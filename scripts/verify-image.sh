@@ -1,6 +1,42 @@
 #!/bin/bash
 # Structural verification only. This does not boot the board or test the radio.
 set -euo pipefail
+
+# -L follows usr-merged /lib and firmware's relative symlinks. Require a
+# readable, nonempty regular target and exact names with supported compression.
+# Keep find's exit code: unreadable trees and symlink loops are errors.
+require_payload() {
+    local directory=$1 kind=$2 expected=$3 match
+    if [[ "$kind" == module ]]; then
+        match=$(find -L "$directory" -type f -readable -size +0c \
+            \( -name "$expected.ko" -o -name "$expected.ko.xz" -o -name "$expected.ko.zst" \) \
+            -print -quit) || return
+    else
+        match=$(find -L "$directory" -type f -readable -size +0c \
+            \( -path "*/$expected" -o -path "*/$expected.xz" -o -path "*/$expected.zst" \) \
+            -print -quit) || return
+    fi
+    if [[ -z "$match" ]]; then
+        echo "Missing readable nonempty $kind: $expected in $directory" >&2
+        return 1
+    fi
+}
+
+require_no_g_serial() {
+    local result=0
+    grep -R -E '^[[:space:]]*g_serial([[:space:]]|$)' "$@" || result=$?
+    case "$result" in
+        1) return 0 ;; # A completed search with no matches is the only pass.
+        0) echo 'Unexpected g_serial autoload configuration' >&2; return 1 ;;
+        *) echo "Could not inspect module autoload configuration (grep exit $result)" >&2; return "$result" ;;
+    esac
+}
+
+# Allow the fixture test to use the same gates without mounting an image.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+
 image=$1
 python3 - "$image" <<'PY'
 import sys
@@ -28,10 +64,10 @@ sudo grep -q '192.168.77.2/24' "$mountdir/etc/NetworkManager/system-connections/
 grep -q '^CONFIG_RTW88_8821CU=m$' "$mountdir"/boot/config-*
 grep -q '^CONFIG_USB_CONFIGFS_F_FS=y$' "$mountdir"/boot/config-*
 for module in rtw88_8821cu btusb btrtl; do
-    test -n "$(find -H "$mountdir/lib/modules" -name "$module.ko*" -print -quit)"
+    require_payload "$mountdir/lib/modules" module "$module"
 done
 for fw in rtw88/rtw8821c_fw.bin rtl_bt/rtl8821c_fw.bin rtl_bt/rtl8821c_config.bin; do
-    test -n "$(find -H "$mountdir/lib/firmware" -path "*/$fw*" -print -quit)"
+    require_payload "$mountdir/lib/firmware" firmware "$fw"
 done
-! grep -R -E '^[[:space:]]*g_serial([[:space:]]|$)' "$mountdir/etc/modules" "$mountdir/etc/modules-load.d/"
+require_no_g_serial "$mountdir/etc/modules" "$mountdir/etc/modules-load.d/"
 echo 'Image structure, app, kernel configuration, modules and firmware checked; hardware untested.'

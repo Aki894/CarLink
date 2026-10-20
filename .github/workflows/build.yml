@@ -32,6 +32,7 @@ jobs:
           python3 -m py_compile scripts/*.py
           bash -n scripts/verify-image.sh
           bash scripts/test-uboot-config.sh
+          bash scripts/test-image-validation.sh
           echo "RUST_VERSION=$(python3 -c 'import json; print(json.load(open("sources.lock.json"))["application"]["rust"])')" >> "$GITHUB_ENV"
           echo "TARGET=$(python3 -c 'import json; print(json.load(open("sources.lock.json"))["application"]["target"])')" >> "$GITHUB_ENV"
       - name: Install ARM hard-float compiler and pinned Rust

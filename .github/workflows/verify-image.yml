@@ -1,0 +1,47 @@
+name: Verify built image
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful CarLink build run containing carlink-h3-image
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_RUN: ${{ inputs.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test image validation gates
+        run: bash scripts/test-image-validation.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: carlink-h3-image
+          path: dist/firmware
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify checksums and mounted root filesystem
+        run: |
+          cd dist/firmware
+          sha256sum --check SHA256SUMS
+          test "$(find . -maxdepth 1 -name '*.img.xz' | wc -l)" -eq 1
+          xz -t -- *.img.xz
+          xz -dk -- *.img.xz
+          cd ../..
+          image=$(find dist/firmware -maxdepth 1 -name '*.img' -print -quit)
+          bash scripts/verify-image.sh "$image" | tee dist/firmware/revalidation.txt
+          echo "ValidationCommit=$GITHUB_SHA" >> dist/firmware/revalidation.txt
+          echo "SourceRun=$SOURCE_RUN" >> dist/firmware/revalidation.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carlink-image-revalidation
+          path: dist/firmware/revalidation.txt
+          retention-days: 14
