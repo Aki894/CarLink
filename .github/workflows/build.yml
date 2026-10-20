@@ -11,6 +11,9 @@ on:
         default: true
 permissions:
   contents: read
+defaults:
+  run:
+    shell: bash
 concurrency:
   group: carlink-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: false
