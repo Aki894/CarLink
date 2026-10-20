@@ -38,15 +38,15 @@ Zero 2/3 target. It does not establish that an unmodified image works.
 The [vendor U-Boot config patch](https://github.com/Timfu2019/wukongpi_build/blob/d2506854fd12fe31009af3d01a6122a583be229e/patch/u-boot/u-boot-sunxi/board_wukongpi/add-wukongpai-cfg.patch)
 sets `DRAM_CLK=408`, `DRAM_ZQ=3881979`, and `DRAM_ODT_EN=y`.
 Upstream [U-Boot v2026.07 Orange Pi Zero configuration](https://github.com/u-boot/u-boot/blob/v2026.07/configs/orangepi_zero_defconfig)
-uses `DRAM_CLK=624`. The local patch changes only 624 to 408 MHz, following
-the vendor's conservative board-specific setting. The H3
-[Kconfig defaults](https://github.com/u-boot/u-boot/blob/v2026.07/arch/arm/mach-sunxi/Kconfig)
-already supply `DRAM_ZQ=3881979` and `DRAM_ODT_EN=y`; they need no patch.
+uses `DRAM_CLK=624`. However, the pinned Armbian framework applies its own
+board-specific patch first: it already sets DRAM to 408 MHz, ZQ to 3881979,
+enables ODT and sets the boot CPU to 480 MHz, matching the vendor baseline.
+A second patch against the unmodified upstream file would conflict with it.
+This project therefore does not duplicate that patch.
 
 The old vendor configuration also used `SYS_CLK_FREQ=480000000`; current
-H3 U-Boot defaults to 1008000000. This patch leaves that CPU clock intact:
-the old value establishes a precedent, not a requirement or demonstrated
-fault at the modern default. Linux CPU frequency policy is separate.
+H3 U-Boot defaults to 1008000000. Armbian's board patch selects the vendor's
+480 MHz bootloader CPU setting. Linux CPU frequency policy is separate.
 Actual 512 MiB detection, repeated cold boot, and memory stability remain
 required hardware checks before increasing the DRAM clock.
 
@@ -54,11 +54,12 @@ Armbian is pinned to
 [`5eda7293bab43a581de02f769139848b6e922328`](https://github.com/armbian/build/tree/5eda7293bab43a581de02f769139848b6e922328).
 Its [sunxi include](https://github.com/armbian/build/blob/5eda7293bab43a581de02f769139848b6e922328/config/sources/families/include/sunxi_common.inc)
 selects `BOOTBRANCH=tag:v2026.07` and **`BOOTPATCHDIR=v2026.07-sunxi`**.
-Consequently the patch lives in
-`userpatches/u-boot/v2026.07-sunxi/`, not the historical `u-boot-sunxi/`.
-Build validation must inspect the resulting U-Boot `.config` for
-`CONFIG_DRAM_CLK=408`; patch applicability alone does not prove the build
-used it, especially if a cached prebuilt bootloader was reused.
+The framework's [board patch](https://github.com/armbian/build/blob/5eda7293bab43a581de02f769139848b6e922328/patch/u-boot/v2026.07-sunxi/board_orangepizero/0001-orangepi-zero-dram-cpufreq.patch)
+supplies these settings. Our `uboot_make_config` extension checks all four
+final values after `olddefconfig` and before compilation. A mismatch stops
+the build; the actual `.config` is preserved as `carlink-uboot.config` in
+the image artifact. The first baseline disables artifact reuse so this
+gate runs during compilation.
 
 ## DTS and connectors
 
