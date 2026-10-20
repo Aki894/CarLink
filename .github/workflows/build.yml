@@ -47,7 +47,7 @@ jobs:
           cp "app/target/$TARGET/release/carlink" dist/app/
           arm-linux-gnueabihf-readelf -h dist/app/carlink | tee dist/app/elf-header.txt
           grep -q 'Machine:.*ARM' dist/app/elf-header.txt
-          sha256sum dist/app/carlink > dist/app/SHA256SUMS
+          (cd dist/app && sha256sum carlink > SHA256SUMS)
           cp sources.lock.json dist/app/
       - uses: actions/upload-artifact@v4
         with:

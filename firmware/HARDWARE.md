@@ -9,18 +9,18 @@ validated** by this firmware preparation.
 
 The local documents were inspected without unpacking the large images:
 
-- `C:/Users/nanao/Desktop/WuKong Pi Hi-Zero/悟空派H3 Zero硬件手册.pdf`:
+- `WuKong Pi Hi-Zero/悟空派H3 Zero硬件手册.pdf`:
   PDF pages 3–4 identify H3, 256/512 MB DDR3, onboard 100 Mb Ethernet,
   three independent USB Host ports including two on the expansion header.
-- `C:/Users/nanao/Desktop/WuKong Pi Hi-Zero/Wukong pi H3 用户手册_v3.2.pdf`:
+- `WuKong Pi Hi-Zero/Wukong pi H3 用户手册_v3.2.pdf`:
   PDF pages 3–4 identify the Type-C power connection, 13-pin expansion
   connector, and the vendor SDK repository.
-- `C:/Users/nanao/Desktop/WuKong Pi Hi-Zero/SCH/WuKongPi-H3-zero-SCH.pdf`:
+- `WuKong Pi Hi-Zero/SCH/WuKongPi-H3-zero-SCH.pdf`:
   five raster schematic sheets, visually inspected; sheet 1 is DDR3,
   sheet 2 CPU/pins, sheet 3 power/Type-C, sheet 4 USB/SD/Ethernet,
   sheet 5 XR819. The schematic has a generic DDR3 footprint description,
   not proof of the memory part fitted to this individual board.
-- `C:/Users/nanao/Desktop/WuKong Pi Hi-Zero/WuKong Pi H3 Zero User Manual.pdf`:
+- `WuKong Pi Hi-Zero/WuKong Pi H3 Zero User Manual.pdf`:
   PDF pages 3–4 describe Android 4.4 and separate USB Host/OTG, but also
   contain an H2/H3 inconsistency. Prefer the Chinese hardware manual and
   schematic for board identification.
