@@ -1,0 +1,120 @@
+name: CarLink builds
+on:
+  push:
+    paths: ['app/**', 'firmware/**', 'scripts/**', 'sources.lock.json', '.github/workflows/**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      firmware:
+        description: Build the bootable Armbian image (kernel and native drivers)
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: carlink-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+jobs:
+  app:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate scripts and locked toolchain
+        run: |
+          find firmware -name '*.sh' -o -name '*.conf' | while read -r file; do
+            case "$file" in */overlay/*) continue;; esac
+            bash -n "$file"
+          done
+          python3 -m py_compile scripts/*.py
+          bash -n scripts/verify-image.sh
+          echo "RUST_VERSION=$(python3 -c 'import json; print(json.load(open("sources.lock.json"))["application"]["rust"])')" >> "$GITHUB_ENV"
+          echo "TARGET=$(python3 -c 'import json; print(json.load(open("sources.lock.json"))["application"]["target"])')" >> "$GITHUB_ENV"
+      - name: Install ARM hard-float compiler and pinned Rust
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET"
+      - name: Test and cross compile app
+        env:
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+        run: |
+          cargo +"$RUST_VERSION" test --locked --manifest-path app/Cargo.toml
+          cargo +"$RUST_VERSION" run --quiet --locked --manifest-path app/Cargo.toml -- doctor --json > /tmp/carlink-doctor.json
+          python3 -c 'import json; d=json.load(open("/tmp/carlink-doctor.json")); assert d["schema_version"] == 1; assert d["aoa"]["status"] == "not_tested"'
+          cargo +"$RUST_VERSION" build --release --locked --manifest-path app/Cargo.toml --target "$TARGET"
+          mkdir -p dist/app
+          cp "app/target/$TARGET/release/carlink" dist/app/
+          arm-linux-gnueabihf-readelf -h dist/app/carlink | tee dist/app/elf-header.txt
+          grep -q 'Machine:.*ARM' dist/app/elf-header.txt
+          sha256sum dist/app/carlink > dist/app/SHA256SUMS
+          cp sources.lock.json dist/app/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carlink-armv7
+          path: dist/app/
+          retention-days: 14
+  firmware:
+    if: github.event_name == 'workflow_dispatch' && inputs.firmware
+    needs: app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read Armbian lock
+        run: echo "ARMBIAN_SHA=$(python3 -c 'import json; print(json.load(open("sources.lock.json"))["armbian"]["commit"])')" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: armbian/build
+          ref: ${{ env.ARMBIAN_SHA }}
+          path: .build/armbian
+      - uses: actions/download-artifact@v4
+        with:
+          name: carlink-armv7
+          path: dist/app/
+      - name: Reclaim unused hosted runner SDK space
+        run: |
+          # Only fixed paths on a disposable GitHub-hosted Linux runner; keep swap.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+          free -h
+          available=$(df --output=avail -BG "$GITHUB_WORKSPACE" | tail -1 | tr -dc '0-9')
+          test "$available" -ge 50 || { echo 'Need at least 50 GiB free for Armbian'; exit 1; }
+      - name: Stage project overlay and verify upstream kernel config
+        run: python3 scripts/prepare-build.py .build/armbian dist/app/carlink
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+      - name: Compile kernel, drivers and minimal image
+        working-directory: .build/armbian
+        run: ./compile.sh carlink-h3 SHOW_LOG=yes SHARE_LOG=no
+      - name: Collect image and checksums
+        run: |
+          mkdir -p dist/firmware
+          find .build/armbian/output/images -type f -name '*.img.xz' -exec cp '{}' dist/firmware/ \;
+          test "$(find dist/firmware -name '*.img.xz' | wc -l)" -eq 1
+          cp .build/armbian/userpatches/overlay/carlink-build.json dist/firmware/
+          xz -t dist/firmware/*.img.xz
+          compressed=$(find dist/firmware -name '*.img.xz' -print -quit)
+          xz -dk "$compressed"
+          bash scripts/verify-image.sh "${compressed%.xz}" | tee dist/firmware/image-validation.txt
+          rm "${compressed%.xz}"
+          cd dist/firmware
+          sha256sum -- *.img.xz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carlink-h3-image
+          path: dist/firmware/
+          compression-level: 0
+          retention-days: 14
+      - name: Preserve Armbian logs and packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: carlink-h3-build-evidence
+          path: |
+            .build/armbian/output/logs/
+            .build/armbian/output/debs/
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 7

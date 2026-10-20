@@ -1,0 +1,14 @@
+{
+  "armbian": {
+    "repository": "https://github.com/armbian/build.git",
+    "commit": "5eda7293bab43a581de02f769139848b6e922328",
+    "board": "orangepizero",
+    "branch": "current",
+    "kernel_series": "6.18",
+    "release": "trixie"
+  },
+  "application": {
+    "rust": "1.90.0",
+    "target": "armv7-unknown-linux-gnueabihf"
+  }
+}

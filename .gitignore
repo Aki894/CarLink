@@ -1,0 +1,11 @@
+research/
+app/target/
+.build/
+dist/
+*.img
+*.img.xz
+*.pem
+*.p7b
+*.pk8
+*.key
+__pycache__/
