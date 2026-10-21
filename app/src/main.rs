@@ -1,4 +1,7 @@
-//! Read-only Linux diagnostics. No shell commands or network requests.
+//! Linux diagnostics and staged CarLife mobile-device development.
+mod carlife;
+mod gadget;
+mod runtime;
 use std::env;
 use std::fs;
 use std::io;
@@ -222,7 +225,14 @@ fn report(root: &Path) -> String {
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args == ["--help"] || args == ["-h"] {
-        println!("Usage: carlink doctor --json\nRead-only Linux inventory; no USB mode changes or connection tests.");
+        println!("Usage:\n  carlink doctor --json\n  carlink carlife tcp [--listen 127.0.0.1:7240] [--duration 60]\n  carlink carlife usb [--duration 120]\nTCP is a loopback lab transport. USB creates a temporary AOA FunctionFS gadget.");
+        return;
+    }
+    if args.first().map(String::as_str) == Some("carlife") {
+        if let Err(error) = run_carlife(&args[1..]) {
+            runtime::log("session_error", &error);
+            std::process::exit(1);
+        }
         return;
     }
     if args != ["doctor", "--json"] {
@@ -230,6 +240,26 @@ fn main() {
         std::process::exit(2);
     }
     println!("{}", report(Path::new("/")));
+}
+
+fn run_carlife(args: &[String]) -> Result<(), String> {
+    let mode = args.first().map(String::as_str).ok_or("Missing CarLife transport: tcp or usb")?;
+    if mode != "tcp" && mode != "usb" { return Err("CarLife transport must be tcp or usb".into()); }
+    let mut seconds = if mode == "usb" { 120 } else { 60 };
+    let mut address = "127.0.0.1:7240".parse().unwrap();
+    let mut index = 1;
+    while index < args.len() {
+        let value = args.get(index + 1).ok_or("Option requires a value")?;
+        match args[index].as_str() {
+            "--duration" => seconds = value.parse::<u64>().map_err(|_| "Invalid duration")?,
+            "--listen" if mode == "tcp" => address = value.parse().map_err(|_| "Invalid socket address")?,
+            _ => return Err(format!("Unknown option: {}", args[index])),
+        }
+        index += 2;
+    }
+    if !(1..=300).contains(&seconds) { return Err("Duration must be 1..300 seconds".into()); }
+    let duration = std::time::Duration::from_secs(seconds);
+    if mode == "tcp" { runtime::tcp(address, duration) } else { gadget::run(duration) }
 }
 
 #[cfg(test)]

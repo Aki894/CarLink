@@ -3,7 +3,7 @@ name = "carlink"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
-description = "Read-only Linux hardware diagnostics for CarLink"
+description = "Linux hardware diagnostics and CarLife mobile-device development for CarLink"
 license = "MIT"
 
 [dependencies]
