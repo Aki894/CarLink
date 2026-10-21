@@ -32,7 +32,20 @@ def protocol(device):
 
 
 def accessory():
-    device = select(0x4ee7)
+    # A freshly bound gadget may take a moment to appear in Windows.
+    deadline = time.monotonic() + 20
+    device = None
+    last_error = "device not found"
+    while time.monotonic() < deadline:
+        try:
+            device = select(0x4ee7)
+            if device is not None or select(0x2d00) is not None:
+                break
+        except (usb.core.USBError, NotImplementedError) as error:
+            last_error = str(error)
+        time.sleep(.25)
+    else:
+        raise RuntimeError("Initial driver/enumeration deadline: " + last_error)
     if device is not None:
         protocol(device)
         for index, text in enumerate(("CarLink HU Lab", "CarLife HU", "CarLink USB test", "1.0", "", "CarLink-HU-Lab")):
