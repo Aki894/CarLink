@@ -43,7 +43,9 @@ fn descriptors() -> Vec<u8> {
     body.extend_from_slice(&2u32.to_le_bytes()); // MS OS feature descriptor count.
     for packet in [64u16, 512u16] {
         body.extend_from_slice(&[9, 4, 0, 0, 2, 255, 255, 0, 1]);
-        for address in [0x01, 0x82] {
+        // Baidu Java HU uses endpoint indices, not endpoint direction lookup:
+        // endpoint(0)=IN, endpoint(1)=OUT (headswap protocol notes section 1).
+        for address in [0x81, 0x02] {
             body.extend_from_slice(&[7, 5, address, 2]);
             body.extend_from_slice(&packet.to_le_bytes());
             body.push(0);
@@ -347,8 +349,8 @@ mod linux {
                 if count != data.len() { return Err("short FunctionFS descriptor write".into()); }
             }
             own.ep0 = Some(ep0);
-            own.rx = Some(open_endpoint(Path::new(FFS).join("ep1"))?);
-            own.tx = Some(open_endpoint(Path::new(FFS).join("ep2"))?);
+            own.tx = Some(open_endpoint(Path::new(FFS).join("ep1"))?);
+            own.rx = Some(open_endpoint(Path::new(FFS).join("ep2"))?);
             symlink(Path::new(ROOT).join("functions/ffs.carlink"), Path::new(ROOT).join("configs/c.1/ffs.carlink"))
                 .map_err(|e| format!("link FunctionFS configuration: {e}"))?;
             own.linked = true;
@@ -788,7 +790,7 @@ mod tests {
         assert_eq!(&data[12..24], &[3, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0]);
         for (base, size) in [(24, 64u16), (47, 512u16)] {
             assert_eq!(&data[base..base + 9], &[9, 4, 0, 0, 2, 255, 255, 0, 1]);
-            for (offset, address) in [(9, 1), (16, 0x82)] {
+            for (offset, address) in [(9, 0x81), (16, 0x02)] {
                 assert_eq!(&data[base + offset..base + offset + 4], &[7, 5, address, 2]);
                 assert_eq!(&data[base + offset + 4..base + offset + 6], &size.to_le_bytes());
             }
