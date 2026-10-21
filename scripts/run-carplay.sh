@@ -23,6 +23,10 @@ done
 install -d -m 700 "$state/state" /run/carlink-carplay
 if [ "$mode" = probe ]; then
     output="$root/probe.py"
+    # iOS wireless audio initialization requires a compatible voice offer even
+    # when only AAC media is playing. The probe accepts compressed OXP packets.
+    export CARLINK_CARPLAY_VOICE_OPUS=${CARLINK_CARPLAY_VOICE_OPUS:-1}
+    export CARLINK_CARPLAY_BUFFERED_AUDIO=${CARLINK_CARPLAY_BUFFERED_AUDIO:-1}
 else
     output="$root/bin/oxp-relay"
 fi

@@ -21,7 +21,8 @@ Current code implements bounded wire framing, 4.1 base handshake, CarLife 2.0
 digest verification, loopback TCP lab and temporary FunctionFS AOA1 USB.
 Synthetic H.264/PCM playback passed on the real Android HU app; see the
 [media acceptance](carlife-media-2026-10-21.md). CarPlay reception is now the active
-step; see [receiver operation](../receiver/README.md). Resume Lexus acceptance
+step; see [receiver operation](../receiver/README.md) and the
+[hardware reception record](carplay-acceptance-2026-10-22.md). Resume Lexus acceptance
 after the live media bridge is ready and vehicle access is available.
 
 Implementation choice: Rust for the headless application, Python for host-side
