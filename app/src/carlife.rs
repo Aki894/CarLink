@@ -41,6 +41,7 @@ pub mod ids {
     pub const HU_AUTH_REQUEST: u32 = 0x18048;
     pub const MD_AUTH_RESPONSE: u32 = 0x10049;
     pub const HU_AUTH_RESULT: u32 = 0x1804a;
+    pub const MD_PEER_ACCEPT: u32 = 0x1004b;
     pub const FEATURE_REQUEST: u32 = 0x10051;
     pub const HU_FEATURE_RESPONSE: u32 = 0x18052;
     pub const HU_RSA_KEY: u32 = 0x1806b;
@@ -275,6 +276,7 @@ pub enum Event {
     ModuleControlIgnored { module: u32, status: u32 },
     MusicControl { status: u32 }, AudioTransport { usb: bool },
     AuthenticationResponded, HuAuthenticationAccepted,
+    UsbPeerAccepted,
     Unhandled { channel: Channel, id: u32, bytes: usize },
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -292,12 +294,16 @@ pub struct Session {
     auth_sent: bool,
     auth_accepted: bool,
     feature_requested: bool,
+    statistic_seen: bool,
+    hu_info_seen: bool,
+    peer_accepted: bool,
 }
 impl Default for Session { fn default() -> Self { Self::new() } }
 
 impl Session {
     pub fn new() -> Self { Self { version: None, video: None, state: VideoState::Uninitialized, generation: 0, failed: false, source: None,
-        auth_identity: None, auth_sent: false, auth_accepted: false, feature_requested: false } }
+        auth_identity: None, auth_sent: false, auth_accepted: false, feature_requested: false,
+        statistic_seen: false, hu_info_seen: false, peer_accepted: false } }
     pub fn with_video_source(config: VideoConfig) -> Self { Self { source: Some(config), ..Self::new() } }
     pub fn video_state(&self) -> VideoState { self.state }
     pub fn video_config(&self) -> Option<VideoConfig> { self.video }
@@ -356,6 +362,7 @@ impl Session {
         match message.id {
             HU_INFO => {
                 fields(&message.payload)?;
+                self.hu_info_seen = true;
                 // MD_INFO was sent at VERSION. Echoing it here causes the HU
                 // to send HU_INFO/challenge again, restarting its handshake.
                 if !self.feature_requested {
@@ -366,7 +373,7 @@ impl Session {
             },
             STATISTIC_INFO => {
                 fields(&message.payload)?;
-                // Deliberately no MD_AUTHEN_RESULT(true) or CAR_DATA_SUBSCRIBE.
+                self.statistic_seen = true;
                 out.events.push(Event::StatisticReceived);
             },
             HU_AUTH_REQUEST => {
@@ -483,6 +490,14 @@ impl Session {
                 else { out.events.push(Event::ModuleControlIgnored { module, status }); }
             },
             _ => out.events.push(Event::Unhandled { channel: message.channel, id: message.id, bytes: message.payload.len() }),
+        }
+        // The MD chooses to accept this locally connected HU without issuing
+        // a reverse challenge. This peer notice is distinct from the computed
+        // HU_AUTH_REQUEST response and from HU_AUTH_RESULT acceptance.
+        if self.auth_sent && self.hu_info_seen && self.statistic_seen && !self.peer_accepted {
+            out.outgoing.push(cmd(MD_PEER_ACCEPT, integers(&[(1,1)]))?);
+            self.peer_accepted = true;
+            out.events.push(Event::UsbPeerAccepted);
         }
         Ok(out)
     }
@@ -763,6 +778,17 @@ mod tests {
         let first=s.handle(&info).unwrap();
         assert_eq!(first.outgoing.iter().map(|m|m.id).collect::<Vec<_>>(),vec![ids::FEATURE_REQUEST]);
         assert!(s.handle(&info).unwrap().outgoing.is_empty());
+    }
+    #[test]
+    fn peer_notice_is_once_after_metadata_and_calculated_auth_response() {
+        let mut s=Session::new(); s.handle(&version()).unwrap();
+        s.handle(&cmd(ids::HU_INFO,Vec::new()).unwrap()).unwrap();
+        assert!(s.handle(&cmd(ids::STATISTIC_INFO,Vec::new()).unwrap()).unwrap().outgoing.is_empty());
+        let mut body=Vec::new(); put_bytes(&mut body,1,b"2.0;lab-nonce");
+        let request=cmd(ids::HU_AUTH_REQUEST,body).unwrap();
+        assert_eq!(s.handle(&request).unwrap().outgoing.iter().map(|m|m.id).collect::<Vec<_>>(),vec![ids::MD_AUTH_RESPONSE,ids::MD_PEER_ACCEPT]);
+        assert!(!s.auth_accepted);
+        assert_eq!(s.handle(&request).unwrap().outgoing.len(),1);
     }
     #[test]
     fn protobuf_bad_wire_overflow_missing_duplicate_fields() {
