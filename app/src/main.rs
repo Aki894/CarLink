@@ -2,6 +2,7 @@
 mod carlife;
 mod gadget;
 mod runtime;
+mod media;
 #[cfg(target_os = "linux")]
 mod usb_aio;
 use std::env;
@@ -227,7 +228,7 @@ fn report(root: &Path) -> String {
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args == ["--help"] || args == ["-h"] {
-        println!("Usage:\n  carlink doctor --json\n  carlink carlife tcp [--listen 127.0.0.1:7240] [--duration 60]\n  carlink carlife usb [--duration 120]\nTCP is a loopback lab transport. USB creates a temporary AOA FunctionFS gadget.");
+        println!("Usage:\n  carlink doctor --json\n  carlink carlife tcp [--listen 127.0.0.1:7240] [--duration 60] [--test-media DIR]\n  carlink carlife usb [--duration 120] [--test-media DIR]\nTCP is a loopback lab transport. USB creates a temporary AOA FunctionFS gadget. Test media is opt-in generated H.264 and PCM.");
         return;
     }
     if args.first().map(String::as_str) == Some("carlife") {
@@ -249,19 +250,22 @@ fn run_carlife(args: &[String]) -> Result<(), String> {
     if mode != "tcp" && mode != "usb" { return Err("CarLife transport must be tcp or usb".into()); }
     let mut seconds = if mode == "usb" { 120 } else { 60 };
     let mut address = "127.0.0.1:7240".parse().unwrap();
+    let mut media_path = None;
     let mut index = 1;
     while index < args.len() {
         let value = args.get(index + 1).ok_or("Option requires a value")?;
         match args[index].as_str() {
             "--duration" => seconds = value.parse::<u64>().map_err(|_| "Invalid duration")?,
             "--listen" if mode == "tcp" => address = value.parse().map_err(|_| "Invalid socket address")?,
+            "--test-media" => media_path = Some(std::path::PathBuf::from(value)),
             _ => return Err(format!("Unknown option: {}", args[index])),
         }
         index += 2;
     }
     if !(1..=300).contains(&seconds) { return Err("Duration must be 1..300 seconds".into()); }
     let duration = std::time::Duration::from_secs(seconds);
-    if mode == "tcp" { runtime::tcp(address, duration) } else { gadget::run(duration) }
+    let media = media_path.as_deref().map(media::TestMedia::load).transpose()?;
+    if mode == "tcp" { runtime::tcp(address, duration, media) } else { gadget::run(duration, media) }
 }
 
 #[cfg(test)]

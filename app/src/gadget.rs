@@ -115,13 +115,13 @@ impl Mode {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn run(_duration: std::time::Duration) -> Result<(), String> {
+pub fn run(_duration: std::time::Duration, _media: Option<crate::media::TestMedia>) -> Result<(), String> {
     Err("FunctionFS AOA gadget is supported only on Linux".into())
 }
 
 #[cfg(target_os = "linux")]
-pub fn run(duration: std::time::Duration) -> Result<(), String> {
-    linux::run(duration)
+pub fn run(duration: std::time::Duration, media: Option<crate::media::TestMedia>) -> Result<(), String> {
+    linux::run(duration, media)
 }
 
 #[cfg(target_os = "linux")]
@@ -135,7 +135,7 @@ mod linux {
     use std::os::unix::fs::{symlink, OpenOptionsExt};
     use std::path::Path;
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
     use std::sync::Arc;
     use std::thread::{self, JoinHandle};
@@ -441,6 +441,27 @@ mod linux {
         Ok(())
     }
 
+    #[derive(Debug)]
+    struct Outgoing {
+        data: Vec<u8>,
+        // Control responses (including audio INIT/STOP) remain FIFO and durable.
+        epoch: Option<(usize, u64)>,
+    }
+
+    impl Outgoing {
+        fn current(&self, epochs: &[AtomicU64; 2]) -> bool {
+            self.epoch.map_or(true, |(lane, generation)| {
+                epochs[lane].load(Ordering::Acquire) == generation
+            })
+        }
+    }
+
+    fn publish_epochs(shared: &[AtomicU64; 2], values: [u64; 2]) {
+        for (slot, value) in shared.iter().zip(values) {
+            slot.store(value, Ordering::Release);
+        }
+    }
+
     struct Workers {
         stop: Arc<AtomicBool>,
         enabled: Arc<AtomicBool>,
@@ -449,11 +470,12 @@ mod linux {
     }
 
     impl Workers {
-        fn start(rx: File, mut tx: File, deadline: Instant) -> Result<Self, String> {
+        fn start(rx: File, mut tx: File, deadline: Instant, media: Option<crate::media::TestMedia>) -> Result<Self, String> {
             let stop = Arc::new(AtomicBool::new(false));
             let enabled = Arc::new(AtomicBool::new(true));
             let (incoming_tx, incoming_rx) = mpsc::sync_channel::<Vec<u8>>(16);
-            let (outgoing_tx, outgoing_rx) = mpsc::sync_channel::<Vec<u8>>(8);
+            let (outgoing_tx, outgoing_rx) = mpsc::sync_channel::<Outgoing>(8);
+            let epochs = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
             let (errors_tx, errors) = mpsc::sync_channel::<String>(4);
             let mut own = Self { stop, enabled, errors, handles: Vec::new() };
             let stop = own.stop.clone(); let enabled = own.enabled.clone(); let errors_tx_rx = errors_tx.clone();
@@ -487,12 +509,20 @@ mod linux {
                 }
             }).map_err(|e| format!("start USB RX worker: {e}"))?);
             let stop = own.stop.clone(); let enabled = own.enabled.clone(); let errors_tx_tx = errors_tx.clone();
+            let writer_epochs = epochs.clone();
             let writer = thread::Builder::new().name("carlink-usb-tx".into()).spawn(move || {
                 let result = (|| {
                     while live(&stop, deadline) {
                         if !enabled.load(Ordering::Acquire) { thread::sleep(Duration::from_millis(10)); continue; }
                         match outgoing_rx.recv_timeout(Duration::from_millis(50)) {
-                            Ok(frame) => transmit(&mut tx, &frame, &stop, deadline)?,
+                            Ok(frame) => {
+                                // Check once before starting the outer header. Once
+                                // started, finish the entire packet without fencing
+                                // in the middle of a USB transfer.
+                                if frame.current(&writer_epochs) {
+                                    transmit(&mut tx, &frame.data, &stop, deadline)?;
+                                }
+                            },
                             Err(mpsc::RecvTimeoutError::Timeout) => continue,
                             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                         }
@@ -510,20 +540,46 @@ mod linux {
             let stop = own.stop.clone();
             let protocol = thread::Builder::new().name("carlink-usb-protocol".into()).spawn(move || {
                 // Construct here: Endpoint is never sent/shared across threads.
-                let mut endpoint = crate::runtime::Endpoint::new();
+                let mut endpoint = crate::runtime::Endpoint::with_media(media);
+                publish_epochs(&epochs, endpoint.epochs());
                 let result = (|| {
                     while live(&stop, deadline) {
-                        match incoming_rx.recv_timeout(Duration::from_millis(50)) {
+                        match incoming_rx.recv_timeout(Duration::from_millis(10)) {
                             Ok(chunk) => {
                                 let responses = endpoint.receive(&chunk)?;
+                                publish_epochs(&epochs, endpoint.epochs());
                                 if responses.len() > 32 { return Err("too many responses to one USB chunk".into()); }
                                 for frame in responses {
                                     if frame.len() > MAX_FRAME { return Err("USB response exceeds frame bound".into()); }
-                                    send_bounded(&outgoing_tx, frame, &stop, deadline)?;
+                                    send_bounded(&outgoing_tx, Outgoing { data: frame, epoch: None }, &stop, deadline)?;
                                 }
                             }
-                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {},
                             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                        if let Some(frame) = endpoint.poll_media()? {
+                            if frame.len() > MAX_FRAME { return Err("USB media exceeds frame bound".into()); }
+                            let header = frame.get(..4).ok_or("USB media lacks channel header")?;
+                            let channel = u32::from_be_bytes(header.try_into().unwrap());
+                            let lane = match channel {
+                                2 => 0,
+                                3 => 1,
+                                _ => return Err("unexpected test-media channel".into()),
+                            };
+                            let current = endpoint.epochs();
+                            publish_epochs(&epochs, current);
+                            let packet = Outgoing { data: frame, epoch: Some((lane, current[lane])) };
+                            match outgoing_tx.try_send(packet) {
+                                Ok(()) => {},
+                                Err(TrySendError::Full(_)) => {
+                                    // Never block command parsing behind generated
+                                    // media. A dropped reference AU requires a new
+                                    // decodable keyframe, not its dependent P frames.
+                                    endpoint.media_backpressure(channel == 2);
+                                    publish_epochs(&epochs, endpoint.epochs());
+                                },
+                                Err(TrySendError::Disconnected(_)) => return Err("USB writer channel closed".into()),
+                            }
                         }
                     }
                     Ok(())
@@ -581,7 +637,7 @@ mod linux {
         Ok(())
     }
 
-    fn serve(gadget: &mut Gadget, deadline: Instant, workers: &mut Option<Workers>) -> Result<(), String> {
+    fn serve(gadget: &mut Gadget, deadline: Instant, workers: &mut Option<Workers>, media: &mut Option<crate::media::TestMedia>) -> Result<(), String> {
         let mut mode = Mode::Initial;
         let mut activated = false;
         let mut enabled = false;
@@ -615,7 +671,7 @@ mod linux {
                             eprintln!("usb_gadget: accessory bulk session enabled");
                             let rx = gadget.rx.take().ok_or("missing USB RX endpoint")?;
                             let tx = gadget.tx.take().ok_or("missing USB TX endpoint")?;
-                            *workers = Some(Workers::start(rx, tx, deadline)?);
+                            *workers = Some(Workers::start(rx, tx, deadline, media.take())?);
                         }
                     }
                     4 => {
@@ -659,13 +715,13 @@ mod linux {
         Ok(())
     }
 
-    pub(super) fn run(duration: Duration) -> Result<(), String> {
+    pub(super) fn run(duration: Duration, mut media: Option<crate::media::TestMedia>) -> Result<(), String> {
         if duration.is_zero() { return Err("USB gadget duration must be positive".into()); }
         let deadline = Instant::now().checked_add(duration).ok_or("USB duration overflow")?;
         let _signals = Signals::install()?;
         let mut gadget = Gadget::open(deadline)?;
         let mut workers = None;
-        let mut result = serve(&mut gadget, deadline, &mut workers);
+        let mut result = serve(&mut gadget, deadline, &mut workers, &mut media);
         if let Some(worker) = workers.as_ref() { worker.stop.store(true, Ordering::Release); }
         if let Err(error) = gadget.unbind() {
             gadget.allow_cleanup = false;
@@ -682,6 +738,31 @@ mod linux {
         }
         let cleanup = gadget.cleanup();
         result.and(cleanup)
+    }
+
+    #[cfg(test)]
+    mod outgoing_tests {
+        use super::*;
+
+        #[test]
+        fn epochs_discard_old_media_without_discarding_control_responses() {
+            let epochs = [AtomicU64::new(3), AtomicU64::new(7)];
+            let video = Outgoing { data: Vec::new(), epoch: Some((0, 3)) };
+            let audio = Outgoing { data: Vec::new(), epoch: Some((1, 7)) };
+            let control = Outgoing { data: Vec::new(), epoch: None };
+            assert!(video.current(&epochs)); assert!(audio.current(&epochs));
+            publish_epochs(&epochs, [4, 7]);
+            assert!(!video.current(&epochs)); assert!(audio.current(&epochs));
+            publish_epochs(&epochs, [4, 8]);
+            assert!(!audio.current(&epochs)); assert!(control.current(&epochs));
+        }
+
+        #[test]
+        fn full_media_queue_reports_backpressure_without_waiting() {
+            let (tx, _rx) = mpsc::sync_channel(1);
+            tx.try_send(Outgoing { data: vec![1], epoch: Some((0, 0)) }).unwrap();
+            assert!(matches!(tx.try_send(Outgoing { data: vec![2], epoch: Some((0, 0)) }), Err(TrySendError::Full(_))));
+        }
     }
 }
 

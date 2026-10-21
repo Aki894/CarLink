@@ -13,7 +13,7 @@
 //! anywhere in an inner header/body and interleaving channels. It does not guess
 //! around incorrect declared lengths or resynchronize after corruption. Some
 //! real HUs require additional trace-backed length-quirk compatibility.
-//! No video/audio source, authentication, encryption, or input injection exists.
+//! Test media is supplied separately; authentication/encryption/input are pending.
 
 use std::fmt;
 
@@ -32,6 +32,7 @@ pub mod ids {
     pub const SCREEN_ON: u32 = 0x10018;
     pub const FOREGROUND: u32 = 0x1001b;
     pub const STATISTIC_INFO: u32 = 0x18027;
+    pub const MODULE_STATUS: u32 = 0x10026;
     pub const MODULE_CONTROL: u32 = 0x18028;
     pub const SUBSCRIBE: u32 = 0x18043;
     pub const SUBSCRIBE_DONE: u32 = 0x10044;
@@ -271,6 +272,7 @@ pub enum Event {
     SubscriptionsUnsupported { modules: Vec<u32> },
     SubscriptionControlIgnored { id: u32 },
     ModuleControlIgnored { module: u32, status: u32 },
+    MusicControl { status: u32 }, AudioTransport { usb: bool },
     Unhandled { channel: Channel, id: u32, bytes: usize },
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -283,11 +285,13 @@ pub struct Session {
     state: VideoState,
     generation: u64,
     failed: bool,
+    source: Option<VideoConfig>,
 }
 impl Default for Session { fn default() -> Self { Self::new() } }
 
 impl Session {
-    pub fn new() -> Self { Self { version: None, video: None, state: VideoState::Uninitialized, generation: 0, failed: false } }
+    pub fn new() -> Self { Self { version: None, video: None, state: VideoState::Uninitialized, generation: 0, failed: false, source: None } }
+    pub fn with_video_source(config: VideoConfig) -> Self { Self { source: Some(config), ..Self::new() } }
     pub fn video_state(&self) -> VideoState { self.state }
     pub fn video_config(&self) -> Option<VideoConfig> { self.video }
     pub fn protocol_version(&self) -> Option<(u32, u32)> { self.version }
@@ -356,10 +360,17 @@ impl Session {
                 let f = fields(&message.payload)?;
                 let (width, height, fps) = (uint(&f, 1)?, uint(&f, 2)?, uint(&f, 3)?);
                 if !(16..=1920).contains(&width) || !(16..=1080).contains(&height)
-                    || width % 2 != 0 || height % 2 != 0 || !(1..=60).contains(&fps) {
+                    || width % 2 != 0 || height % 2 != 0 || fps > 60 {
                     return Err(Error::InvalidVideoConfig);
                 }
-                let config = VideoConfig { width, height, fps: fps.min(30) };
+                // Java HUs use zero to request an unrestricted frame rate.
+                let mut config = VideoConfig { width, height, fps: if fps == 0 { 30 } else { fps.min(30) } };
+                if let Some(source) = self.source {
+                    if (width, height) != (source.width, source.height) {
+                        return Err(Error::Unsupported("test video dimensions differ from HU request; regenerate test assets"));
+                    }
+                    config.fps = config.fps.min(source.fps);
+                }
                 // Identical retries re-ACK without undoing START/PAUSE state.
                 if self.video != Some(config) { self.video = Some(config); self.state = VideoState::Negotiated; }
                 out.outgoing.push(cmd(VIDEO_INIT_DONE, integers(&[(1, width as u64), (2, height as u64), (3, config.fps as u64)]))?);
@@ -380,14 +391,16 @@ impl Session {
             VIDEO_RESET => {
                 no_payload(message)?;
                 self.generation = self.generation.checked_add(1).ok_or(Error::InvalidState("generation overflow"))?;
-                self.video = None; self.state = VideoState::Uninitialized;
+                // A HU RESET asks for a fresh key frame, preserving the mode
+                // and playback state (including PAUSE), not another INIT.
+                if self.video.is_none() { return Err(Error::InvalidState("VIDEO_RESET before INIT")); }
                 out.events.push(Event::VideoReset { generation: self.generation });
             },
             VIDEO_FPS_CHANGE => {
                 let fps = uint(&fields(&message.payload)?, 1)?;
                 if !(1..=60).contains(&fps) { return Err(Error::InvalidVideoConfig); }
                 let config = self.video.as_mut().ok_or(Error::InvalidState("FPS change before INIT"))?;
-                config.fps = fps.min(30);
+                config.fps = fps.min(30).min(self.source.map_or(30, |s| s.fps));
                 out.outgoing.push(cmd(VIDEO_FPS_DONE, integers(&[(1, config.fps as u64)]))?);
                 out.events.push(Event::FrameRateChanged { fps: config.fps });
             },
@@ -402,6 +415,10 @@ impl Session {
                     let value = uint(&feature, 2)?;
                     if key == b"CONTENT_ENCRYPTION" && value != 0 {
                         return Err(Error::Unsupported("encrypted CarLife media"));
+                    }
+                    if key == b"AUDIO_TRANSMISSION_MODE" {
+                        if value > 1 { return Err(Error::Unsupported("unknown audio transmission mode")); }
+                        out.events.push(Event::AudioTransport { usb: value == 0 });
                     }
                 }
                 out.events.push(Event::FeaturesReceived);
@@ -426,7 +443,9 @@ impl Session {
             },
             MODULE_CONTROL => {
                 let f = fields(&message.payload)?;
-                out.events.push(Event::ModuleControlIgnored { module: uint(&f, 1)?, status: uint(&f, 2)? });
+                let (module, status) = (uint(&f, 1)?, uint(&f, 2)?);
+                if module == 3 { out.events.push(Event::MusicControl { status }); }
+                else { out.events.push(Event::ModuleControlIgnored { module, status }); }
             },
             _ => out.events.push(Event::Unhandled { channel: message.channel, id: message.id, bytes: message.payload.len() }),
         }
@@ -633,23 +652,38 @@ mod tests {
         assert_eq!(reply.outgoing.iter().map(|m|m.id).collect::<Vec<_>>(),vec![ids::VERSION_MATCH]);
     }
     #[test]
-    fn video_state_machine_has_no_media_output_and_reset_requires_new_init() {
+    fn video_reset_preserves_mode_and_pause_then_start_resumes() {
         let mut s=Session::new(); s.handle(&version()).unwrap();
         s.handle(&init()).unwrap(); assert_eq!(s.video_config(),Some(VideoConfig{width:1280,height:720,fps:30}));
         let start=s.handle(&cmd(ids::VIDEO_START,vec![]).unwrap()).unwrap();
         assert!(start.outgoing.is_empty()); assert_eq!(start.events,vec![Event::AwaitingVideoSource]);
         s.handle(&cmd(ids::VIDEO_PAUSE,vec![]).unwrap()).unwrap(); assert_eq!(s.video_state(),VideoState::Paused);
         s.handle(&init()).unwrap(); assert_eq!(s.video_state(),VideoState::Paused);
-        s.handle(&cmd(ids::VIDEO_RESET,vec![]).unwrap()).unwrap(); assert_eq!(s.video_config(),None);
-        assert!(s.handle(&cmd(ids::VIDEO_START,vec![]).unwrap()).is_err());
+        s.handle(&cmd(ids::VIDEO_RESET,vec![]).unwrap()).unwrap();
+        assert_eq!(s.video_config(),Some(VideoConfig{width:1280,height:720,fps:30}));
+        assert_eq!(s.video_state(),VideoState::Paused);
+        s.handle(&cmd(ids::VIDEO_START,vec![]).unwrap()).unwrap();
+        assert_eq!(s.video_state(),VideoState::AwaitingVideoSource);
     }
     #[test]
     fn bad_video_parameters_are_rejected_transactionally() {
-        for (w,h,fps) in [(15,720,30),(1281,720,30),(1922,720,30),(1280,1082,30),(1280,720,0),(1280,720,61)] {
+        for (w,h,fps) in [(15,720,30),(1281,720,30),(1922,720,30),(1280,1082,30),(1280,720,61)] {
             let mut s=Session::new(); s.handle(&version()).unwrap();
             let msg=cmd(ids::VIDEO_INIT,integers(&[(1,w),(2,h),(3,fps)])).unwrap();
             assert_eq!(s.handle(&msg),Err(Error::InvalidVideoConfig)); assert_eq!(s.video_config(),None); assert!(s.is_failed());
         }
+    }
+    #[test]
+    fn hu_zero_fps_and_source_limits_use_actual_encoder_parameters() {
+        let config = VideoConfig { width:1280, height:720, fps:15 };
+        let mut s=Session::with_video_source(config); s.handle(&version()).unwrap();
+        let zero=cmd(ids::VIDEO_INIT,integers(&[(1,1280),(2,720),(3,0)])).unwrap();
+        s.handle(&zero).unwrap(); assert_eq!(s.video_config(),Some(config));
+        let mismatch=cmd(ids::VIDEO_INIT,integers(&[(1,800),(2,480),(3,30)])).unwrap();
+        assert!(matches!(s.handle(&mismatch),Err(Error::Unsupported(_))));
+        assert_eq!(s.video_config(),Some(config));
+        let mut normal=Session::new(); normal.handle(&version()).unwrap();
+        normal.handle(&zero).unwrap(); assert_eq!(normal.video_config().unwrap().fps,30);
     }
     #[test]
     fn protobuf_bad_wire_overflow_missing_duplicate_fields() {
