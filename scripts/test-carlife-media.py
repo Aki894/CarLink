@@ -5,6 +5,7 @@ serial and AOA helper. Otherwise --address can be an SSH-forwarded TCP port.
 """
 import argparse
 import importlib.util
+import hashlib
 import json
 import pathlib
 import socket
@@ -37,8 +38,18 @@ def packet(stream):
 
 def probe(stream, output):
     stream.settimeout(3)
-    stream.sendall(lab.command(0x18001, b'\x08\x02\x10\x00'))
-    assert [packet(stream)[1] for _ in range(4)] == [0x10002, 0x1001b, 0x10018, 0x10004]
+    stream.sendall(lab.command(0x18001, b'\x08\x04\x10\x01'))
+    startup = [packet(stream) for _ in range(4)]
+    assert [p[1] for p in startup] == [0x10002, 0x1001b, 0x10018, 0x10004]
+    # Fixed public lab identity, independently checked against MD_INFO on wire.
+    assert b'CarLink Linux MD' in startup[3][3] and b'29' in startup[3][3]
+    nonce = b'lab-probe-nonce'
+    challenge = b'2.0;' + nonce + b';ignored'
+    stream.sendall(lab.command(0x18048, b'\x0a' + bytes([len(challenge)]) + challenge))
+    response = packet(stream)
+    digest = hashlib.md5(b'CARLIFECarLinkCarLink Linux MD29' + nonce).hexdigest().encode()
+    assert response[1] == 0x10049 and response[3] == b'\x0a\x20' + digest
+    stream.sendall(lab.command(0x1804a, b'\x08\x01'))
     # Actual Java HU behavior: fps=0 means unrestricted.
     stream.sendall(lab.command(0x18007, b'\x08\x80\x0a\x10\xd0\x05\x18\x00'))
     init = packet(stream)
@@ -125,7 +136,7 @@ def probe(stream, output):
         assert item[1] not in (0x30001, 0x30006), 'video resume overrode HU music stop'
     print(json.dumps({'event': 'media_probe', 'status': 'passed', 'video_frames': len(videos),
                       'pcm_chunks': len(audio), 'output': str(output.resolve()),
-                      'checks': ['fps_zero', 'loop', 'backpressure_reset', 'pause_heartbeat', 'resume', 'music_stop_query', 'mute_latch']}))
+                      'checks': ['v4_1', 'v2_auth', 'fps_zero', 'loop', 'backpressure_reset', 'pause_heartbeat', 'resume', 'music_stop_query', 'mute_latch']}))
 
 
 if __name__ == '__main__':
