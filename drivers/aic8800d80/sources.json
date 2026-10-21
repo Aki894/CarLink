@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/shenmintao/aic8800d80.git",
+  "variants": {
+    "main": "5327c777d00a94ee3bea09525b3acc8e1b031993",
+    "mcu1": "a9683a456079131a0381ed75fb7a4f5514527b3c"
+  },
+  "kernel_release": "6.18.57-current-sunxi",
+  "kernel_evidence_run": 39459953269,
+  "kernel_evidence_artifact": 12286805150,
+  "headers_package": "linux-headers-current-sunxi_26.11.0-trunk_armhf__6.18.57-S2ff6-D68f5-P063e-C5688-H6541-HK01ba-V014b-Bb9ae-R448a.deb",
+  "headers_sha256": "ea535236dadbf03ef6e5b67fbd19926c6098186207bfd027137a300bcc3d528a",
+  "symvers_sha256": "a46bcf7b3675fd2e911b3212db17a2ba4797c26f3d4216da344afe063246d04d",
+  "kernel_config_sha256": "8d2d6028b27581489bfbf4bbdce1d7b92b04ac8c8d7aa72dc323716e1590f8b3"
+}

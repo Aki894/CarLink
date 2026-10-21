@@ -1,0 +1,68 @@
+name: AIC USB driver for installed kernel
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  driver:
+    runs-on: ubuntu-24.04
+    container: debian:trixie
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [main, mcu1]
+    steps:
+      - name: Install host tools and ARMv7 cross compiler
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git python3 curl xz-utils zstd \
+            build-essential gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf \
+            bc flex bison libssl-dev libelf-dev pkg-config kmod file
+      - uses: actions/checkout@v4
+      - name: Check fixed evidence run and artifact identity
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          lock = json.load(open('drivers/aic8800d80/sources.json'))
+          base = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'}
+          def get(path):
+              return json.load(urllib.request.urlopen(urllib.request.Request(base + path, headers=headers), timeout=60))
+          run = get('/actions/runs/' + str(lock['kernel_evidence_run']))
+          assert run['conclusion'] == 'success' and run['status'] == 'completed', 'Kernel build did not succeed'
+          artifact = get('/actions/artifacts/' + str(lock['kernel_evidence_artifact']))
+          assert not artifact['expired'] and artifact['name'] == 'carlink-h3-build-evidence'
+          assert artifact['workflow_run']['id'] == lock['kernel_evidence_run']
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: '12286805150'
+          path: .build/kernel-evidence
+          run-id: '39459953269'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          merge-multiple: true
+      - name: Inspect headers and build matched driver package
+        run: |
+          bash -n scripts/build-aic-driver.sh drivers/aic8800d80/install.sh
+          bash scripts/build-aic-driver.sh '${{ matrix.variant }}' .build/kernel-evidence 'dist/aic/${{ matrix.variant }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aic8800-usb-${{ matrix.variant }}
+          path: dist/aic/${{ matrix.variant }}/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Preserve failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aic-build-failure-${{ matrix.variant }}
+          path: .build/aic-${{ matrix.variant }}/*.log
+          if-no-files-found: ignore
+          retention-days: 14

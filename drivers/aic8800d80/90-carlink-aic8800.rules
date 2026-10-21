@@ -1,0 +1,5 @@
+# Only the adapter actually observed on this board; do not claim other USB IDs.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="a69c", ATTR{idProduct}=="5721", RUN+="/usr/sbin/usb_modeswitch -v a69c -p 5721 -K"
+# The firmware loader and Wi-Fi driver have USB modaliases. Standard btusb
+# handles the Bluetooth interface; never inject aic_btusb/new_id or blacklist it.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="368b", ATTR{idProduct}=="8d81", RUN+="/sbin/modprobe aic_zlp_quirk"

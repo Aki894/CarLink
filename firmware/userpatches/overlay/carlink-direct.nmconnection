@@ -1,7 +1,7 @@
 [connection]
 id=carlink-direct
 type=ethernet
-interface-name=eth0
+interface-name=end0
 autoconnect=true
 autoconnect-priority=100
 
