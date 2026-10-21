@@ -1,10 +1,46 @@
 //! Temporary, explicitly owned FunctionFS AOA1 USB transport.
 //! No networking, pairing data, persistent services or other gadgets are changed.
 
+const WINUSB_INTERFACE_GUID: &str = "{B608E05E-72F0-466A-B77C-793EF58A88D5}";
+
+fn os_feature(index: u16, count: u16, body: &[u8]) -> Vec<u8> {
+    // Packed FunctionFS header, NOT the 16/10-byte Windows wire headers.
+    let mut data = vec![0]; // Interface zero.
+    data.extend_from_slice(&(11u32 + body.len() as u32).to_le_bytes());
+    data.extend_from_slice(&0x0100u16.to_le_bytes());
+    data.extend_from_slice(&index.to_le_bytes());
+    data.extend_from_slice(&count.to_le_bytes()); // Compat: bCount + Reserved.
+    data.extend_from_slice(body);
+    data
+}
+
+fn winusb_features() -> [Vec<u8>; 2] {
+    let mut compatible = vec![0, 1]; // Interface zero, Reserved1 must equal one.
+    compatible.extend_from_slice(b"WINUSB\0\0");
+    compatible.extend_from_slice(&[0; 14]); // SubCompatibleID[8], Reserved2[6].
+
+    // FunctionFS accepts UTF-8 property strings and converts them to UTF-16LE
+    // in composite.c. Supplying UTF-16 here would encode them twice.
+    // Linux 6.18 composite.c does not serialize type 7 (REG_MULTI_SZ).
+    // Microsoft's supported single-interface equivalent is the singular
+    // DeviceInterfaceGUID REG_SZ, which WinUSB registers for discovery.
+    let name = b"DeviceInterfaceGUID\0";
+    let value = format!("{WINUSB_INTERFACE_GUID}\0").into_bytes();
+    let mut property = Vec::new();
+    property.extend_from_slice(&(14u32 + name.len() as u32 + value.len() as u32).to_le_bytes());
+    property.extend_from_slice(&1u32.to_le_bytes()); // REG_SZ.
+    property.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    property.extend_from_slice(name);
+    property.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    property.extend_from_slice(&value);
+    [os_feature(4, 1, &compatible), os_feature(5, 1, &property)]
+}
+
 fn descriptors() -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&3u32.to_le_bytes()); // Full-speed descriptor count.
     body.extend_from_slice(&3u32.to_le_bytes()); // High-speed descriptor count.
+    body.extend_from_slice(&2u32.to_le_bytes()); // MS OS feature descriptor count.
     for packet in [64u16, 512u16] {
         body.extend_from_slice(&[9, 4, 0, 0, 2, 255, 255, 0, 1]);
         for address in [0x01, 0x82] {
@@ -13,11 +49,14 @@ fn descriptors() -> Vec<u8> {
             body.push(0);
         }
     }
+    for feature in winusb_features() {
+        body.extend_from_slice(&feature);
+    }
     let mut result = Vec::new();
     result.extend_from_slice(&3u32.to_le_bytes()); // FUNCTIONFS_DESCRIPTORS_MAGIC_V2.
     result.extend_from_slice(&(12u32 + body.len() as u32).to_le_bytes());
-    // FS, HS, device-recipient vendor requests, and requests before configuration.
-    result.extend_from_slice(&(1u32 | 2 | 64 | 128).to_le_bytes());
+    // FS, HS, MS OS, device vendor requests, and requests before configuration.
+    result.extend_from_slice(&(1u32 | 2 | 8 | 64 | 128).to_le_bytes());
     result.extend_from_slice(&body);
     result
 }
@@ -230,6 +269,7 @@ mod linux {
         ffs_created: bool,
         mounted: bool,
         linked: bool,
+        os_linked: bool,
         bound: bool,
         ep0: Option<File>,
         rx: Option<File>,
@@ -269,13 +309,14 @@ mod linux {
             if !function.trim().is_empty() { return Err("UDC has a bound function; refusing to replace it".into()); }
             let udc = controllers[0].file_name().into_string().map_err(|_| "invalid UDC name")?;
             let mut own = Self { _lock: lock, udc, created: false, ffs_created: false,
-                mounted: false, linked: false, bound: false, ep0: None, rx: None, tx: None, allow_cleanup: true };
+                mounted: false, linked: false, os_linked: false, bound: false,
+                ep0: None, rx: None, tx: None, allow_cleanup: true };
             mkdir(ROOT)?;
             own.created = true;
             put(Path::new(ROOT).join("idVendor"), "0x18d1")?;
             put(Path::new(ROOT).join("idProduct"), "0x4ee7")?;
             put(Path::new(ROOT).join("bcdUSB"), "0x0200")?;
-            put(Path::new(ROOT).join("bcdDevice"), "0x0100")?;
+            put(Path::new(ROOT).join("bcdDevice"), "0x0101")?;
             mkdir(Path::new(ROOT).join("strings/0x409"))?;
             for (key, value) in [("manufacturer", "CarLink"), ("product", "CarLink H3 MD"),
                                  ("serialnumber", "carlink-h3-lab")] {
@@ -283,6 +324,12 @@ mod linux {
             }
             mkdir(Path::new(ROOT).join("configs/c.1"))?;
             put(Path::new(ROOT).join("configs/c.1/MaxPower"), "250")?;
+            put(Path::new(ROOT).join("os_desc/use"), "1")?;
+            put(Path::new(ROOT).join("os_desc/b_vendor_code"), "0x20")?;
+            put(Path::new(ROOT).join("os_desc/qw_sign"), "MSFT100")?;
+            symlink(Path::new(ROOT).join("configs/c.1"), Path::new(ROOT).join("os_desc/c.1"))
+                .map_err(|e| format!("link MS OS descriptor configuration: {e}"))?;
+            own.os_linked = true;
             mkdir(Path::new(ROOT).join("functions/ffs.carlink"))?;
             mkdir(FFS)?;
             own.ffs_created = true;
@@ -335,6 +382,10 @@ mod linux {
             if self.created { self.unbind()?; }
             self.rx.take(); self.tx.take(); self.ep0.take();
             let mut errors = Vec::new();
+            if self.os_linked {
+                if let Err(e) = fs::remove_file(Path::new(ROOT).join("os_desc/c.1")) { errors.push(e.to_string()); }
+                else { self.os_linked = false; }
+            }
             if self.linked {
                 if let Err(e) = fs::remove_file(Path::new(ROOT).join("configs/c.1/ffs.carlink")) { errors.push(e.to_string()); }
                 else { self.linked = false; }
@@ -347,7 +398,7 @@ mod linux {
             if self.ffs_created && !self.mounted {
                 if let Err(e) = fs::remove_dir(FFS) { errors.push(e.to_string()); } else { self.ffs_created = false; }
             }
-            if self.created && !self.mounted && !self.linked {
+            if self.created && !self.mounted && !self.linked && !self.os_linked {
                 for path in ["functions/ffs.carlink", "configs/c.1", "strings/0x409"] {
                     let child = Path::new(ROOT).join(path);
                     if child.exists() {
@@ -630,11 +681,11 @@ mod tests {
     #[test]
     fn fs_hs_descriptors_have_fixed_bulk_directions_and_packet_sizes() {
         let data = descriptors();
-        assert_eq!(data.len(), 66);
-        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 66);
-        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 195);
-        assert_eq!(&data[12..20], &[3, 0, 0, 0, 3, 0, 0, 0]);
-        for (base, size) in [(20, 64u16), (43, 512u16)] {
+        assert_eq!(data.len(), 189);
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 189);
+        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 203);
+        assert_eq!(&data[12..24], &[3, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0]);
+        for (base, size) in [(24, 64u16), (47, 512u16)] {
             assert_eq!(&data[base..base + 9], &[9, 4, 0, 0, 2, 255, 255, 0, 1]);
             for (offset, address) in [(9, 1), (16, 0x82)] {
                 assert_eq!(&data[base + offset..base + offset + 4], &[7, 5, address, 2]);
@@ -644,6 +695,37 @@ mod tests {
         let string_data = strings();
         assert_eq!(u32::from_le_bytes(string_data[4..8].try_into().unwrap()) as usize, string_data.len());
         assert_eq!(string_data.last(), Some(&0));
+    }
+
+    #[test]
+    fn winusb_os_features_match_functionfs_packed_parser_layout() {
+        let [compatible, properties] = winusb_features();
+        for (data, index) in [(&compatible, 4u16), (&properties, 5u16)] {
+            assert_eq!(data[0], 0);
+            assert_eq!(u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize, data.len());
+            assert_eq!(&data[5..7], &0x0100u16.to_le_bytes());
+            assert_eq!(&data[7..9], &index.to_le_bytes());
+            assert_eq!(&data[9..11], &[1, 0]);
+        }
+        assert_eq!(compatible.len(), 11 + 24);
+        assert_eq!(&compatible[11..13], &[0, 1]);
+        assert_eq!(&compatible[13..21], b"WINUSB\0\0");
+        assert!(compatible[21..].iter().all(|b| *b == 0));
+        // Host-facing compatible descriptor is 40 bytes; FunctionFS is 35.
+        assert_ne!(u32::from_le_bytes(compatible[1..5].try_into().unwrap()), 40);
+        let property = &properties[11..];
+        assert_eq!(u32::from_le_bytes(property[..4].try_into().unwrap()) as usize, property.len());
+        assert_eq!(&property[4..8], &1u32.to_le_bytes());
+        let name_length = u16::from_le_bytes(property[8..10].try_into().unwrap()) as usize;
+        assert_eq!(&property[10..10 + name_length], b"DeviceInterfaceGUID\0");
+        let length_offset = 10 + name_length;
+        let value_length = u32::from_le_bytes(property[length_offset..length_offset + 4].try_into().unwrap()) as usize;
+        let value = &property[length_offset + 4..];
+        assert_eq!(value.len(), value_length);
+        assert_eq!(value, format!("{WINUSB_INTERFACE_GUID}\0").as_bytes());
+        // Composite doubles these UTF-8 ASCII lengths to form wire WCHARs.
+        assert_eq!(10 + 14 + 2 * name_length + 2 * value_length, 142);
+        assert_eq!(descriptors()[70..], [compatible, properties].concat());
     }
 
     #[test]
