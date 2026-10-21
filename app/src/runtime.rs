@@ -21,6 +21,7 @@ pub struct Endpoint {
     hu_muted: bool,
     epochs: [u64; 2],
     last_video: Duration,
+    first_header: Vec<u8>,
 }
 
 impl Endpoint {
@@ -31,7 +32,8 @@ impl Endpoint {
     pub fn with_media(media: Option<TestMedia>) -> Self {
         let session = media.as_ref().map_or_else(Session::new, |m| Session::with_video_source(m.config()));
         Self { decoder: Decoder::new(Limits::default()), session, media, clock: Instant::now(),
-            playing: false, audio_on: false, audio_allowed: true, hu_muted: false, epochs: [0; 2], last_video: Duration::ZERO }
+            playing: false, audio_on: false, audio_allowed: true, hu_muted: false, epochs: [0; 2], last_video: Duration::ZERO,
+            first_header: Vec::with_capacity(8) }
     }
 
     fn music_status(&self) -> Result<Vec<u8>, String> {
@@ -66,7 +68,9 @@ impl Endpoint {
 
     pub fn receive(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         let mut packets = Vec::new();
-        for message in self.decoder.feed(bytes).map_err(|e| e.to_string())? {
+        let needed = 8 - self.first_header.len();
+        self.first_header.extend_from_slice(&bytes[..bytes.len().min(needed)]);
+        for message in self.decoder.feed(bytes).map_err(|e| format!("{e}; first_outer_header={:02x?} chunk_bytes={}", self.first_header, bytes.len()))? {
             log("carlife_rx", &format!("channel={:?} id=0x{:08x} bytes={}",
                 message.channel, message.id, message.payload.len()));
             let outcome = self.session.handle(&message).map_err(|e| e.to_string())?;
