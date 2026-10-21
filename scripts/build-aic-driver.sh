@@ -48,18 +48,41 @@ for tool in scripts/basic/fixdep scripts/mod/modpost scripts/mod/mk_elfconfig sc
         fi
     fi
 done
-abi_before=$(sha256sum "$kdir/Module.symvers" "$kdir/.config" "$kdir/include/config/auto.conf" "$kdir/include/generated/utsrelease.h")
-make -C "$kdir" ARCH=arm CROSS_COMPILE="$cross" HOSTCC=gcc HOSTCXX=g++ -j2 scripts
-# Some header packages' scripts target omits modpost; explicitly build this
-# exact supplied subdirectory if needed, rather than borrowing host headers.
-if [[ ! -x $kdir/scripts/mod/modpost ]]; then
-    make -C "$kdir" ARCH=arm CROSS_COMPILE="$cross" HOSTCC=gcc HOSTCXX=g++ -j2 scripts/mod/
-fi
+abi_fingerprint() {
+    python3 - "$kdir" <<'PY'
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+files = [root / '.config', root / 'Module.symvers']
+for directory in ['include/config', 'include/generated', 'arch/arm/include/generated']:
+    files.extend(p for p in (root / directory).rglob('*') if p.is_file())
+records = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(set(files))}
+print(hashlib.sha256(json.dumps(records, sort_keys=True).encode()).hexdigest())
+PY
+}
+abi_before=$(abi_fingerprint)
+echo "Pinned ABI tree fingerprint before host-tool build: $abi_before"
+# Do NOT call top-level 'scripts', 'scripts/mod/' or modules_prepare. They
+# invoke syncconfig/archheaders, while Armbian deliberately omits syscall.tbl
+# from its headers package. Build only the supplied host-tool subdirectories.
+# modpost needs target ARM empty.o/devicetable-offsets.s for ELF layout; these
+# are tools' temporary objects, not regenerated kernel configuration/headers.
+linuxinclude="-I$kdir/arch/arm/include -I$kdir/arch/arm/include/generated -I$kdir/include -I$kdir/arch/arm/include/uapi -I$kdir/arch/arm/include/generated/uapi -I$kdir/include/uapi -I$kdir/include/generated/uapi -include $kdir/include/linux/compiler-version.h -include $kdir/include/linux/kconfig.h -include $kdir/include/linux/compiler_types.h"
+host_build=(make -C "$kdir" -f scripts/Makefile.build -j2
+    "srctree=$kdir" "srcroot=$kdir" "objtree=$kdir"
+    ARCH=arm SRCARCH=arm "CROSS_COMPILE=$cross"
+    "CC=${cross}gcc" "LD=${cross}ld" "AR=${cross}ar" "NM=${cross}nm"
+    HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld
+    "KBUILD_HOSTCFLAGS=-O2 -std=gnu11" "KBUILD_HOSTCXXFLAGS=-O2"
+    "LINUXINCLUDE=$linuxinclude" "KBUILD_CPPFLAGS=-D__KERNEL__"
+    "KBUILD_CFLAGS=-O2 -std=gnu11 -mabi=aapcs-linux -marm -mlittle-endian -march=armv7-a -msoft-float"
+    CONFIG_SHELL=/bin/bash SHELL=/bin/bash)
+"${host_build[@]}" obj=scripts/basic
+"${host_build[@]}" obj=scripts/mod
 for tool in scripts/basic/fixdep scripts/mod/modpost; do
     test -x "$kdir/$tool"
     file "$kdir/$tool" | grep -q 'x86-64' || { echo "Host utility is not x86_64: $tool"; exit 1; }
 done
-[[ $(sha256sum "$kdir/Module.symvers" "$kdir/.config" "$kdir/include/config/auto.conf" "$kdir/include/generated/utsrelease.h") == "$abi_before" ]] || { echo 'Header preparation modified pinned ABI inputs'; exit 1; }
+[[ $(abi_fingerprint) == "$abi_before" ]] || { echo 'Host-tool build modified pinned ABI inputs'; exit 1; }
 
 git init "$work/source"
 git -C "$work/source" remote add origin https://github.com/shenmintao/aic8800d80.git
@@ -68,7 +91,7 @@ git -C "$work/source" checkout --detach FETCH_HEAD
 [[ $(git -C "$work/source" rev-parse HEAD) == "$commit" ]]
 source_dir="$work/source/drivers/aic8800"
 make -C "$source_dir" -j2 ARCH=arm CROSS_COMPILE="$cross" KDIR="$kdir" KVER="$release" HOSTCC=gcc HOSTCXX=g++
-[[ $(sha256sum "$kdir/Module.symvers" "$kdir/.config" "$kdir/include/config/auto.conf" "$kdir/include/generated/utsrelease.h") == "$abi_before" ]] || { echo 'Module build changed pinned ABI inputs'; exit 1; }
+[[ $(abi_fingerprint) == "$abi_before" ]] || { echo 'Module build changed pinned ABI inputs'; exit 1; }
 
 stage="$work/package"
 mkdir -p "$stage/modules/$release/extra/aic8800" "$stage/firmware" "$stage/udev" "$stage/licenses"
@@ -87,7 +110,15 @@ test -d "$work/source/fw/aic8800D80"
 test -s "$work/source/LICENSE"
 # Preserve each pinned variant's entire firmware set and supplied notices.
 # Do not execute the third-party installer or alter firmware/calibration data.
-cp -a "$work/source/fw/." "$stage/firmware/"
+for firmware_entry in "$work/source/fw/"*; do
+    if [[ -d $firmware_entry && $(basename "$firmware_entry") == aic8800* ]]; then
+        cp -a "$firmware_entry" "$stage/firmware/"
+    elif [[ -f $firmware_entry ]]; then
+        cp "$firmware_entry" "$stage/licenses/firmware-root-$(basename "$firmware_entry")"
+    else
+        echo "Unexpected firmware entry: $firmware_entry"; exit 1
+    fi
+done
 cp "$work/source/LICENSE" "$stage/licenses/aic8800-source-LICENSE"
 find "$work/source/fw" -type f \( -iname '*license*' -o -iname '*copying*' -o -iname '*copyright*' \) -print > "$work/firmware-license-files.log"
 install -m 0644 "$repo/drivers/aic8800d80/90-carlink-aic8800.rules" "$stage/udev/"
