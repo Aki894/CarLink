@@ -1,0 +1,68 @@
+--- a/rust/carplay-airplay/src/air_play_info_plist.rs
++++ b/rust/carplay-airplay/src/air_play_info_plist.rs
+@@ -183,13 +183,20 @@
+         .microphone
+         .then_some(mono | if c.microphone_opus { opus } else { 0 });
+     let output_opus = if c.output_opus { opus } else { 0 };
++    // Telephony negotiates narrow/wideband voice, not entertainment-rate PCM.
++    // iOS rejects the entire audio offer when this role includes 44.1/48 kHz.
++    let phone_pcm = 0x150u64; // 16/24/32 kHz, signed 16-bit mono
++    let phone_opus = opus & !0x40000000u64; // 16/24 kHz mono
++    let phone_input = c.microphone.then_some(
++        phone_pcm | if c.microphone_opus { phone_opus } else { 0 },
++    );
+     let mut formats = vec![
+         (100, "compatibility", pcm, input),
+         (101, "compatibility", pcm, None),
+         (100, "default", speech | output_opus, wireless),
+         (100, "alert", speech | output_opus, None),
+         (100, "media", pcm, None),
+-        (100, "telephony", mono | output_opus, wireless),
++        (100, "telephony", phone_pcm | (output_opus & phone_opus), phone_input),
+         (100, "speechRecognition", mono | output_opus, wireless),
+         (101, "default", speech | output_opus, None),
+         (102, "media", aac, None),
+--- a/rust/carplay-airplay/tests/control_info.rs
++++ b/rust/carplay-airplay/tests/control_info.rs
+@@ -205,19 +205,19 @@
+         .get("audioInputFormats")
+         .is_none());
+     c.microphone = true;
+-    for audio in ["telephony", "default", "speechRecognition"] {
++    for audio in ["default", "speechRecognition"] {
+         assert_eq!(
+             uint(&format(&c, 100, audio), "audioInputFormats"),
+             0x70004154
+         );
+     }
+     c.microphone_opus = false;
+-    for audio in ["telephony", "default", "speechRecognition"] {
++    for audio in ["default", "speechRecognition"] {
+         assert_eq!(uint(&format(&c, 100, audio), "audioInputFormats"), 0x4154);
+     }
+     assert_eq!(
+         uint(&format(&c, 100, "telephony"), "audioOutputFormats"),
+-        0x70004154
++        0x30000150
+     );
+ }
+ #[test]
+@@ -461,3 +461,18 @@
+         .is_err()
+     );
+ }
++
++#[test]
++fn telephony_offer_excludes_entertainment_rates() {
++    let mut c = config();
++    for opus in [true, false] {
++        c.output_opus = opus;
++        c.microphone_opus = opus;
++        let f = format(&c, 100, "telephony");
++        let expected = 0x150 | if opus { 0x30000000 } else { 0 };
++        assert_eq!(uint(&f, "audioOutputFormats"), expected);
++        assert_eq!(uint(&f, "audioInputFormats"), expected);
++    }
++    c.microphone = false;
++    assert!(format(&c, 100, "telephony").get("audioInputFormats").is_none());
++}
