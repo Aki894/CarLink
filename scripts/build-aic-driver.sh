@@ -41,7 +41,7 @@ cross=arm-linux-gnueabihf-
 # Armbian headers contain sources for host utilities, but no usable x86
 # fixdep/modpost executables. Build them on the runner; never run an ARM ELF
 # tool or replace the ABI-defining .config/generated headers/Module.symvers.
-for tool in scripts/basic/fixdep scripts/mod/modpost scripts/mod/mk_elfconfig scripts/genksyms/genksyms; do
+for tool in scripts/basic/fixdep scripts/mod/modpost scripts/mod/mk_elfconfig scripts/genksyms/genksyms scripts/recordmcount; do
     if [[ -f $kdir/$tool ]]; then
         if file "$kdir/$tool" | grep -q 'ELF'; then
             rm -- "$kdir/$tool"
@@ -112,7 +112,8 @@ host_build=(make -C "$kdir" -f scripts/Makefile.build -j2
     "${kbuild_flags[@]}" CONFIG_SHELL=/bin/bash SHELL=/bin/bash)
 "${host_build[@]}" obj=scripts/basic
 "${host_build[@]}" obj=scripts/mod
-for tool in scripts/basic/fixdep scripts/mod/modpost; do
+"${host_build[@]}" obj=scripts scripts/recordmcount
+for tool in scripts/basic/fixdep scripts/mod/modpost scripts/recordmcount; do
     test -x "$kdir/$tool"
     file "$kdir/$tool" | grep -q 'x86-64' || { echo "Host utility is not x86_64: $tool"; exit 1; }
 done
