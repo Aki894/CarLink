@@ -73,6 +73,9 @@ impl Endpoint {
         for message in self.decoder.feed(bytes).map_err(|e| format!("{e}; first_outer_header={:02x?} chunk_bytes={}", self.first_header, bytes.len()))? {
             log("carlife_rx", &format!("channel={:?} id=0x{:08x} bytes={}",
                 message.channel, message.id, message.payload.len()));
+            if message.id == ids::VIDEO_INIT {
+                log("hu_video_preference", &format!("{:?}", crate::carlife::video_hint(&message.payload).map_err(|e| e.to_string())?));
+            }
             let outcome = self.session.handle(&message).map_err(|e| e.to_string())?;
             for event in outcome.events {
                 log("carlife_state", &format!("{event:?}"));

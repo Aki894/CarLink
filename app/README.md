@@ -13,17 +13,23 @@ sudo carlink carlife usb --duration 120
 The application implements framing, MD handshake and video negotiation. Default
 mode sends no media. Opt-in synthetic media uses a bounded pre-encoded H.264
 loop and quiet intermittent PCM tone; H3 performs no live video encoding.
-Unsupported authentication or encryption requests exit with an error.
+CarLife 2.0 challenges are answered from the actual transmitted MD_INFO and HU
+nonce using the public digest profile. HU acceptance is checked explicitly;
+legacy RSA challenges and encrypted media exit with a diagnostic error. The
+separate USB peer acceptance notice follows metadata exchange and a calculated
+challenge response, with no private identity material required.
 
 ```sh
 # Generate assets on the development PC (FFmpeg required), then transfer the
-# directory to the board. Match the HU's requested video dimensions exactly.
+# directory to the board. INIT_DONE advertises the validated asset dimensions.
 python scripts/generate-test-media.py .build/test-media-720p --width 1280 --height 720 --fps 30
 sudo carlink carlife usb --duration 300 --test-media /opt/carlink/test-media
 ```
 
 The source validates baseline SPS dimensions/timing, access-unit boundaries and
-asset bounds before binding USB. HU fps=0 selects the source rate, capped at 30;
+asset bounds before binding USB. HU dimensions are display preferences; the
+actual encoded dimensions from the assets are reported in INIT_DONE. HU fps=0
+selects the source rate, capped at 30;
 lower requested rates adjust pacing. START begins test playback; PAUSE stops the
 test picture and tone, keeping video heartbeats. RESET restarts video from
 SPS/PPS+IDR with its mode preserved. HU music STOP remains latched through video

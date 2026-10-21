@@ -262,6 +262,11 @@ fn be32(bytes: &[u8]) -> u32 { u32::from_be_bytes([bytes[0], bytes[1], bytes[2],
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VideoConfig { pub width: u32, pub height: u32, pub fps: u32 }
+
+pub fn video_hint(payload: &[u8]) -> Result<VideoConfig, Error> {
+    let f = fields(payload)?;
+    Ok(VideoConfig { width: uint(&f,1)?, height: uint(&f,2)?, fps: uint(&f,3)? })
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoState { Uninitialized, Negotiated, AwaitingVideoSource, Paused }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -277,6 +282,7 @@ pub enum Event {
     MusicControl { status: u32 }, AudioTransport { usb: bool },
     AuthenticationResponded, HuAuthenticationAccepted,
     UsbPeerAccepted,
+    HuProceededToVideo,
     Unhandled { channel: Channel, id: u32, bytes: usize },
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -297,13 +303,14 @@ pub struct Session {
     statistic_seen: bool,
     hu_info_seen: bool,
     peer_accepted: bool,
+    auth_proceeded: bool,
 }
 impl Default for Session { fn default() -> Self { Self::new() } }
 
 impl Session {
     pub fn new() -> Self { Self { version: None, video: None, state: VideoState::Uninitialized, generation: 0, failed: false, source: None,
         auth_identity: None, auth_sent: false, auth_accepted: false, feature_requested: false,
-        statistic_seen: false, hu_info_seen: false, peer_accepted: false } }
+        statistic_seen: false, hu_info_seen: false, peer_accepted: false, auth_proceeded: false } }
     pub fn with_video_source(config: VideoConfig) -> Self { Self { source: Some(config), ..Self::new() } }
     pub fn video_state(&self) -> VideoState { self.state }
     pub fn video_config(&self) -> Option<VideoConfig> { self.video }
@@ -398,29 +405,34 @@ impl Session {
                 out.events.push(Event::HuAuthenticationAccepted);
             },
             VIDEO_INIT => {
-                let f = fields(&message.payload)?;
-                let (width, height, fps) = (uint(&f, 1)?, uint(&f, 2)?, uint(&f, 3)?);
-                if !(16..=1920).contains(&width) || !(16..=1080).contains(&height)
-                    || width % 2 != 0 || height % 2 != 0 || fps > 60 {
+                let hint = video_hint(&message.payload)?;
+                let (width, height, fps) = (hint.width, hint.height, hint.fps);
+                if !(16..=8192).contains(&width) || !(16..=8192).contains(&height) || fps > 60 {
                     return Err(Error::InvalidVideoConfig);
                 }
                 // Java HUs use zero to request an unrestricted frame rate.
                 let mut config = VideoConfig { width, height, fps: if fps == 0 { 30 } else { fps.min(30) } };
                 if let Some(source) = self.source {
-                    if (width, height) != (source.width, source.height) {
-                        return Err(Error::Unsupported("test video dimensions differ from HU request; regenerate test assets"));
-                    }
+                    // HU supplies a display preference. INIT_DONE must report
+                    // the actual encoded mode, which the HU scales to display.
+                    config.width = source.width; config.height = source.height;
                     config.fps = config.fps.min(source.fps);
+                } else if width > 1920 || height > 1080 || width % 2 != 0 || height % 2 != 0 {
+                    return Err(Error::InvalidVideoConfig);
+                }
+                if self.auth_sent && self.peer_accepted && !self.auth_accepted {
+                    self.auth_proceeded = true;
+                    out.events.push(Event::HuProceededToVideo);
                 }
                 // Identical retries re-ACK without undoing START/PAUSE state.
                 if self.video != Some(config) { self.video = Some(config); self.state = VideoState::Negotiated; }
-                out.outgoing.push(cmd(VIDEO_INIT_DONE, integers(&[(1, width as u64), (2, height as u64), (3, config.fps as u64)]))?);
+                out.outgoing.push(cmd(VIDEO_INIT_DONE, integers(&[(1, config.width as u64), (2, config.height as u64), (3, config.fps as u64)]))?);
                 out.events.push(Event::VideoNegotiated(config));
             },
             VIDEO_START => {
                 no_payload(message)?;
                 if self.video.is_none() { return Err(Error::InvalidState("VIDEO_START before INIT")); }
-                if self.auth_sent && !self.auth_accepted { return Err(Error::InvalidState("VIDEO_START before HU authentication acceptance")); }
+                if self.auth_sent && !self.auth_accepted && !self.auth_proceeded { return Err(Error::InvalidState("VIDEO_START before HU authentication progress")); }
                 self.state = VideoState::AwaitingVideoSource;
                 out.events.push(Event::AwaitingVideoSource);
             },
@@ -742,7 +754,7 @@ mod tests {
         let zero=cmd(ids::VIDEO_INIT,integers(&[(1,1280),(2,720),(3,0)])).unwrap();
         s.handle(&zero).unwrap(); assert_eq!(s.video_config(),Some(config));
         let mismatch=cmd(ids::VIDEO_INIT,integers(&[(1,800),(2,480),(3,30)])).unwrap();
-        assert!(matches!(s.handle(&mismatch),Err(Error::Unsupported(_))));
+        s.handle(&mismatch).unwrap();
         assert_eq!(s.video_config(),Some(config));
         let mut normal=Session::new(); normal.handle(&version()).unwrap();
         normal.handle(&zero).unwrap(); assert_eq!(normal.video_config().unwrap().fps,30);
