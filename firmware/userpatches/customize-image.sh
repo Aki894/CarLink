@@ -19,6 +19,7 @@ for file in /etc/modules /etc/modules-load.d/*.conf; do
 done
 mkdir -p /etc/modprobe.d
 printf 'blacklist g_serial\n' > /etc/modprobe.d/carlink-gadget.conf
+install -m 0644 /tmp/overlay/carlink-aic.conf /etc/modprobe.d/carlink-aic.conf
 
 # Keep first-login password rotation and SSH host-key generation from Armbian.
 systemctl enable ssh

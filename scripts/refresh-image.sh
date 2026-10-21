@@ -116,6 +116,11 @@ fi
 [[ ${BASE_RUN_ID:-} =~ ^[0-9]+$ && ${REFRESH_COMMIT:-} =~ ^[0-9a-f]{40}$ ]]
 [[ -z ${DRIVER_RUN_ID:-} || ${DRIVER_RUN_ID} =~ ^[0-9]+$ ]]
 [[ ${DRIVER_VARIANT:-main} == main || ${DRIVER_VARIANT:-main} == mcu1 ]]
+export DISABLE_ONBOARD_WIFI=${DISABLE_ONBOARD_WIFI:-false}
+[[ "$DISABLE_ONBOARD_WIFI" == false || "$DISABLE_ONBOARD_WIFI" == true ]]
+[[ "$DISABLE_ONBOARD_WIFI" == false || -n ${DRIVER_RUN_ID:-} ]] || {
+    echo 'Disabling XR819 requires an AIC driver run' >&2; exit 2;
+}
 base=$(realpath "$1")
 mkdir -p "$2"
 output=$(realpath "$2")
@@ -227,6 +232,15 @@ PY
     cp -a "$work/driver/firmware/." "$rootfs/lib/firmware/"
     mkdir -p "$rootfs/etc/udev/rules.d"
     install -m 0644 "$work/driver/udev/90-carlink-aic8800.rules" "$rootfs/etc/udev/rules.d/"
+    mkdir -p "$rootfs/etc/modprobe.d"
+    install -m 0644 "$project/firmware/userpatches/overlay/carlink-aic.conf" "$rootfs/etc/modprobe.d/carlink-aic.conf"
+    cmp "$project/firmware/userpatches/overlay/carlink-aic.conf" "$rootfs/etc/modprobe.d/carlink-aic.conf"
+    grep -qx 'options aic8800_fdrv country_code=CN custregd=0' "$rootfs/etc/modprobe.d/carlink-aic.conf"
+    if [[ "$DISABLE_ONBOARD_WIFI" == true ]]; then
+        install -m 0644 "$project/firmware/userpatches/overlay/carlink-onboard-wifi.conf" "$rootfs/etc/modprobe.d/carlink-onboard-wifi.conf"
+        cmp "$project/firmware/userpatches/overlay/carlink-onboard-wifi.conf" "$rootfs/etc/modprobe.d/carlink-onboard-wifi.conf"
+        grep -Eq '^blacklist[[:space:]]+xradio_wlan([[:space:]]|$)' "$rootfs/etc/modprobe.d/carlink-onboard-wifi.conf"
+    fi
     depmod -b "$rootfs" "$kernel"
     # Verify installed content against every declared payload, not just one glob match.
     "$python" - "$work/driver" "$rootfs" <<'PY'
@@ -259,7 +273,7 @@ record={'schema_version':1,'refreshed_at_utc':datetime.datetime.now(datetime.tim
  'driver_commit':os.environ['DRIVER_COMMIT'] or None,
  'driver_variant':os.environ.get('DRIVER_VARIANT') if os.environ['DRIVER_COMMIT'] else None,
  'runtime_packages':json.loads(pathlib.Path(sys.argv[3]).read_text()),
- 'xr819_disabled':False,'hardware_acceptance':'not_tested_by_refresh'}
+ 'xr819_disabled':os.environ['DISABLE_ONBOARD_WIFI']=='true','hardware_acceptance':'not_tested_by_refresh'}
 text=json.dumps(record,indent=2)+'\n'
 (root/'etc/carlink-refresh.json').write_text(text)
 pathlib.Path(sys.argv[2]).write_text(text)

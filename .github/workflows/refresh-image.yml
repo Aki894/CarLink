@@ -16,6 +16,10 @@ on:
         type: choice
         options: [main, mcu1]
         default: main
+      disable_onboard_wifi:
+        description: Disable XR819 after accepted AIC Wi-Fi/Bluetooth/AP tests; requires driver_run_id
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
@@ -30,6 +34,7 @@ jobs:
       BASE_RUN_ID: ${{ inputs.base_run_id }}
       DRIVER_RUN_ID: ${{ inputs.driver_run_id }}
       DRIVER_VARIANT: ${{ inputs.variant }}
+      DISABLE_ONBOARD_WIFI: ${{ inputs.disable_onboard_wifi }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
@@ -38,6 +43,8 @@ jobs:
           [[ "$BASE_RUN_ID" =~ ^[0-9]+$ ]]
           [[ -z "$DRIVER_RUN_ID" || "$DRIVER_RUN_ID" =~ ^[0-9]+$ ]]
           [[ "$DRIVER_VARIANT" == main || "$DRIVER_VARIANT" == mcu1 ]]
+          [[ "$DISABLE_ONBOARD_WIFI" == false || "$DISABLE_ONBOARD_WIFI" == true ]]
+          [[ "$DISABLE_ONBOARD_WIFI" == false || -n "$DRIVER_RUN_ID" ]]
           for run in "$BASE_RUN_ID" ${DRIVER_RUN_ID:+"$DRIVER_RUN_ID"}; do
             test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" --jq .conclusion)" = success
           done
@@ -75,7 +82,7 @@ jobs:
       - name: Refresh without rebuilding kernel or app
         run: |
           sudo env BASE_RUN_ID="$BASE_RUN_ID" DRIVER_RUN_ID="$DRIVER_RUN_ID" \
-            DRIVER_VARIANT="$DRIVER_VARIANT" REFRESH_COMMIT="$GITHUB_SHA" \
+            DRIVER_VARIANT="$DRIVER_VARIANT" DISABLE_ONBOARD_WIFI="$DISABLE_ONBOARD_WIFI" REFRESH_COMMIT="$GITHUB_SHA" \
             SOURCE_REPOSITORY="$GITHUB_REPOSITORY" RUNTIME_PACKAGES_DIR="$GITHUB_WORKSPACE/dist/runtime-packages" \
             bash scripts/refresh-image.sh dist/base dist/refreshed dist/driver
           sudo chown -R "$(id -u):$(id -g)" dist/refreshed
