@@ -16,9 +16,11 @@
    Remote Touch/HID. Validate navigation, reconnects, microphone/calls separately.
 6. Optimize cold startup only after both protocol endpoints work reliably.
 
-Current code adds the first Rust CarLife MD milestone: bounded wire framing,
-handshake/video negotiation, loopback TCP lab and temporary FunctionFS AOA1 USB.
-Video/audio producers and real Lexus acceptance are the next milestone.
+Current code implements bounded wire framing, 4.1 base handshake, CarLife 2.0
+digest verification, loopback TCP lab and temporary FunctionFS AOA1 USB.
+Synthetic H.264/PCM playback passed on the real Android HU app; see the
+[media acceptance](carlife-media-2026-10-21.md). Real Lexus acceptance comes next,
+followed by integration with a live wireless CarPlay media source.
 
 Implementation choice: Rust for the headless application, Python for host-side
 test fixtures. Keep app deployment independent of kernel/image builds.

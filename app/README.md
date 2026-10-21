@@ -14,7 +14,8 @@ The application implements framing, MD handshake and video negotiation. Default
 mode sends no media. Opt-in synthetic media uses a bounded pre-encoded H.264
 loop and quiet intermittent PCM tone; H3 performs no live video encoding.
 CarLife 2.0 challenges are answered from the actual transmitted MD_INFO and HU
-nonce using the public digest profile. HU acceptance is checked explicitly;
+nonce using the public digest profile. Explicit HU rejection stops the session;
+some HUs return acceptance while others proceed directly to video negotiation.
 legacy RSA challenges and encrypted media exit with a diagnostic error. The
 separate USB peer acceptance notice follows metadata exchange and a calculated
 challenge response, with no private identity material required.
