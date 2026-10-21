@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import selectors
+import signal
 import socket
 import struct
 import time
@@ -214,6 +215,13 @@ def run(args):
                                     recording = None
                         elif kind == 'video-format' and message.get('screen') == 0:
                             f = message.get('format')
+                            # A keyframe can repeat the same configuration. Requesting
+                            # another one here would create a producer/consumer loop.
+                            if f is not None:
+                                next_parameters = avc_parameters(base64.b64decode(f['config'], validate=True))
+                                next_format = {k: f.get(k) for k in ('codec', 'width', 'height', 'fpsHint')}
+                                if parameters == next_parameters and state['video_format'] == next_format:
+                                    continue
                             parameters = b''
                             awaiting_keyframe = True
                             if recording:
@@ -308,8 +316,14 @@ def main():
             print(response.decode().strip())
             return 0 if response == b'{"ok":true}\n' else 1
     os.umask(0o077)
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
     try:
         run(args)
+    except KeyboardInterrupt:
+        return 0
     except (EOFError, OSError, ValueError, KeyError, TypeError) as error:
         print(json.dumps({'type': 'carlink-probe-exit', 'error': type(error).__name__}), flush=True)
         return 1

@@ -39,6 +39,12 @@ class WireTests(unittest.TestCase):
                     probe.send_json(s, {'type': 'video-format', 'screen': 0, 'format': dict(codec='H264',
                         config='AULAHv/hAAJngAEAAmig', width=800, height=480, fpsHint=30)})
                     self.assertEqual(probe.receive(s)['type'], 'keyframe')
+                    probe.send_json(s, {'type': 'video-format', 'screen': 0, 'format': dict(codec='H264',
+                        config='AULAHv/hAAJngAEAAmig', width=800, height=480, fpsHint=30)})
+                    s.settimeout(.2)
+                    with self.assertRaises(socket.timeout):
+                        probe.receive(s)
+                    s.settimeout(3)
                     payload = b'\0\0\0\2\x65\x80'
                     header = probe.HEADER.pack(1, 0, 1, 0, 1, 200, 200)
                     s.sendall(struct.pack('<I', len(header) + len(payload)) + header + payload)
