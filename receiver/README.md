@@ -32,7 +32,9 @@ reports video/audio metadata and drains media without decoding or displaying it.
 `carlink-carplay web --pair 600` uses the original web output subprocess instead.
 The optional environment variables `CARLINK_CARPLAY_ROOT`,
 `CARLINK_CARPLAY_STATE`, and `CARLINK_CARPLAY_WIFI` override install/state/interface
-paths. The default interface is the tested AX900 adapter `wlx002e2d91fc8e`.
+paths. `CARLINK_CARPLAY_COUNTRY` defaults to `CN` and
+`CARLINK_CARPLAY_CHANNEL` to the previously tested non-DFS channel 149. The
+default interface is the tested AX900 adapter `wlx002e2d91fc8e`.
 
 Probe status is `/run/carlink/carplay-probe.json`. The producer connects to
 `/run/carlink-carplay/media.sock`, and the local control socket appends `.control`.

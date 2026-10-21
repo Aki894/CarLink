@@ -1,5 +1,5 @@
 #!/bin/bash
-# Reuse the proven SPL, bootloader, kernel and application; never copy live-board data.
+# Reuse the proven SPL, bootloader and kernel; install verified CI applications.
 set -euo pipefail
 project=$(cd "$(dirname "$0")/.." && pwd)
 python=${PYTHON:-python3}
@@ -161,7 +161,7 @@ image="$output/image/CarLink-refresh-${BASE_RUN_ID}-${REFRESH_COMMIT:0:8}.img"
 [[ ! -e "$image" && ! -e "$image.xz" ]]
 xz -t -- "${images[0]}"
 xz -dc -- "${images[0]}" > "$image"
-bash "$project/scripts/verify-image.sh" "$image" | tee "$output/evidence/base-validation.txt"
+bash "$project/scripts/verify-image.sh" "$image" --baseline | tee "$output/evidence/base-validation.txt"
 loop=$(losetup --find --show --partscan "$image")
 udevadm settle
 mkdir "$work/root"
@@ -173,6 +173,7 @@ kernel=${kernels[0]}
 start=$(lsblk -nro START "${loop}p1")
 boot_prefix=$(dd if="$image" bs=512 count="$start" status=none | sha256sum | cut -d' ' -f1)
 app_before=$(sha256sum "$rootfs/usr/local/bin/carlink" | cut -d' ' -f1)
+cp "$rootfs/etc/carlink-build.json" "$work/base-build.json"
 boot_fingerprint() {
     (cd "$rootfs/boot"; find . -type f -print0 | sort -z | xargs -0 sha256sum; find . -type l -printf '%p -> %l\n' | sort) | sha256sum | cut -d' ' -f1
 }
@@ -258,17 +259,21 @@ PY
     cp "$work/runtime-packages.json" "$output/driver/runtime-packages/manifest.json"
 fi
 
-[[ $(sha256sum "$rootfs/usr/local/bin/carlink" | cut -d' ' -f1) == "$app_before" ]]
+"$python" "$project/scripts/install-projection-runtime.py" \
+    "${APPLICATION_DIR:?Verified application artifact required}" \
+    "${CARPLAY_DIR:?Verified CarPlay artifact required}" "$rootfs"
 [[ $(boot_fingerprint) == "$boot_before" ]]
 BASE_SHA="$base_sha" BASE_APP_SHA="$app_before" BOOT_SHA="$boot_before" KERNEL_RELEASE="$kernel" \
-DRIVER_COMMIT="$driver_commit" "$python" - "$rootfs" "$output/image/carlink-refresh.json" "$work/runtime-packages.json" <<'PY'
+DRIVER_COMMIT="$driver_commit" "$python" - "$rootfs" "$output/image/carlink-refresh.json" "$work/runtime-packages.json" "$work/base-build.json" <<'PY'
 import datetime,json,os,pathlib,sys
-root=pathlib.Path(sys.argv[1]); base=json.loads((root/'etc/carlink-build.json').read_text())
+root=pathlib.Path(sys.argv[1]); base=json.loads(pathlib.Path(sys.argv[4]).read_text())
 record={'schema_version':1,'refreshed_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
  'base_run_id':os.environ['BASE_RUN_ID'],'base_repository':os.environ.get('SOURCE_REPOSITORY',''),
  'base_image_sha256':os.environ['BASE_SHA'],'base_build':base,
  'refresh_commit':os.environ['REFRESH_COMMIT'],'kernel_release':os.environ['KERNEL_RELEASE'],
- 'preserved_app_sha256':os.environ['BASE_APP_SHA'],'preserved_boot_tree_sha256':os.environ['BOOT_SHA'],
+ 'previous_app_sha256':os.environ['BASE_APP_SHA'],'preserved_boot_tree_sha256':os.environ['BOOT_SHA'],
+ 'app_run_id':os.environ['APP_RUN_ID'],'app_source_commit':os.environ['APP_COMMIT'],
+ 'app_sha256':__import__('hashlib').sha256((root/'usr/local/bin/carlink').read_bytes()).hexdigest(),
  'network_interface':'end0','driver_run_id':os.environ.get('DRIVER_RUN_ID') or None,
  'driver_commit':os.environ['DRIVER_COMMIT'] or None,
  'driver_variant':os.environ.get('DRIVER_VARIANT') if os.environ['DRIVER_COMMIT'] else None,
@@ -286,4 +291,4 @@ bash "$project/scripts/verify-image.sh" "$image" | tee "$output/image/image-vali
 xz -T2 -3 -- "$image"
 xz -t -- "$image.xz"
 (cd "$output/image"; sha256sum -- *.img.xz > SHA256SUMS)
-echo 'Incremental image ready; original SPL, bootloader, kernel and app retained.'
+echo 'Complete refreshed image ready; original SPL/bootloader/kernel preserved; CI applications installed and image validated.'

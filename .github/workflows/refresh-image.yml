@@ -8,9 +8,13 @@ on:
         required: true
         default: '39459953269'
       driver_run_id:
-        description: Optional successful driver build run; empty means network fix only
+        description: Optional matched AIC driver build run; empty preserves the baseline driver set
         type: string
         required: false
+      app_run_id:
+        description: Successful CarLink app run containing both carlink-armv7 and carplay-armv7
+        type: string
+        required: true
       variant:
         description: AIC firmware variant (only used with driver_run_id)
         type: choice
@@ -33,6 +37,7 @@ jobs:
     env:
       BASE_RUN_ID: ${{ inputs.base_run_id }}
       DRIVER_RUN_ID: ${{ inputs.driver_run_id }}
+      APP_RUN_ID: ${{ inputs.app_run_id }}
       DRIVER_VARIANT: ${{ inputs.variant }}
       DISABLE_ONBOARD_WIFI: ${{ inputs.disable_onboard_wifi }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -42,17 +47,31 @@ jobs:
         run: |
           [[ "$BASE_RUN_ID" =~ ^[0-9]+$ ]]
           [[ -z "$DRIVER_RUN_ID" || "$DRIVER_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$APP_RUN_ID" =~ ^[0-9]+$ ]]
           [[ "$DRIVER_VARIANT" == main || "$DRIVER_VARIANT" == mcu1 ]]
           [[ "$DISABLE_ONBOARD_WIFI" == false || "$DISABLE_ONBOARD_WIFI" == true ]]
           [[ "$DISABLE_ONBOARD_WIFI" == false || -n "$DRIVER_RUN_ID" ]]
-          for run in "$BASE_RUN_ID" ${DRIVER_RUN_ID:+"$DRIVER_RUN_ID"}; do
+          for run in "$BASE_RUN_ID" "$APP_RUN_ID" ${DRIVER_RUN_ID:+"$DRIVER_RUN_ID"}; do
             test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" --jq .conclusion)" = success
           done
+          echo "APP_COMMIT=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$APP_RUN_ID" --jq .head_sha)" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           name: carlink-h3-image
           path: dist/base
           run-id: ${{ inputs.base_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: carlink-armv7
+          path: dist/app
+          run-id: ${{ inputs.app_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: carplay-armv7
+          path: dist/carplay
+          run-id: ${{ inputs.app_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/download-artifact@v4
         if: inputs.driver_run_id != ''
@@ -68,6 +87,7 @@ jobs:
           bash -n scripts/refresh-image.sh
           bash scripts/refresh-image.sh --self-test
           bash scripts/test-image-validation.sh
+          python3 scripts/test-runtime-install.py dist/app dist/carplay
       - name: Download authenticated Debian armhf mode-switch runtime
         if: inputs.driver_run_id != ''
         run: |
@@ -79,10 +99,12 @@ jobs:
             apt-get download usb-modeswitch:armhf libjim0.83:armhf usb-modeswitch-data
             sha256sum -- *.deb > SHA256SUMS
           '
-      - name: Refresh without rebuilding kernel or app
+      - name: Build and validate complete image with CI applications and matched driver
         run: |
           sudo env BASE_RUN_ID="$BASE_RUN_ID" DRIVER_RUN_ID="$DRIVER_RUN_ID" \
             DRIVER_VARIANT="$DRIVER_VARIANT" DISABLE_ONBOARD_WIFI="$DISABLE_ONBOARD_WIFI" REFRESH_COMMIT="$GITHUB_SHA" \
+            APP_RUN_ID="$APP_RUN_ID" APP_COMMIT="$APP_COMMIT" \
+            APPLICATION_DIR="$GITHUB_WORKSPACE/dist/app" CARPLAY_DIR="$GITHUB_WORKSPACE/dist/carplay" \
             SOURCE_REPOSITORY="$GITHUB_REPOSITORY" RUNTIME_PACKAGES_DIR="$GITHUB_WORKSPACE/dist/runtime-packages" \
             bash scripts/refresh-image.sh dist/base dist/refreshed dist/driver
           sudo chown -R "$(id -u):$(id -g)" dist/refreshed

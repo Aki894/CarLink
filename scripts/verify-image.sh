@@ -38,6 +38,8 @@ if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
 fi
 
 image=$1
+mode=${2:-current}
+[[ "$mode" == current || "$mode" == --baseline ]] || { echo 'Unknown image validation mode' >&2; exit 2; }
 python3 - "$image" <<'PY'
 import sys
 with open(sys.argv[1], 'rb') as image:
@@ -59,6 +61,7 @@ sudo mount -o ro "${loop}p1" "$mountdir"
 test -f "$mountdir/boot/boot.scr"
 test -f "$mountdir/etc/carlink-build.json"
 test -x "$mountdir/usr/local/bin/carlink"
+if [[ "$mode" == current ]]; then
 test -x "$mountdir/usr/local/bin/carlink-carplay"
 receiver="$mountdir/usr/local/lib/carlink/carplay"
 for name in openxplay-relay oxp-relay; do
@@ -80,6 +83,7 @@ for key in ['rust','target','relay','stream']:
     assert receiver[key] == build['sources']['carplay'][key], f'CarPlay image lock mismatch: {key}'
 assert receiver['target']=='armv7-unknown-linux-gnueabihf'
 PY
+fi
 test -x "$mountdir/usr/sbin/sshd"
 sudo grep -q '192.168.77.2/24' "$mountdir/etc/NetworkManager/system-connections/carlink-direct.nmconnection"
 grep -q '^CONFIG_RTW88_8821CU=m$' "$mountdir"/boot/config-*
@@ -91,4 +95,4 @@ for fw in rtw88/rtw8821c_fw.bin rtl_bt/rtl8821c_fw.bin rtl_bt/rtl8821c_config.bi
     require_payload "$mountdir/lib/firmware" firmware "$fw"
 done
 require_no_g_serial "$mountdir/etc/modules" "$mountdir/etc/modules-load.d/"
-echo 'Image structure, app, CarPlay runtime/source/checksums, kernel configuration, modules and firmware checked; hardware untested.'
+echo "Image structure, app, kernel configuration, modules and firmware checked (mode=$mode); current mode also checks CarPlay runtime/source/checksums. Hardware untested."

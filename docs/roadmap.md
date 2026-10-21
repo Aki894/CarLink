@@ -9,9 +9,10 @@
 3. Implement and independently test Linux CarLife MD transport. Exercise AOA
    requests 51/52/53, re-enumeration, bulk transfers, fragmentation, disconnects.
    First use generated H.264 and PCM, then validate the actual Lexus head unit.
-4. Integrate the wireless CarPlay receiver after CarLife MD works on the Lexus.
-   Use CatPlay's Rust architecture and DiPlay as references. Confirm upstream
-   licensing and the local MFi identity/hardware path before importing components.
+4. Integrate the wireless CarPlay receiver before vehicle tests while the car is
+   unavailable. Build pinned OpenXPlay Relay and Stream as independent ARMv7
+   processes. Validate iPhone pairing and reception with the bounded media probe.
+   The local DiPlay identity pair has been found and verified; keep it private.
 5. Integrate bounded media queues, timestamps, audio roles, H.264 recovery and
    Remote Touch/HID. Validate navigation, reconnects, microphone/calls separately.
 6. Optimize cold startup only after both protocol endpoints work reliably.
@@ -19,8 +20,9 @@
 Current code implements bounded wire framing, 4.1 base handshake, CarLife 2.0
 digest verification, loopback TCP lab and temporary FunctionFS AOA1 USB.
 Synthetic H.264/PCM playback passed on the real Android HU app; see the
-[media acceptance](carlife-media-2026-10-21.md). Real Lexus acceptance comes next,
-followed by integration with a live wireless CarPlay media source.
+[media acceptance](carlife-media-2026-10-21.md). CarPlay reception is now the active
+step; see [receiver operation](../receiver/README.md). Resume Lexus acceptance
+after the live media bridge is ready and vehicle access is available.
 
 Implementation choice: Rust for the headless application, Python for host-side
 test fixtures. Keep app deployment independent of kernel/image builds.
