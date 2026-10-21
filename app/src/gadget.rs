@@ -449,7 +449,7 @@ mod linux {
     }
 
     impl Workers {
-        fn start(mut rx: File, mut tx: File, deadline: Instant) -> Result<Self, String> {
+        fn start(rx: File, mut tx: File, deadline: Instant) -> Result<Self, String> {
             let stop = Arc::new(AtomicBool::new(false));
             let enabled = Arc::new(AtomicBool::new(true));
             let (incoming_tx, incoming_rx) = mpsc::sync_channel::<Vec<u8>>(16);
@@ -459,20 +459,32 @@ mod linux {
             let stop = own.stop.clone(); let enabled = own.enabled.clone(); let errors_tx_rx = errors_tx.clone();
             own.handles.push(thread::Builder::new().name("carlink-usb-rx".into()).spawn(move || {
                 let result = (|| {
-                    let mut data = [0u8; 512]; // Never read only the 8-byte header on MUSB.
-                    while live(&stop, deadline) {
-                        if !enabled.load(Ordering::Acquire) { thread::sleep(Duration::from_millis(10)); continue; }
-                        if !ready(rx.as_raw_fd(), POLLIN, Duration::from_millis(50))? { continue; }
-                        match rx.read(&mut data) {
-                            Ok(0) => return Err("USB bulk RX reached EOF".into()),
-                            Ok(n) => send_bounded(&incoming_tx, data[..n].to_vec(), &stop, deadline)?,
-                            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => continue,
-                            Err(e) => return Err(format!("USB bulk read: {e}")),
+                    let mut reads = crate::usb_aio::ReadQueue::new(rx)?;
+                    eprintln!("usb_gadget: native AIO RX depth=32 packet=512");
+                    let transfer: Result<(), String> = (|| {
+                        while live(&stop, deadline) {
+                            if !enabled.load(Ordering::Acquire) { thread::sleep(Duration::from_millis(10)); continue; }
+                            if let Some(bytes) = reads.next(&stop, deadline)? {
+                                send_bounded(&incoming_tx, bytes, &stop, deadline)?;
+                            }
+                        }
+                        Ok(())
+                    })();
+                    // Wake control before io_destroy: outstanding FunctionFS
+                    // reads need UDC unbind to finish cancellation.
+                    if let Err(error) = &transfer {
+                        if live(&stop, deadline) {
+                            let _ = errors_tx_rx.try_send(error.clone());
+                            stop.store(true, Ordering::Release);
                         }
                     }
-                    Ok(())
+                    let cleanup = reads.close();
+                    if let Err(error) = &cleanup { eprintln!("usb_gadget: {error}"); }
+                    transfer.and(cleanup)
                 })();
-                if let Err(e) = result { let _ = errors_tx_rx.try_send(e); stop.store(true, Ordering::Release); }
+                if let Err(e) = result {
+                    if live(&stop, deadline) { let _ = errors_tx_rx.try_send(e); stop.store(true, Ordering::Release); }
+                }
             }).map_err(|e| format!("start USB RX worker: {e}"))?);
             let stop = own.stop.clone(); let enabled = own.enabled.clone(); let errors_tx_tx = errors_tx.clone();
             let writer = thread::Builder::new().name("carlink-usb-tx".into()).spawn(move || {
@@ -487,7 +499,9 @@ mod linux {
                     }
                     Ok(())
                 })();
-                if let Err(e) = result { let _ = errors_tx_tx.try_send(e); stop.store(true, Ordering::Release); }
+                if let Err(e) = result {
+                    if live(&stop, deadline) { let _ = errors_tx_tx.try_send(e); stop.store(true, Ordering::Release); }
+                }
             });
             match writer {
                 Ok(handle) => own.handles.push(handle),
@@ -515,7 +529,9 @@ mod linux {
                     Ok(())
                 })();
                 let finished = endpoint.finish();
-                if let Err(e) = result.and(finished) { let _ = errors_tx.try_send(e); stop.store(true, Ordering::Release); }
+                if let Err(e) = result.and(finished) {
+                    if live(&stop, deadline) { let _ = errors_tx.try_send(e); stop.store(true, Ordering::Release); }
+                }
             });
             match protocol {
                 Ok(handle) => own.handles.push(handle),
@@ -653,12 +669,15 @@ mod linux {
         if let Some(worker) = workers.as_ref() { worker.stop.store(true, Ordering::Release); }
         if let Err(error) = gadget.unbind() {
             gadget.allow_cleanup = false;
-            return Err(format!("cannot unbind owned gadget: {error}; descriptors retained"));
+            let error = format!("cannot unbind owned gadget: {error}; descriptors retained");
+            if result.is_err() { eprintln!("usb_gadget: secondary cleanup error: {error}"); return result; }
+            return Err(error);
         }
         if let Some(worker) = workers.as_mut() {
             if let Err(error) = worker.finish() {
                 if worker.handles.iter().any(|h| !h.is_finished()) { gadget.allow_cleanup = false; }
-                result = Err(error);
+                if result.is_ok() { result = Err(error); }
+                else { eprintln!("usb_gadget: secondary worker cleanup error: {error}"); }
             }
         }
         let cleanup = gadget.cleanup();

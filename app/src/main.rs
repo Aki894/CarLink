@@ -2,6 +2,8 @@
 mod carlife;
 mod gadget;
 mod runtime;
+#[cfg(target_os = "linux")]
+mod usb_aio;
 use std::env;
 use std::fs;
 use std::io;

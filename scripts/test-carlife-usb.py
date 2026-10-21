@@ -51,7 +51,8 @@ def accessory():
                 device.ctrl_transfer(0x40, 53, 0, 0, b"", timeout=2000)  # idempotent START
                 print(json.dumps({"event": "aoa_passed", "identity": "18d1:2d00"}))
                 return device
-        except usb.core.USBError as error:
+        except (usb.core.USBError, NotImplementedError) as error:
+            # Windows can publish the USB node before WinUSB is ready to open it.
             last_error = str(error)
         time.sleep(.25)
     raise RuntimeError("Accessory driver/enumeration deadline: " + last_error)
