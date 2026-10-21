@@ -64,6 +64,8 @@ done
 (cd "$stream/rust/web-receiver" && npm ci && npm run build)
 cp -a "$relay/admin-web/dist" "$out/share/admin"
 cp -a "$stream/rust/web-receiver/dist" "$out/share/web"
+test -s "$out/share/web/receiver/index.html"
+test -s "$out/share/admin/index.html"
 mkdir -p "$out/share/plugins"
 install -m 0755 "$root/scripts/run-carplay.sh" "$out/run-carplay.sh"
 install -m 0755 "$root/receiver/probe.py" "$out/probe.py"

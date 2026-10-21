@@ -2,11 +2,65 @@
 import socket
 import struct
 import unittest
+import os
+import json
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
 
 import probe
 
 
 class WireTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'posix', 'Unix listener subprocess contract runs on Linux Actions')
+    def test_supervised_consumer_session(self):
+        with tempfile.TemporaryDirectory(prefix='oxp-') as directory:
+            root = Path(directory)
+            sock = root / 'media'
+            status = root / 'status.json'
+            child = subprocess.Popen([sys.executable, '-B', str(Path(probe.__file__)), '--unix', str(sock),
+                '--status', str(status), '--record-directory', str(root / 'record'),
+                '--web-port', '8443', '--relay-name', 'ignored'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + 5
+                while not sock.exists():
+                    if child.poll() is not None or time.monotonic() > deadline:
+                        self.fail('probe did not bind media socket')
+                    time.sleep(.02)
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(3)
+                    s.connect(str(sock))
+                    probe.send_json(s, dict(type='hello', version=0, role='producer', name='test', client='test'))
+                    self.assertEqual(probe.receive(s)['role'], 'consumer')
+                    self.assertTrue(probe.receive(s)['prefersH264'])
+                    probe.send_json(s, dict(type='session', session=dict(id='1', phase='ACTIVE')))
+                    probe.send_json(s, {'type': 'video-format', 'screen': 0, 'format': dict(codec='H264',
+                        config='AULAHv/hAAJngAEAAmig', width=800, height=480, fpsHint=30)})
+                    self.assertEqual(probe.receive(s)['type'], 'keyframe')
+                    payload = b'\0\0\0\2\x65\x80'
+                    header = probe.HEADER.pack(1, 0, 1, 0, 1, 200, 200)
+                    s.sendall(struct.pack('<I', len(header) + len(payload)) + header + payload)
+                    deadline = time.monotonic() + 4
+                    while json.loads(status.read_text())['video_frames'] != 1:
+                        if time.monotonic() > deadline:
+                            self.fail('probe did not observe video frame')
+                        time.sleep(.02)
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as ctl:
+                        ctl.settimeout(2)
+                        ctl.connect(str(sock) + '.control')
+                        ctl.sendall(b'{"type":"keyframe","screen":0}\n')
+                        self.assertEqual(ctl.recv(128), b'{"ok":true}\n')
+                    self.assertEqual(probe.receive(s)['type'], 'keyframe')
+                child.communicate(timeout=4)
+                self.assertEqual(len(list((root / 'record').glob('*.h264'))), 1)
+                self.assertFalse(json.loads(status.read_text())['connected'])
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate()
+
     def test_upstream_video_vector(self):
         from pathlib import Path
         path = Path(__file__).resolve().parents[1] / 'research/repos/OpenXPlay-Stream/spec/vectors/wire/video.hex'

@@ -68,7 +68,7 @@ done
 test -x "$receiver/probe.py"
 for payload in SOURCE.json SHA256SUMS share/source/relay.tar.gz share/source/stream.tar.gz \
     share/licenses/relay/LICENSE share/licenses/relay/LICENSE-GPL-3.0 share/licenses/relay/NOTICE \
-    share/licenses/stream/LICENSE share/admin/index.html share/web/index.html; do
+    share/licenses/stream/LICENSE share/admin/index.html share/web/receiver/index.html; do
     test -s "$receiver/$payload"
 done
 (cd "$receiver" && sha256sum -c SHA256SUMS)

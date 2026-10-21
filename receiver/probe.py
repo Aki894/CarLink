@@ -159,6 +159,8 @@ def run(args):
     record_dir = Path(args.record_directory) if args.record_directory else None
     if record_dir:
         record_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        state['written_bytes'] = sum(p.stat().st_size for p in record_dir.glob('video-*.h264') if p.is_file())
+        state['recording_limit_reached'] = state['written_bytes'] >= limit
     try:
         media = listener(args.unix)
         ctl = listener(control_path)

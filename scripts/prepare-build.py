@@ -40,7 +40,7 @@ for line in (carplay / "SHA256SUMS").read_text().splitlines():
     if hashlib.sha256((carplay / name).read_bytes()).hexdigest() != expected:
         raise SystemExit(f"CarPlay artifact checksum mismatch: {name}")
 for name in ["bin/openxplay-relay", "bin/oxp-relay", "probe.py", "run-carplay.sh",
-             "share/admin/index.html", "share/web/index.html", "share/source/relay.tar.gz",
+             "share/admin/index.html", "share/web/receiver/index.html", "share/source/relay.tar.gz",
              "share/source/stream.tar.gz", "share/licenses/relay/LICENSE", "share/licenses/stream/LICENSE"]:
     if not (carplay / name).is_file() or not (carplay / name).stat().st_size:
         raise SystemExit(f"Missing CarPlay runtime payload: {name}")
