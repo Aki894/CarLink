@@ -5,7 +5,7 @@
          .then_some(mono | if c.microphone_opus { opus } else { 0 });
      let output_opus = if c.output_opus { opus } else { 0 };
 +    // Telephony negotiates narrow/wideband voice, not entertainment-rate PCM.
-+    // iOS rejects the entire audio offer when this role includes 44.1/48 kHz.
++    // Keep the offer within voice rates while diagnosing iOS kParamErr.
 +    let phone_pcm = 0x150u64; // 16/24/32 kHz, signed 16-bit mono
 +    let phone_opus = opus & !0x40000000u64; // 16/24 kHz mono
 +    let phone_input = c.microphone.then_some(
@@ -47,6 +47,15 @@
      );
  }
  #[test]
+@@ -232,7 +232,7 @@
+     ] {
+         assert_eq!(
+             uint(&format(&c, kind, audio), "audioOutputFormats") & 0x70000000,
+-            0x70000000
++            if audio == "telephony" { 0x30000000 } else { 0x70000000 }
+         );
+     }
+     let media = uint(&format(&c, 102, "media"), "audioOutputFormats");
 @@ -461,3 +461,18 @@
          .is_err()
      );
