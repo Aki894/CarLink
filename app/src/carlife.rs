@@ -323,7 +323,10 @@ impl Session {
         if message.id == HU_PROTOCOL_VERSION {
             let fields = fields(&message.payload)?;
             let (major, minor) = (uint(&fields, 1)?, uint(&fields, 2)?);
-            if !matches!((major, minor), (1, 0) | (2, 0) | (2, 1)) {
+            // 4.1 is advertised by the Android HU SDK tested on our lab phone;
+            // it uses the same base framing/handshake. Optional features still
+            // follow the explicit unsupported/authentication checks below.
+            if !matches!((major, minor), (1, 0) | (2, 0) | (2, 1) | (4, 1)) {
                 return Err(Error::UnsupportedVersion { major, minor });
             }
             let repeated = self.version == Some((major, minor));
@@ -684,6 +687,15 @@ mod tests {
         assert_eq!(s.video_config(),Some(config));
         let mut normal=Session::new(); normal.handle(&version()).unwrap();
         normal.handle(&zero).unwrap(); assert_eq!(normal.video_config().unwrap().fps,30);
+    }
+    #[test]
+    fn android_hu_4_1_uses_base_handshake_without_duplicate_startup() {
+        let request=cmd(ids::HU_PROTOCOL_VERSION,integers(&[(1,4),(2,1)])).unwrap();
+        let mut s=Session::new();
+        assert_eq!(s.handle(&request).unwrap().outgoing.len(),4);
+        assert_eq!(s.protocol_version(),Some((4,1)));
+        assert!(s.handle(&request).unwrap().outgoing.is_empty());
+        assert!(matches!(s.handle(&cmd(ids::HU_AUTH_REQUEST,vec![]).unwrap()),Err(Error::Unsupported(_))));
     }
     #[test]
     fn protobuf_bad_wire_overflow_missing_duplicate_fields() {
