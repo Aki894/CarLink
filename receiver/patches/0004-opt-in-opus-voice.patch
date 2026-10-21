@@ -1,0 +1,17 @@
+--- a/rust/direlay-linux/src/linux_wireless_platform.rs
++++ b/rust/direlay-linux/src/linux_wireless_platform.rs
+@@ -393,9 +393,11 @@
+     let mut config = AirPlayConfig::linux_receiver(device_id, bt_mac);
+     // No audio offer leaves the iPhone's audio on its own Bluetooth link with the car.
+     config.disable_audio_output = car_bluetooth_audio;
+-    config.microphone_opus = false;
+-    // The Linux relay cannot decode Opus and its receivers play only PCM and AAC.
+-    config.output_opus = false;
++    // OXP can carry Opus without decoding. Enable only for consumers that accept
++    // compressed voice; the default native output retains its PCM/AAC offer.
++    let voice_opus = std::env::var("CARLINK_CARPLAY_VOICE_OPUS").as_deref() == Ok("1");
++    config.microphone_opus = voice_opus;
++    config.output_opus = voice_opus;
+     config.main.fps = session.0;
+     config.hevc = session.1;
+     config.device_name = crate::branding::DEVICE_NAME.into();
