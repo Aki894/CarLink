@@ -5,6 +5,8 @@ umask 077
 root=${CARLINK_CARPLAY_ROOT:-/usr/local/lib/carlink/carplay}
 state=${CARLINK_CARPLAY_STATE:-/var/lib/carlink/carplay}
 iface=${CARLINK_CARPLAY_WIFI:-wlx002e2d91fc8e}
+channel=${CARLINK_CARPLAY_CHANNEL:-149}
+country=${CARLINK_CARPLAY_COUNTRY:-CN}
 mode=${1:-probe}
 case "$mode" in
     probe|web) if [ "$#" -gt 0 ]; then shift; fi ;;
@@ -25,9 +27,10 @@ else
     output="$root/bin/oxp-relay"
 fi
 test -x "$output" || { echo "Missing executable: $output" >&2; exit 1; }
+iw reg set "$country"
 exec "$root/bin/openxplay-relay" \
     --state-dir "$state/state" --identity-dir "$state/mfi" \
-    --wifi-interface "$iface" --wifi-channel 36 --network-mode device-hotspot \
+    --wifi-interface "$iface" --wifi-channel "$channel" --network-mode device-hotspot \
     --stream-socket /run/carlink-carplay/media.sock --oxp-relay "$output" \
     --web-root "$root/share/web" --admin-root "$root/share/admin" \
     --plugins-root "$root/share/plugins" --output web "$@"

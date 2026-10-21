@@ -125,6 +125,11 @@ git -C "$work/source" fetch --depth=1 origin "$commit"
 git -C "$work/source" checkout --detach FETCH_HEAD
 [[ $(git -C "$work/source" rev-parse HEAD) == "$commit" ]]
 source_dir="$work/source/drivers/aic8800"
+for patch in "$repo"/drivers/aic8800d80/patches/*.patch; do
+    [[ -f "$patch" ]] || continue
+    git -C "$work/source" apply --check "$patch"
+    git -C "$work/source" apply "$patch"
+done
 make -C "$source_dir" -j2 ARCH=arm CROSS_COMPILE="$cross" KDIR="$kdir" KVER="$release" HOSTCC=gcc HOSTCXX=g++
 [[ $(abi_fingerprint) == "$abi_before" ]] || { echo 'Module build changed pinned ABI inputs'; exit 1; }
 
@@ -155,6 +160,7 @@ for firmware_entry in "$work/source/fw/"*; do
     fi
 done
 cp "$work/source/LICENSE" "$stage/licenses/aic8800-source-LICENSE"
+cp "$repo"/drivers/aic8800d80/patches/*.patch "$stage/licenses/"
 find "$work/source/fw" -type f \( -iname '*license*' -o -iname '*copying*' -o -iname '*copyright*' \) -print > "$work/firmware-license-files.log"
 install -m 0644 "$repo/drivers/aic8800d80/90-carlink-aic8800.rules" "$stage/udev/"
 install -m 0755 "$repo/drivers/aic8800d80/install.sh" "$stage/install.sh"
@@ -174,6 +180,8 @@ m = dict(schema_version=1, variant=variant, driver_repository=lock['repository']
          cross_compiler=subprocess.check_output(['arm-linux-gnueabihf-gcc','--version'],text=True).splitlines()[0],
          builder_commit=subprocess.check_output(['git','-c','safe.directory='+repo,'-C',repo,'rev-parse','HEAD'],text=True).strip(),
          bluetooth_driver='standard btusb with device-scoped aic_zlp_quirk',
+         patches=[{'file':p.name,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+                  for p in sorted((pathlib.Path(repo)/'drivers/aic8800d80/patches').glob('*.patch'))],
          hardware_validation='not_tested',
          firmware_provenance='Unmodified fw/ files from driver_repository at driver_commit; upstream licensing metadata preserved')
 for group in ['modules', 'firmware', 'udev']:

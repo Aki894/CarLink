@@ -1,0 +1,18 @@
+--- a/drivers/aic8800/aic_zlp_quirk/aic_zlp_quirk.c
++++ b/drivers/aic8800/aic_zlp_quirk/aic_zlp_quirk.c
+@@ -169,7 +169,15 @@
+ {
+ 	int ret;
+ 
++/* ARMv7 Thumb-2 btusb return probing faults during the first ACL TX.
++	 * Use the existing device/endpoint-scoped submit hook on this platform.
++	 * No return-address rewriting is needed by the submit hook.
++	 */
++#if defined(CONFIG_ARM)
++	ret = -EOPNOTSUPP;
++#else
+ 	ret = register_kretprobe(&alloc_bulk_urb_probe);
++#endif
+ 	if (!ret) {
+ 		active_hook = AIC_ZLP_HOOK_BTUSB_RETURN;
+ 		hook_name = "btusb:alloc_bulk_urb";
