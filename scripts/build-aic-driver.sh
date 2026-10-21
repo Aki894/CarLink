@@ -79,7 +79,7 @@ names = [
     'KBUILD_CFLAGS_KERNEL', 'KBUILD_CFLAGS_MODULE', 'KBUILD_AFLAGS_KERNEL', 'KBUILD_AFLAGS_MODULE',
     'KBUILD_LDFLAGS', 'KBUILD_LDFLAGS_MODULE', 'CC_FLAGS_LTO', 'CONFIG_SHELL',
     'HOSTPKG_CONFIG', 'LEX', 'YACC', 'AWK', 'PERL', 'PYTHON3', 'UTS_MACHINE',
-    'KBUILD_BUILD_TIMESTAMP',
+    'KBUILD_BUILD_TIMESTAMP', 'CC_FLAGS_FTRACE', 'BUILD_C_RECORDMCOUNT',
 ]
 values = {name: os.environ.get(name, '') for name in names}
 assert '/scripts/include' in values['KBUILD_HOSTCFLAGS'], 'Missing kernel host include directory'
@@ -88,7 +88,8 @@ assert '-nostdinc' in values['NOSTDINC_FLAGS'], 'Missing target include isolatio
 assert 'arch/arm/include' in values['LINUXINCLUDE'], 'Missing ARM include directories'
 pathlib.Path(sys.argv[1]).write_text(json.dumps(values, indent=2) + '\n')
 PY
-make -C "$kdir" M="$work/flags-probe" ARCH=arm CROSS_COMPILE="$cross" HOSTCC=gcc HOSTCXX=g++ \
+make --no-print-directory -C "$work/flags-probe" -f "$kdir/Makefile" \
+    M="$work/flags-probe" ARCH=arm CROSS_COMPILE="$cross" HOSTCC=gcc HOSTCXX=g++ \
     --eval="carlink-export-flags: ; @python3 '$work/export-kbuild-flags.py' '$work/kbuild-flags.json'" \
     carlink-export-flags
 [[ $(abi_fingerprint) == "$abi_before" ]] || { echo 'Kbuild flag export modified pinned ABI inputs'; exit 1; }
