@@ -39,6 +39,7 @@ pub mod ids {
     pub const SUBSCRIBE_START: u32 = 0x18045;
     pub const SUBSCRIBE_STOP: u32 = 0x18046;
     pub const HU_AUTH_REQUEST: u32 = 0x18048;
+    pub const MD_AUTH_RESPONSE: u32 = 0x10049;
     pub const HU_AUTH_RESULT: u32 = 0x1804a;
     pub const FEATURE_REQUEST: u32 = 0x10051;
     pub const HU_FEATURE_RESPONSE: u32 = 0x18052;
@@ -273,6 +274,7 @@ pub enum Event {
     SubscriptionControlIgnored { id: u32 },
     ModuleControlIgnored { module: u32, status: u32 },
     MusicControl { status: u32 }, AudioTransport { usb: bool },
+    AuthenticationResponded, HuAuthenticationAccepted,
     Unhandled { channel: Channel, id: u32, bytes: usize },
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -286,11 +288,15 @@ pub struct Session {
     generation: u64,
     failed: bool,
     source: Option<VideoConfig>,
+    auth_identity: Option<String>,
+    auth_sent: bool,
+    auth_accepted: bool,
 }
 impl Default for Session { fn default() -> Self { Self::new() } }
 
 impl Session {
-    pub fn new() -> Self { Self { version: None, video: None, state: VideoState::Uninitialized, generation: 0, failed: false, source: None } }
+    pub fn new() -> Self { Self { version: None, video: None, state: VideoState::Uninitialized, generation: 0, failed: false, source: None,
+        auth_identity: None, auth_sent: false, auth_accepted: false } }
     pub fn with_video_source(config: VideoConfig) -> Self { Self { source: Some(config), ..Self::new() } }
     pub fn video_state(&self) -> VideoState { self.state }
     pub fn video_config(&self) -> Option<VideoConfig> { self.video }
@@ -317,7 +323,7 @@ impl Session {
         }
         // Never turn the unconditional peer-acceptance status used by some MDs
         // into a forged answer to a HU phone challenge.
-        if matches!(message.id, HU_AUTH_REQUEST | HU_AUTH_RESULT | HU_RSA_KEY) {
+        if message.id == HU_RSA_KEY || (self.version.is_none() && matches!(message.id, HU_AUTH_REQUEST | HU_AUTH_RESULT)) {
             return Err(Error::Unsupported("HU authentication/key exchange"));
         }
         if message.id == HU_PROTOCOL_VERSION {
@@ -340,7 +346,7 @@ impl Session {
             if !repeated {
                 out.outgoing.push(cmd(FOREGROUND, Vec::new())?);
                 out.outgoing.push(cmd(SCREEN_ON, Vec::new())?);
-                out.outgoing.push(cmd(MD_INFO, device_info())?);
+                out.outgoing.push(self.device_message()?);
             }
             out.events.push(Event::ProtocolVersion { major, minor, repeated });
             return Ok(out);
@@ -349,7 +355,7 @@ impl Session {
         match message.id {
             HU_INFO => {
                 fields(&message.payload)?;
-                out.outgoing.push(cmd(MD_INFO, device_info())?);
+                out.outgoing.push(self.device_message()?);
                 // No media/navigation/multitouch capability producer yet.
                 out.outgoing.push(cmd(FEATURE_REQUEST, integers(&[(1, 0)]))?);
                 out.events.push(Event::HuInfoReceived);
@@ -358,6 +364,27 @@ impl Session {
                 fields(&message.payload)?;
                 // Deliberately no MD_AUTHEN_RESULT(true) or CAR_DATA_SUBSCRIBE.
                 out.events.push(Event::StatisticReceived);
+            },
+            HU_AUTH_REQUEST => {
+                if self.auth_accepted { return Err(Error::InvalidState("authentication challenge after completed handshake")); }
+                let f = fields(&message.payload)?;
+                let challenge = std::str::from_utf8(single_bytes(&f, 1)?)
+                    .map_err(|_| Error::InvalidProtobuf("authentication challenge UTF-8"))?;
+                let identity = self.auth_identity.as_deref().ok_or(Error::InvalidState("MD_INFO required before authentication"))?;
+                let response = crate::auth::response(challenge, identity)
+                    .map_err(|_| Error::Unsupported("unsupported or invalid CarLife 2.0 challenge"))?;
+                let mut body = Vec::new(); put_bytes(&mut body, 1, &response);
+                out.outgoing.push(cmd(MD_AUTH_RESPONSE, body)?);
+                self.auth_sent = true;
+                out.events.push(Event::AuthenticationResponded);
+            },
+            HU_AUTH_RESULT => {
+                if !self.auth_sent { return Err(Error::InvalidState("authentication result without request")); }
+                if uint(&fields(&message.payload)?, 1)? != 1 {
+                    return Err(Error::Unsupported("HU rejected CarLife identity response"));
+                }
+                self.auth_accepted = true;
+                out.events.push(Event::HuAuthenticationAccepted);
             },
             VIDEO_INIT => {
                 let f = fields(&message.payload)?;
@@ -382,6 +409,7 @@ impl Session {
             VIDEO_START => {
                 no_payload(message)?;
                 if self.video.is_none() { return Err(Error::InvalidState("VIDEO_START before INIT")); }
+                if self.auth_sent && !self.auth_accepted { return Err(Error::InvalidState("VIDEO_START before HU authentication acceptance")); }
                 self.state = VideoState::AwaitingVideoSource;
                 out.events.push(Event::AwaitingVideoSource);
             },
@@ -453,6 +481,18 @@ impl Session {
             _ => out.events.push(Event::Unhandled { channel: message.channel, id: message.id, bytes: message.payload.len() }),
         }
         Ok(out)
+    }
+
+    fn device_message(&mut self) -> Result<Message, Error> {
+        let payload = device_info();
+        let f = fields(&payload)?;
+        let mut identity = String::new();
+        for number in [4, 14, 20] {
+            identity.push_str(std::str::from_utf8(single_bytes(&f, number)?)
+                .map_err(|_| Error::InvalidProtobuf("MD_INFO identity UTF-8"))?);
+        }
+        self.auth_identity = Some(identity);
+        cmd(ids::MD_INFO, payload)
     }
 }
 
@@ -695,7 +735,22 @@ mod tests {
         assert_eq!(s.handle(&request).unwrap().outgoing.len(),4);
         assert_eq!(s.protocol_version(),Some((4,1)));
         assert!(s.handle(&request).unwrap().outgoing.is_empty());
-        assert!(matches!(s.handle(&cmd(ids::HU_AUTH_REQUEST,vec![]).unwrap()),Err(Error::Unsupported(_))));
+        assert!(s.handle(&cmd(ids::HU_AUTH_REQUEST,vec![]).unwrap()).is_err());
+    }
+    #[test]
+    fn v2_authentication_uses_sent_identity_and_requires_explicit_hu_acceptance() {
+        let mut s=Session::new(); s.handle(&version()).unwrap();
+        let mut body=Vec::new(); put_bytes(&mut body,1,b"2.0;lab-nonce;ignored");
+        let challenge=cmd(ids::HU_AUTH_REQUEST,body).unwrap();
+        let response=s.handle(&challenge).unwrap();
+        assert_eq!(response.outgoing[0].id,ids::MD_AUTH_RESPONSE);
+        assert_eq!(single_bytes(&fields(&response.outgoing[0].payload).unwrap(),1).unwrap(),b"5aead4d021054b7c2d254b801d0edfce");
+        assert_eq!(s.handle(&challenge).unwrap(),response);
+        s.handle(&cmd(ids::HU_AUTH_RESULT,integers(&[(1,1)])).unwrap()).unwrap();
+        assert!(s.auth_accepted);
+        let mut rejected=Session::new(); rejected.handle(&version()).unwrap(); rejected.handle(&challenge).unwrap();
+        assert!(rejected.handle(&cmd(ids::HU_AUTH_RESULT,integers(&[(1,0)])).unwrap()).is_err());
+        assert!(rejected.is_failed());
     }
     #[test]
     fn protobuf_bad_wire_overflow_missing_duplicate_fields() {
