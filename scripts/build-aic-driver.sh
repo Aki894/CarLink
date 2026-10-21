@@ -172,7 +172,7 @@ m = dict(schema_version=1, variant=variant, driver_repository=lock['repository']
          headers_sha256=lock['headers_sha256'], symvers_sha256=lock['symvers_sha256'],
          kernel_config_sha256=lock['kernel_config_sha256'],
          cross_compiler=subprocess.check_output(['arm-linux-gnueabihf-gcc','--version'],text=True).splitlines()[0],
-         builder_commit=subprocess.check_output(['git','-C',repo,'rev-parse','HEAD'],text=True).strip(),
+         builder_commit=subprocess.check_output(['git','-c','safe.directory='+repo,'-C',repo,'rev-parse','HEAD'],text=True).strip(),
          bluetooth_driver='standard btusb with device-scoped aic_zlp_quirk',
          hardware_validation='not_tested',
          firmware_provenance='Unmodified fw/ files from driver_repository at driver_commit; upstream licensing metadata preserved')
