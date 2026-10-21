@@ -1,0 +1,44 @@
+--- a/rust/direlay-linux/src/linux_wireless_platform.rs
++++ b/rust/direlay-linux/src/linux_wireless_platform.rs
+@@ -324,6 +324,9 @@
+             self.session,
+             self.options.settings.car_bluetooth_audio,
+         );
++        // Opt-in while validating iOS buffered media on CarLink's receiver.
++        config.main_buffered_audio = std::env::var("CARLINK_CARPLAY_BUFFERED_AUDIO")
++            .is_ok_and(|v| v == "1");
+         self.input.configure_display(&mut config.main);
+         let input = self.input.clone();
+         let sink = self.sink.clone();
+--- a/rust/direlay-linux/src/linux_audio.rs
++++ b/rust/direlay-linux/src/linux_audio.rs
+@@ -13,7 +13,7 @@
+ impl AudioPolicy {
+     pub fn stream(id: &AudioStreamId) -> Option<u16> {
+         match id.kind {
+-            102 => Some(0),
++            102 | 103 => Some(0),
+             100 => Some(1),
+             101 => Some(2),
+             _ => None,
+--- a/rust/carplay-airplay/src/air_play_session.rs
++++ b/rust/carplay-airplay/src/air_play_session.rs
+@@ -602,6 +602,9 @@
+             );
+         }
+         if path.ends_with("/info") {
++            self.log_debug(&format!("CarLink audio offer disabled={} buffered={} features={:x}",
++                self.config.disable_audio_output, self.config.buffered_audio_output_enabled(),
++                AirPlayInfoPlist::features(&self.config)));
+             return plist_response(&AirPlayInfoPlist::build(&self.config)?);
+         }
+         if request.method == "POST" && path.ends_with("/command") {
+@@ -624,6 +627,8 @@
+             _ => return Ok(response(400)),
+         };
+         if let Some(streams) = body.get("streams").and_then(V::as_array) {
++            let kinds: Vec<_> = streams.iter().filter_map(|s| s.get("type").and_then(V::as_u64)).collect();
++            self.log_debug(&format!("CarLink setup stream types={kinds:?}"));
+             return plist_response(&dictionary([(
+                 "streams",
+                 V::Array(self.handle_streams(streams)?),
