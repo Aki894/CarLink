@@ -186,7 +186,7 @@ pub fn tcp(address: SocketAddr, duration: Duration, media: Option<TestMedia>) ->
         }
     };
     stream.set_nodelay(true).map_err(|e| e.to_string())?;
-    stream.set_read_timeout(Some(Duration::from_millis(10))).map_err(|e| e.to_string())?;
+    stream.set_read_timeout(Some(Duration::from_millis(2))).map_err(|e| e.to_string())?;
     stream.set_write_timeout(Some(Duration::from_secs(2))).map_err(|e| e.to_string())?;
     let mut endpoint = Endpoint::with_media(media);
     let mut bytes = [0_u8; 16384];
@@ -211,7 +211,9 @@ pub fn tcp(address: SocketAddr, duration: Duration, media: Option<TestMedia>) ->
             Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) => {},
             Err(error) => return Err(format!("read: {error}")),
         }
-        if let Some(packet) = endpoint.poll_media()? {
+        // Service both due lanes before waiting for another control read.
+        for _ in 0..4 {
+            let Some(packet) = endpoint.poll_media()? else { break; };
             stream.write_all(&packet).map_err(|e| format!("write media: {e}"))?;
         }
     }

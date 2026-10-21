@@ -560,7 +560,8 @@ mod linux {
                             Err(mpsc::RecvTimeoutError::Timeout) => {},
                             Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         }
-                        if let Some(frame) = endpoint.poll_media()? {
+                        for _ in 0..4 {
+                            let Some(frame) = endpoint.poll_media()? else { break; };
                             if frame.len() > MAX_FRAME { return Err("USB media exceeds frame bound".into()); }
                             let header = frame.get(..4).ok_or("USB media lacks channel header")?;
                             let channel = u32::from_be_bytes(header.try_into().unwrap());
