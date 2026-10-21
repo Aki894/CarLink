@@ -72,6 +72,7 @@ def probe(stream, output):
     assert 100 < max(abs(v) for v in samples) < 1500, 'quiet PCM tone amplitude invalid'
 
     # RESET retains the negotiated mode and requests a fresh keyframe.
+    time.sleep(.5)  # Deliberately fill the bounded USB media queue first.
     stream.sendall(lab.command(0x1800b))
     limit = time.monotonic() + 2
     while True:
@@ -89,6 +90,8 @@ def probe(stream, output):
     assert status[1] == 0x10026 and status[3][-1] == 0, status
     lab.no_response(stream)
     stream.settimeout(3)
+    heartbeat = packet(stream)
+    assert heartbeat[1] == 0x20002 and not heartbeat[3], heartbeat
 
     # Resume without another INIT; first resumed video must carry SPS/PPS/IDR.
     stream.sendall(lab.command(0x18009))
@@ -115,9 +118,14 @@ def probe(stream, output):
             assert item[3][-1] == 0
             query_answer = True
     assert query_answer
+    stream.sendall(lab.command(0x1800a) + lab.command(0x18009))
+    limit = time.monotonic() + .4
+    while time.monotonic() < limit:
+        item = packet(stream)
+        assert item[1] not in (0x30001, 0x30006), 'video resume overrode HU music stop'
     print(json.dumps({'event': 'media_probe', 'status': 'passed', 'video_frames': len(videos),
                       'pcm_chunks': len(audio), 'output': str(output.resolve()),
-                      'checks': ['fps_zero', 'loop', 'reset_keyframe', 'pause', 'resume', 'music_stop_query']}))
+                      'checks': ['fps_zero', 'loop', 'backpressure_reset', 'pause_heartbeat', 'resume', 'music_stop_query', 'mute_latch']}))
 
 
 if __name__ == '__main__':

@@ -3,16 +3,39 @@
 Dependency-free Rust binary: **`carlink`**, targeting ARMv7 H3 boards.
 CarLife MD development comes first; CarPlay integration follows it.
 
-## CarLife handshake milestone
+## CarLife transport and synthetic media
 
 ```sh
 carlink carlife tcp --listen 127.0.0.1:7240 --duration 60
 sudo carlink carlife usb --duration 120
 ```
 
-The current milestone implements framing, MD handshake and video negotiation.
-VIDEO_START records `AwaitingVideoSource`; H.264/PCM sources and input handling
-come next. Unsupported authentication or encryption requests exit with an error.
+The application implements framing, MD handshake and video negotiation. Default
+mode sends no media. Opt-in synthetic media uses a bounded pre-encoded H.264
+loop and quiet intermittent PCM tone; H3 performs no live video encoding.
+Unsupported authentication or encryption requests exit with an error.
+
+```sh
+# Generate assets on the development PC (FFmpeg required), then transfer the
+# directory to the board. Match the HU's requested video dimensions exactly.
+python scripts/generate-test-media.py .build/test-media-720p --width 1280 --height 720 --fps 30
+sudo carlink carlife usb --duration 300 --test-media /opt/carlink/test-media
+```
+
+The source validates baseline SPS dimensions/timing, access-unit boundaries and
+asset bounds before binding USB. HU fps=0 selects the source rate, capped at 30;
+lower requested rates adjust pacing. START begins test playback; PAUSE stops the
+test picture and tone, keeping video heartbeats. RESET restarts video from
+SPS/PPS+IDR with its mode preserved. HU music STOP remains latched through video
+pause/resume. USB media queues are bounded; obsolete queued media is discarded
+and dropped video recovers from a keyframe. Timestamps are relative monotonic
+milliseconds. These are development assets, pending a live CarPlay media source.
+
+```sh
+# Requires pyusb + libusb-package; keep generated captures out of Git.
+python scripts/test-carlife-media.py --usb --output .build/media-capture
+ffmpeg -v error -xerror -i .build/media-capture/received.h264 -f null -
+```
 
 USB creates a temporary AOA1 FunctionFS gadget, handles requests 51/52/53 and
 re-enumerates as `18d1:2d00`. It only owns `carlink-md`, refuses a busy UDC and
