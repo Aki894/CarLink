@@ -291,12 +291,13 @@ pub struct Session {
     auth_identity: Option<String>,
     auth_sent: bool,
     auth_accepted: bool,
+    feature_requested: bool,
 }
 impl Default for Session { fn default() -> Self { Self::new() } }
 
 impl Session {
     pub fn new() -> Self { Self { version: None, video: None, state: VideoState::Uninitialized, generation: 0, failed: false, source: None,
-        auth_identity: None, auth_sent: false, auth_accepted: false } }
+        auth_identity: None, auth_sent: false, auth_accepted: false, feature_requested: false } }
     pub fn with_video_source(config: VideoConfig) -> Self { Self { source: Some(config), ..Self::new() } }
     pub fn video_state(&self) -> VideoState { self.state }
     pub fn video_config(&self) -> Option<VideoConfig> { self.video }
@@ -355,9 +356,12 @@ impl Session {
         match message.id {
             HU_INFO => {
                 fields(&message.payload)?;
-                out.outgoing.push(self.device_message()?);
-                // No media/navigation/multitouch capability producer yet.
-                out.outgoing.push(cmd(FEATURE_REQUEST, integers(&[(1, 0)]))?);
+                // MD_INFO was sent at VERSION. Echoing it here causes the HU
+                // to send HU_INFO/challenge again, restarting its handshake.
+                if !self.feature_requested {
+                    out.outgoing.push(cmd(FEATURE_REQUEST, integers(&[(1, 0)]))?);
+                    self.feature_requested = true;
+                }
                 out.events.push(Event::HuInfoReceived);
             },
             STATISTIC_INFO => {
@@ -751,6 +755,14 @@ mod tests {
         let mut rejected=Session::new(); rejected.handle(&version()).unwrap(); rejected.handle(&challenge).unwrap();
         assert!(rejected.handle(&cmd(ids::HU_AUTH_RESULT,integers(&[(1,0)])).unwrap()).is_err());
         assert!(rejected.is_failed());
+    }
+    #[test]
+    fn repeated_hu_info_does_not_echo_md_info_or_restart_authentication() {
+        let mut s=Session::new(); s.handle(&version()).unwrap();
+        let info=cmd(ids::HU_INFO,Vec::new()).unwrap();
+        let first=s.handle(&info).unwrap();
+        assert_eq!(first.outgoing.iter().map(|m|m.id).collect::<Vec<_>>(),vec![ids::FEATURE_REQUEST]);
+        assert!(s.handle(&info).unwrap().outgoing.is_empty());
     }
     #[test]
     fn protobuf_bad_wire_overflow_missing_duplicate_fields() {
