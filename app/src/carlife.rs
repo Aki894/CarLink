@@ -801,6 +801,10 @@ mod tests {
         assert_eq!(s.handle(&request).unwrap().outgoing.iter().map(|m|m.id).collect::<Vec<_>>(),vec![ids::MD_AUTH_RESPONSE,ids::MD_PEER_ACCEPT]);
         assert!(!s.auth_accepted);
         assert_eq!(s.handle(&request).unwrap().outgoing.len(),1);
+        let next=s.handle(&init()).unwrap();
+        assert!(next.events.contains(&Event::HuProceededToVideo));
+        assert!(!s.auth_accepted); // The HU chose video without an explicit result.
+        s.handle(&cmd(ids::VIDEO_START,Vec::new()).unwrap()).unwrap();
     }
     #[test]
     fn protobuf_bad_wire_overflow_missing_duplicate_fields() {
