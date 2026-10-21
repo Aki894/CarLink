@@ -1,0 +1,34 @@
+--- a/rust/carplay-airplay/src/air_play_info_plist.rs
++++ b/rust/carplay-airplay/src/air_play_info_plist.rs
+@@ -28,6 +28,10 @@
+     pub fn features(config: &AirPlayConfig) -> u64 {
+         if config.disable_audio_output {
+             CARPLAY_FEATURES_NO_AUDIO
++        } else if config.buffered_audio_output_enabled() {
++            // The buffered media offer must agree with both /info and mDNS.
++            // PCM is implemented for the real-time audio streams as well.
++            CARPLAY_FEATURES | (1u64 << 18) | (1u64 << 40)
+         } else {
+             CARPLAY_FEATURES
+         }
+--- a/rust/direlay-linux/src/linux_audio.rs
++++ b/rust/direlay-linux/src/linux_audio.rs
+@@ -42,6 +42,7 @@
+         if !(1..=2).contains(&source.channels)
+             || !(8000..=48000).contains(&source.sample_rate)
+             || (role == AudioRole::Media
++                && codec != AudioCodec::PcmS16le
+                 && (codec != AudioCodec::AacLc
+                     || source.sample_rate != 48000
+                     || source.channels != 2))
+--- a/rust/carplay-airplay/tests/control_info.rs
++++ b/rust/carplay-airplay/tests/control_info.rs
+@@ -390,6 +390,8 @@
+     c.main_buffered_audio = true;
+     let info = AirPlayInfoPlist::build(&c).unwrap();
+     assert!(info.get("mainBufferedInfo").is_some());
++    assert_ne!(AirPlayInfoPlist::features(&c) & (1u64 << 40), 0);
++    assert_ne!(AirPlayInfoPlist::features(&c) & (1u64 << 18), 0);
+     assert_eq!(
+         uint(&format(&c, 103, "media"), "audioOutputFormats"),
+         0x800000
