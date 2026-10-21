@@ -10,5 +10,17 @@
   "application": {
     "rust": "1.90.0",
     "target": "armv7-unknown-linux-gnueabihf"
+  },
+  "carplay": {
+    "rust": "1.99.1",
+    "target": "armv7-unknown-linux-gnueabihf",
+    "relay": {
+      "repository": "https://github.com/OpenXPlay/OpenXPlay-Relay.git",
+      "commit": "6a7cdab585113e29422f2306e90fdb5a789c318a"
+    },
+    "stream": {
+      "repository": "https://github.com/OpenXPlay/OpenXPlay-Stream.git",
+      "commit": "356a3f56c0e0b4e839b91387bf2b8cfa0b0a8537"
+    }
   }
 }

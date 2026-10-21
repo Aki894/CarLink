@@ -3,6 +3,14 @@ set -euo pipefail
 [[ "${3:-}" == orangepizero ]] || { echo 'Unexpected board' >&2; exit 1; }
 install -m 0755 /tmp/overlay/carlink /usr/local/bin/carlink
 install -m 0644 /tmp/overlay/carlink-build.json /etc/carlink-build.json
+mkdir -p /usr/local/lib/carlink/carplay
+cp -a /tmp/overlay/carplay/. /usr/local/lib/carlink/carplay/
+chmod 0755 /usr/local/lib/carlink/carplay/bin/openxplay-relay \
+    /usr/local/lib/carlink/carplay/bin/oxp-relay /usr/local/lib/carlink/carplay/probe.py
+install -m 0755 /tmp/overlay/carplay/run-carplay.sh /usr/local/bin/carlink-carplay
+mkdir -p /usr/local/lib/carlink/carplay/share/plugins
+install -d -m 0700 /var/lib/carlink/carplay /var/lib/carlink/carplay/mfi
+(cd /usr/local/lib/carlink/carplay && sha256sum -c SHA256SUMS)
 
 mkdir -p /etc/NetworkManager/system-connections /etc/systemd/journald.conf.d
 install -m 0600 /tmp/overlay/carlink-direct.nmconnection \

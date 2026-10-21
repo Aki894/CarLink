@@ -1,7 +1,7 @@
 name: CarLink builds
 on:
   push:
-    paths: ['app/**', 'firmware/**', 'scripts/**', 'sources.lock.json', '.github/workflows/**']
+    paths: ['app/**', 'receiver/**', 'firmware/**', 'scripts/**', 'sources.lock.json', '.github/workflows/**']
   pull_request:
   workflow_dispatch:
     inputs:
@@ -20,7 +20,7 @@ concurrency:
 jobs:
   app:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Validate scripts and locked toolchain
@@ -30,7 +30,10 @@ jobs:
             bash -n "$file"
           done
           python3 -m py_compile scripts/*.py
+          python3 -m unittest discover -s receiver -p 'test_*.py'
           bash -n scripts/verify-image.sh
+          bash -n scripts/build-carplay.sh
+          bash -n scripts/run-carplay.sh
           bash scripts/test-uboot-config.sh
           bash scripts/test-image-validation.sh
           echo "RUST_VERSION=$(python3 -c 'import json; print(json.load(open("sources.lock.json"))["application"]["rust"])')" >> "$GITHUB_ENV"
@@ -38,7 +41,7 @@ jobs:
       - name: Install ARM hard-float compiler and pinned Rust
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabihf
+          sudo apt-get install -y gcc-arm-linux-gnueabihf qemu-user
           rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET"
       - name: Test and cross compile app
         env:
@@ -54,6 +57,17 @@ jobs:
           grep -q 'Machine:.*ARM' dist/app/elf-header.txt
           (cd dist/app && sha256sum carlink > SHA256SUMS)
           cp sources.lock.json dist/app/
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build pinned ARMv7 CarPlay receiver and output process
+        run: bash scripts/build-carplay.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carplay-armv7
+          path: dist/carplay/
+          if-no-files-found: error
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         with:
           name: carlink-armv7
@@ -77,6 +91,10 @@ jobs:
         with:
           name: carlink-armv7
           path: dist/app/
+      - uses: actions/download-artifact@v4
+        with:
+          name: carplay-armv7
+          path: dist/carplay/
       - name: Reclaim unused hosted runner SDK space
         run: |
           # Only fixed paths on a disposable GitHub-hosted Linux runner; keep swap.
@@ -86,7 +104,7 @@ jobs:
           available=$(df --output=avail -BG "$GITHUB_WORKSPACE" | tail -1 | tr -dc '0-9')
           test "$available" -ge 50 || { echo 'Need at least 50 GiB free for Armbian'; exit 1; }
       - name: Stage project overlay and verify upstream kernel config
-        run: python3 scripts/prepare-build.py .build/armbian dist/app/carlink
+        run: python3 scripts/prepare-build.py .build/armbian dist/app/carlink dist/carplay
       - uses: docker/setup-qemu-action@v3
         with:
           platforms: arm

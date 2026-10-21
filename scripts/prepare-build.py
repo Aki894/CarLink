@@ -9,6 +9,7 @@ import sys
 root = pathlib.Path(__file__).resolve().parents[1]
 builder = pathlib.Path(sys.argv[1]).resolve()
 binary = pathlib.Path(sys.argv[2]).resolve()
+carplay = pathlib.Path(sys.argv[3]).resolve()
 lock = json.loads((root / "sources.lock.json").read_text())
 actual = subprocess.check_output(["git", "-C", str(builder), "rev-parse", "HEAD"], text=True).strip()
 if actual != lock["armbian"]["commit"]:
@@ -27,11 +28,29 @@ for name, value in required.items():
 shutil.copytree(root / "firmware/userpatches", builder / "userpatches", dirs_exist_ok=True)
 overlay = builder / "userpatches/overlay"
 shutil.copyfile(binary, overlay / "carlink")
+receiver = json.loads((carplay / "SOURCE.json").read_text())
+for key in ["rust", "target", "relay", "stream"]:
+    if receiver[key] != lock["carplay"][key]:
+        raise SystemExit(f"CarPlay artifact lock mismatch: {key}")
+for line in (carplay / "SHA256SUMS").read_text().splitlines():
+    expected, name = line.split("  ", 1)
+    relative = pathlib.PurePosixPath(name)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise SystemExit("Unsafe CarPlay checksum path")
+    if hashlib.sha256((carplay / name).read_bytes()).hexdigest() != expected:
+        raise SystemExit(f"CarPlay artifact checksum mismatch: {name}")
+for name in ["bin/openxplay-relay", "bin/oxp-relay", "probe.py", "run-carplay.sh",
+             "share/admin/index.html", "share/web/index.html", "share/source/relay.tar.gz",
+             "share/source/stream.tar.gz", "share/licenses/relay/LICENSE", "share/licenses/stream/LICENSE"]:
+    if not (carplay / name).is_file() or not (carplay / name).stat().st_size:
+        raise SystemExit(f"Missing CarPlay runtime payload: {name}")
+shutil.copytree(carplay, overlay / "carplay", dirs_exist_ok=True)
 manifest = {
     "project_commit": subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip(),
     "sources": lock,
     "app_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-    "stage": "hardware bring-up; CarPlay and CarLife not implemented",
+    "carplay_receiver": receiver,
+    "stage": "CarLife MD and separate ARMv7 CarPlay receiver; hardware acceptance in progress",
     "reproducibility": "Framework pinned; resolved kernel/bootloader revisions and package versions remain build-time inputs. See Armbian build logs.",
 }
 (overlay / "carlink-build.json").write_text(json.dumps(manifest, indent=2) + "\n")

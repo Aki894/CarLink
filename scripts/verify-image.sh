@@ -59,6 +59,27 @@ sudo mount -o ro "${loop}p1" "$mountdir"
 test -f "$mountdir/boot/boot.scr"
 test -f "$mountdir/etc/carlink-build.json"
 test -x "$mountdir/usr/local/bin/carlink"
+test -x "$mountdir/usr/local/bin/carlink-carplay"
+receiver="$mountdir/usr/local/lib/carlink/carplay"
+for name in openxplay-relay oxp-relay; do
+    test -x "$receiver/bin/$name"
+    readelf -h "$receiver/bin/$name" | grep -q 'Machine:.*ARM'
+done
+test -x "$receiver/probe.py"
+for payload in SOURCE.json SHA256SUMS share/source/relay.tar.gz share/source/stream.tar.gz \
+    share/licenses/relay/LICENSE share/licenses/relay/LICENSE-GPL-3.0 share/licenses/relay/NOTICE \
+    share/licenses/stream/LICENSE share/admin/index.html share/web/index.html; do
+    test -s "$receiver/$payload"
+done
+(cd "$receiver" && sha256sum -c SHA256SUMS)
+cmp "$receiver/run-carplay.sh" "$mountdir/usr/local/bin/carlink-carplay"
+python3 - "$receiver/SOURCE.json" "$mountdir/etc/carlink-build.json" <<'PY'
+import json,sys
+receiver,build=[json.load(open(p)) for p in sys.argv[1:]]
+for key in ['rust','target','relay','stream']:
+    assert receiver[key] == build['sources']['carplay'][key], f'CarPlay image lock mismatch: {key}'
+assert receiver['target']=='armv7-unknown-linux-gnueabihf'
+PY
 test -x "$mountdir/usr/sbin/sshd"
 sudo grep -q '192.168.77.2/24' "$mountdir/etc/NetworkManager/system-connections/carlink-direct.nmconnection"
 grep -q '^CONFIG_RTW88_8821CU=m$' "$mountdir"/boot/config-*
@@ -70,4 +91,4 @@ for fw in rtw88/rtw8821c_fw.bin rtl_bt/rtl8821c_fw.bin rtl_bt/rtl8821c_config.bi
     require_payload "$mountdir/lib/firmware" firmware "$fw"
 done
 require_no_g_serial "$mountdir/etc/modules" "$mountdir/etc/modules-load.d/"
-echo 'Image structure, app, kernel configuration, modules and firmware checked; hardware untested.'
+echo 'Image structure, app, CarPlay runtime/source/checksums, kernel configuration, modules and firmware checked; hardware untested.'
