@@ -95,9 +95,10 @@ fn request(setup: &[u8; 8]) -> Result<Request, String> {
 }
 
 fn valid_identity(data: &[u8]) -> bool {
-    data.last() == Some(&0)
-        && !data[..data.len().saturating_sub(1)].contains(&0)
-        && std::str::from_utf8(&data[..data.len().saturating_sub(1)]).is_ok()
+    // Some Java HUs send UTF-8 bytes without the optional terminal NUL.
+    // Values are only validated and discarded; never used as a C string.
+    let text = data.strip_suffix(&[0]).unwrap_or(data);
+    !data.is_empty() && !text.contains(&0) && std::str::from_utf8(text).is_ok()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -686,7 +687,7 @@ mod linux {
                                 let mut data = vec![0u8; length];
                                 let count = control_data(fd, false, &mut data)?;
                                 if count != length || !valid_identity(&data[..count]) {
-                                    return Err("invalid AOA identity string encoding or length".into());
+                                    return Err(format!("invalid AOA identity index={index} expected={length} received={count} terminal_nul={}", data.last() == Some(&0)));
                                 }
                                 eprintln!("usb_gadget: AOA identity index={index} bytes={count}");
                             }
@@ -853,11 +854,11 @@ mod tests {
     }
 
     #[test]
-    fn identity_requires_one_terminal_nul_and_valid_utf8() {
+    fn identity_accepts_java_hu_optional_nul_but_rejects_embedded_nuls_and_bad_utf8() {
         assert!(valid_identity(b"CarLink\0"));
         assert!(valid_identity(b"\0"));
         assert!(!valid_identity(b""));
-        assert!(!valid_identity(b"CarLink"));
+        assert!(valid_identity(b"CarLink"));
         assert!(!valid_identity(b"a\0b\0"));
         assert!(!valid_identity(b"\xff\0"));
     }
