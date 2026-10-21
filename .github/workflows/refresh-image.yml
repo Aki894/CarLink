@@ -1,0 +1,102 @@
+name: Refresh existing firmware
+on:
+  workflow_dispatch:
+    inputs:
+      base_run_id:
+        description: Successful run containing the original carlink-h3-image
+        type: string
+        required: true
+        default: '39459953269'
+      driver_run_id:
+        description: Optional successful driver build run; empty means network fix only
+        type: string
+        required: false
+      variant:
+        description: AIC firmware variant (only used with driver_run_id)
+        type: choice
+        options: [main, mcu1]
+        default: main
+permissions:
+  contents: read
+  actions: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      BASE_RUN_ID: ${{ inputs.base_run_id }}
+      DRIVER_RUN_ID: ${{ inputs.driver_run_id }}
+      DRIVER_VARIANT: ${{ inputs.variant }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate inputs and successful source runs
+        run: |
+          [[ "$BASE_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ -z "$DRIVER_RUN_ID" || "$DRIVER_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$DRIVER_VARIANT" == main || "$DRIVER_VARIANT" == mcu1 ]]
+          for run in "$BASE_RUN_ID" ${DRIVER_RUN_ID:+"$DRIVER_RUN_ID"}; do
+            test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" --jq .conclusion)" = success
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          name: carlink-h3-image
+          path: dist/base
+          run-id: ${{ inputs.base_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        if: inputs.driver_run_id != ''
+        with:
+          name: aic8800-usb-${{ inputs.variant }}
+          path: dist/driver
+          run-id: ${{ inputs.driver_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install image inspection tools and test archive guards
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y kmod xz-utils util-linux binutils qemu-user
+          bash -n scripts/refresh-image.sh
+          bash scripts/refresh-image.sh --self-test
+          bash scripts/test-image-validation.sh
+      - name: Download authenticated Debian armhf mode-switch runtime
+        if: inputs.driver_run_id != ''
+        run: |
+          mkdir -p dist/runtime-packages
+          docker run --rm -v "$GITHUB_WORKSPACE/dist/runtime-packages:/output" debian:trixie bash -euo pipefail -c '
+            dpkg --add-architecture armhf
+            apt-get update
+            cd /output
+            apt-get download usb-modeswitch:armhf libjim0.83:armhf usb-modeswitch-data
+            sha256sum -- *.deb > SHA256SUMS
+          '
+      - name: Refresh without rebuilding kernel or app
+        run: |
+          sudo env BASE_RUN_ID="$BASE_RUN_ID" DRIVER_RUN_ID="$DRIVER_RUN_ID" \
+            DRIVER_VARIANT="$DRIVER_VARIANT" REFRESH_COMMIT="$GITHUB_SHA" \
+            SOURCE_REPOSITORY="$GITHUB_REPOSITORY" RUNTIME_PACKAGES_DIR="$GITHUB_WORKSPACE/dist/runtime-packages" \
+            bash scripts/refresh-image.sh dist/base dist/refreshed dist/driver
+          sudo chown -R "$(id -u):$(id -g)" dist/refreshed
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carlink-h3-refreshed-image
+          path: dist/refreshed/image/
+          compression-level: 0
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: inputs.driver_run_id != ''
+        with:
+          name: carlink-aic8800-hot-deploy-${{ inputs.variant }}
+          path: dist/refreshed/driver/
+          compression-level: 0
+          retention-days: 14
+      - name: Preserve refresh diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: carlink-refresh-evidence
+          path: dist/refreshed/evidence/
+          if-no-files-found: ignore
+          retention-days: 14
