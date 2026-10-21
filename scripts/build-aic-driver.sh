@@ -63,19 +63,52 @@ abi_before=$(abi_fingerprint)
 echo "Pinned ABI tree fingerprint before host-tool build: $abi_before"
 # Do NOT call top-level 'scripts', 'scripts/mod/' or modules_prepare. They
 # invoke syncconfig/archheaders, while Armbian deliberately omits syscall.tbl
-# from its headers package. Build only the supplied host-tool subdirectories.
+# from its headers package. Parse the exact top-level Makefile in EXTERNAL
+# module mode, where may-sync-config is off, using a custom target with no
+# preparation dependencies. Export its canonical flags before building only
+# basic/mod through Makefile.build. This includes host scripts/include + LFS
+# flags and target ARM ABI/include/compiler flags without hand-maintaining a
+# partial copy of the top-level Makefile.
+mkdir -p "$work/flags-probe"
+printf '# Flags probe only; no module objects.\n' > "$work/flags-probe/Makefile"
+cat > "$work/export-kbuild-flags.py" <<'PY'
+import json, os, pathlib, sys
+names = [
+    'KBUILD_HOSTCFLAGS', 'KBUILD_HOSTCXXFLAGS', 'KBUILD_HOSTLDFLAGS', 'KBUILD_HOSTLDLIBS',
+    'KBUILD_CFLAGS', 'KBUILD_CPPFLAGS', 'KBUILD_AFLAGS', 'NOSTDINC_FLAGS', 'LINUXINCLUDE',
+    'KBUILD_CFLAGS_KERNEL', 'KBUILD_CFLAGS_MODULE', 'KBUILD_AFLAGS_KERNEL', 'KBUILD_AFLAGS_MODULE',
+    'KBUILD_LDFLAGS', 'KBUILD_LDFLAGS_MODULE', 'CC_FLAGS_LTO', 'CONFIG_SHELL',
+    'HOSTPKG_CONFIG', 'LEX', 'YACC', 'AWK', 'PERL', 'PYTHON3', 'UTS_MACHINE',
+    'KBUILD_BUILD_TIMESTAMP',
+]
+values = {name: os.environ.get(name, '') for name in names}
+assert '/scripts/include' in values['KBUILD_HOSTCFLAGS'], 'Missing kernel host include directory'
+assert '-D__KERNEL__' in values['KBUILD_CPPFLAGS'], 'Missing kernel target preprocessor flags'
+assert '-nostdinc' in values['NOSTDINC_FLAGS'], 'Missing target include isolation'
+assert 'arch/arm/include' in values['LINUXINCLUDE'], 'Missing ARM include directories'
+pathlib.Path(sys.argv[1]).write_text(json.dumps(values, indent=2) + '\n')
+PY
+make -C "$kdir" M="$work/flags-probe" ARCH=arm CROSS_COMPILE="$cross" HOSTCC=gcc HOSTCXX=g++ \
+    --eval="carlink-export-flags: ; @python3 '$work/export-kbuild-flags.py' '$work/kbuild-flags.json'" \
+    carlink-export-flags
+[[ $(abi_fingerprint) == "$abi_before" ]] || { echo 'Kbuild flag export modified pinned ABI inputs'; exit 1; }
+mapfile -d '' -t kbuild_flags < <(python3 - "$work/kbuild-flags.json" <<'PY'
+import json, sys
+for key, value in json.load(open(sys.argv[1])).items():
+    if value:
+        sys.stdout.buffer.write((key + '=' + value).encode() + b'\0')
+PY
+)
 # modpost needs target ARM empty.o/devicetable-offsets.s for ELF layout; these
 # are tools' temporary objects, not regenerated kernel configuration/headers.
-linuxinclude="-I$kdir/arch/arm/include -I$kdir/arch/arm/include/generated -I$kdir/include -I$kdir/arch/arm/include/uapi -I$kdir/arch/arm/include/generated/uapi -I$kdir/include/uapi -I$kdir/include/generated/uapi -include $kdir/include/linux/compiler-version.h -include $kdir/include/linux/kconfig.h -include $kdir/include/linux/compiler_types.h"
 host_build=(make -C "$kdir" -f scripts/Makefile.build -j2
     "srctree=$kdir" "srcroot=$kdir" "objtree=$kdir"
     ARCH=arm SRCARCH=arm "CROSS_COMPILE=$cross"
     "CC=${cross}gcc" "LD=${cross}ld" "AR=${cross}ar" "NM=${cross}nm"
+    "CPP=${cross}gcc -E" "OBJCOPY=${cross}objcopy" "OBJDUMP=${cross}objdump"
+    "READELF=${cross}readelf" "STRIP=${cross}strip"
     HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld
-    "KBUILD_HOSTCFLAGS=-O2 -std=gnu11" "KBUILD_HOSTCXXFLAGS=-O2"
-    "LINUXINCLUDE=$linuxinclude" "KBUILD_CPPFLAGS=-D__KERNEL__"
-    "KBUILD_CFLAGS=-O2 -std=gnu11 -mabi=aapcs-linux -marm -mlittle-endian -march=armv7-a -msoft-float"
-    CONFIG_SHELL=/bin/bash SHELL=/bin/bash)
+    "${kbuild_flags[@]}" CONFIG_SHELL=/bin/bash SHELL=/bin/bash)
 "${host_build[@]}" obj=scripts/basic
 "${host_build[@]}" obj=scripts/mod
 for tool in scripts/basic/fixdep scripts/mod/modpost; do
