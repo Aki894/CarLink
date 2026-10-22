@@ -22,6 +22,7 @@ MAX_VIDEO = 512 * 1024
 MAX_QUEUE = 1024 * 1024
 VIDEO_BUDGET = .12
 AUDIO_BUDGET = .12
+AUDIO_DECODE_BUDGET = .5  # Compressed AirPlay audio arrives in bursts before PCM pacing.
 PCM_CHUNK = 3528  # 20 ms, 44100 Hz, stereo S16LE
 ROLES = {'MEDIA': 0, 'ALERT': 1}
 
@@ -265,7 +266,7 @@ class AudioDecoder:
                    '-f', 's16le', '-flush_packets', '1', 'pipe:1']
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL, bufsize=0)
-        self.emit, self.queue = emit, queue.Queue(maxsize=6)
+        self.emit, self.queue = emit, queue.Queue(maxsize=16)
         self.closed = threading.Event()
         self.origin = None
         self.samples = 0
@@ -307,7 +308,7 @@ class AudioDecoder:
                     data, queued = self.queue.get(timeout=.1)
                 except queue.Empty:
                     continue
-                if time.monotonic() - queued > AUDIO_BUDGET:
+                if time.monotonic() - queued > AUDIO_DECODE_BUDGET:
                     self.failed = True
                     return
                 view = memoryview(data)

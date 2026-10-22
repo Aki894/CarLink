@@ -137,7 +137,6 @@ impl LiveSource {
                     if self.queued+f.payload.len()>MAX_QUEUED || self.queue.len()>=32{return Ok(());}
                 }
                 if f.kind==2 && self.waiting_key {if f.flags&1==0{return Ok(());}self.waiting_key=false;}
-                if f.kind==3 && self.waiting_key{return Ok(());}
                 self.queued+=f.payload.len();self.queue.push_back(f);
             }
         }
@@ -266,10 +265,12 @@ fn varint(bytes:&[u8],pos:&mut usize)->Result<u64,String>{let mut out=0u64;for s
  #[test]#[cfg(unix)]fn video_recovery_and_audio_overflow_keep_audio_track_alive(){
   let mut s=source();s.waiting_key=false;s.audio_active[0]=true;
   s.recover_video();assert!(s.audio_active[0]);assert!(s.audio_pending.is_empty());
-  s.waiting_key=false;
+  // Audio must continue while video is waiting for its recovery keyframe.
+  assert!(s.waiting_key);
   for _ in 0..6{s.accept_frame(Frame{arrived:Instant::now(),kind:3,flags:0,pts:1000,payload:vec![0;4]}).unwrap();}
   s.accept_frame(Frame{arrived:Instant::now(),kind:3,flags:0,pts:2000,payload:vec![0;4]}).unwrap();
   assert!(s.audio_active[0]);assert!(s.audio_pending.is_empty());assert_eq!(s.queue.len(),6);
+  assert_eq!(s.next(true).unwrap().id,0x30006);assert!(s.waiting_key);
  }
  #[test]#[cfg(unix)]fn stale_video_is_not_replayed_and_audio_epoch_survives(){
   let mut s=source();s.waiting_key=false;s.audio_active[0]=true;
