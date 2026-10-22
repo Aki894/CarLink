@@ -18,10 +18,10 @@
  fn air_play_config(
      device_id: String,
      bt_mac: String,
-@@ -396,7 +407,8 @@
-     config.microphone_opus = false;
-     // The Linux relay cannot decode Opus and its receivers play only PCM and AAC.
-     config.output_opus = false;
+@@ -398,7 +409,8 @@
+     let voice_opus = std::env::var("CARLINK_CARPLAY_VOICE_OPUS").as_deref() == Ok("1");
+     config.microphone_opus = voice_opus;
+     config.output_opus = voice_opus;
 -    config.main.fps = session.0;
 +    config.main.fps = carlink_frame_rate(session.0,
 +        std::env::var("CARLINK_LOW_LATENCY").as_deref()==Ok("1"));
