@@ -281,6 +281,8 @@ mod tests {
     fn invalid_touch_does_not_terminate_live_session() {
         let path=std::env::temp_dir().join(format!("carlink-touch-{}",std::process::id()));
         let mut endpoint=Endpoint::with_source(None,Some(path)).unwrap();
+        let version=Message::command(ids::HU_PROTOCOL_VERSION,vec![8,4,16,1]).unwrap().encode().unwrap();
+        endpoint.receive(&version).unwrap();
         let init=Message::command(ids::VIDEO_INIT,vec![8,0xa0,6,16,0xe0,3,24,30]).unwrap().encode().unwrap();
         endpoint.receive(&init).unwrap();
         for payload in [vec![8,0,16,1,24,1,42,5,1],vec![8,0,16,0xff,0x7f,24,1]] {
