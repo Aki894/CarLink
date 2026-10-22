@@ -42,7 +42,7 @@ set -euo pipefail
     --disable-autodetect --disable-network --disable-everything \
     --disable-programs --enable-ffmpeg --disable-doc --disable-debug \
     --disable-shared --enable-static --enable-small \
-    --disable-avdevice --disable-swscale --disable-postproc \
+    --disable-avdevice --disable-swscale \
     --disable-hwaccels --disable-gpl --disable-nonfree --disable-version3 \
     --enable-avcodec --enable-avformat --enable-avfilter --enable-swresample \
     --enable-decoder=aac,pcm_s16le,opus --enable-encoder=pcm_s16le \

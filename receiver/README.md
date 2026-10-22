@@ -56,8 +56,10 @@ coordinates, for example:
 Recording is opt-in via `CARLINK_PROBE_RECORD_DIR`. It writes Annex B H.264 from
 the next keyframe, with a 128 MiB total limit across existing segments. Captures
 may contain personal screen content; keep them local. Without this variable, no
-media is saved. Audio is counted and its format reported; PCM forwarding to
-CarLife is a subsequent integration step.
+media is saved. Audio is counted and its format reported in probe mode.
+`carlink-carplay forward` uses the new live consumer; the combined
+`carlink-run` supervisor starts it alongside the CarLife USB sender. See
+[live forwarding](../docs/live-forwarding.md) for runtime and acceptance details.
 
 ## Wire boundary and checks
 
@@ -72,6 +74,6 @@ Run `python3 -m unittest discover -s receiver` for malformed-frame, AVC/NAL,
 touch and supervised-process checks. Linux Actions runs the Unix process test;
 the optional upstream vector test uses the ignored local reference checkout.
 
-The existing CarLife synthetic-media path remains independently runnable. Live
-CarPlay-to-CarLife video, audio decoding, touch mapping and microphone return
-will use this receiver boundary after iPhone reception is accepted.
+The existing CarLife synthetic-media path remains independently runnable. The live
+consumer forwards H.264, converts media/alert audio and returns single-point
+touch. Phone/Siri microphone paths are a later stage.
