@@ -50,3 +50,5 @@ CI 应在最终镜像校验阶段调用 `--verify`，并将配置源与安装器
 - [systemd journald 配置](https://www.freedesktop.org/software/systemd/man/latest/journald.conf.html)：用 drop-in 约束持久/运行时容量、保留时间及同步周期，保留排错能力。
 - [systemd unit 文档](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html)：mask 阻止启动、ConditionPathExists 按文件存在条件启动；用于废弃串口实例与本地 MFi 文件检查。
 - [Armbian minimal/desktop 构建开关](https://docs.armbian.com/build-framework/switches/image-type/)：继续使用 minimal 无桌面基础镜像，不额外引入桌面服务。
+
+最终完整镜像已通过构建与配置校验，见 [验收记录](live-build-validation-2026-10-22.md)。实际启动耗时待下一轮通电测量。
