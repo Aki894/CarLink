@@ -133,6 +133,16 @@ class WireTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     probe.control(left, c)
 
+    def test_focus_key_pulse_is_bounded_and_always_released(self):
+        left, right = socket.socketpair()
+        with left, right:
+            probe.control(left, {'type': 'key-press', 'code': 3})
+            self.assertEqual(probe.receive(right)[-1], b'\x03\x00\x01')
+            self.assertEqual(probe.receive(right)[-1], b'\x03\x00\x00')
+            for code in (-1, 10, True, '3'):
+                with self.assertRaises(ValueError):
+                    probe.control(left, {'type': 'key-press', 'code': code})
+
 
 if __name__ == '__main__':
     unittest.main()

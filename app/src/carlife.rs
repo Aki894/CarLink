@@ -51,6 +51,10 @@ pub mod ids {
 #[repr(u32)]
 pub enum Channel { Cmd = 1, Video = 2, Media = 3, Tts = 4, Vr = 5, Touch = 6 }
 
+fn channel_matches(channel: Channel, id: u32) -> bool {
+    id >> 16 == channel as u32 || (channel == Channel::Touch && (0x1005a..=0x1005e).contains(&id))
+}
+
 impl Channel {
     pub fn from_u32(value: u32) -> Result<Self, Error> {
         match value {
@@ -103,7 +107,7 @@ impl Message {
 
     /// Encodes one complete inner message into one outer frame, without USB I/O.
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
-        if self.id >> 16 != self.channel as u32 { return Err(Error::InvalidFrame("message/channel mismatch")); }
+        if !channel_matches(self.channel,self.id) { return Err(Error::InvalidFrame("message/channel mismatch")); }
         let header = self.channel.header_len();
         if self.payload.len() > Limits::default().max_inner_payload { return Err(Error::LimitExceeded("encoded payload")); }
         let mut inner = Vec::with_capacity(header + self.payload.len());
@@ -239,7 +243,7 @@ impl Decoder {
         let header = channel.header_len();
         let length = if header == 8 { u16::from_be_bytes([inner[0], inner[1]]) as usize } else { be32(&inner[..4]) as usize };
         if length > self.limits.max_inner_payload { return Err(Error::LimitExceeded("inner payload length")); }
-        if be32(&inner[header - 4..header]) >> 16 != channel as u32 {
+        if !channel_matches(channel,be32(&inner[header - 4..header])) {
             return Err(Error::InvalidFrame("message/channel mismatch"));
         }
         Ok(header + length)
@@ -328,7 +332,7 @@ impl Session {
     }
     fn handle_inner(&mut self, message: &Message) -> Result<Outcome, Error> {
         use ids::*;
-        if message.id >> 16 != message.channel as u32 { return Err(Error::InvalidFrame("message/channel mismatch")); }
+        if !channel_matches(message.channel,message.id) { return Err(Error::InvalidFrame("message/channel mismatch")); }
         if message.payload.len() > 65535 { return Err(Error::LimitExceeded("session command payload")); }
         let mut out = Outcome::default();
         if message.channel != Channel::Cmd {
@@ -581,6 +585,19 @@ fn fields(bytes: &[u8]) -> Result<Vec<Field<'_>>, Error> {
             _ => return Err(Error::InvalidProtobuf("unsupported wire type")),
         };
         out.push(Field { number: (tag >> 3) as u32, value });
+    }
+    Ok(out)
+}
+
+pub(crate) fn input_integers(bytes: &[u8]) -> Result<[Option<i32>;4],Error> {
+    let mut out=[None;4];
+    for field in fields(bytes)? {
+        if (1..=3).contains(&field.number) {
+            match field.value {
+                Value::Integer(value)=>out[field.number as usize]=Some(value as u32 as i32),
+                _=>return Err(Error::InvalidProtobuf("input integer field has wrong wire type")),
+            }
+        }
     }
     Ok(out)
 }

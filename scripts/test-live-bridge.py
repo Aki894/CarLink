@@ -122,6 +122,15 @@ with tempfile.TemporaryDirectory(prefix='carlink-live-ci-') as directory:
                         ident, down, x, y = struct.unpack('<BBHH', event[-1][1:])
                         assert ident == 0 and down == 1 and (x, y) == (32768, 32768)
                         break
+                # Lexus legacy CMD-range ids are carried on the TOUCH channel.
+                hu.sendall(lab.command(0x1005a, b'\x08\x01', channel=6))
+                hu.sendall(lab.command(0x1005b, b'\x08\x02\x10'+b'\xd0'+b'\xff'*8+b'\x01\x18\x00', channel=6))
+                keys = []
+                while len(keys) < 2:
+                    event = probe.receive(source)
+                    if isinstance(event, tuple) and event[0] == 17:
+                        keys.append(struct.unpack('<HB', event[-1]))
+                assert keys == [(3, 1), (3, 0)], keys
     finally:
         for child in reversed(children):
             if child.poll() is None:

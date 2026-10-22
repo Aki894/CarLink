@@ -102,6 +102,19 @@ def control(stream, value):
     if value == {'type': 'keyframe', 'screen': 0}:
         send_json(stream, value)
         return
+    if value.get('type') == 'key-press':
+        if set(value) != {'type', 'code'} or type(value['code']) is not int or not 0 <= value['code'] <= 9:
+            raise ValueError('invalid focus key')
+        now = time.monotonic_ns() // 1000
+        # One internal event owns the complete pulse; no queued held key remains
+        # if the bounded live control queue disconnects before another event.
+        wire = bytearray()
+        for down in (1, 0):
+            payload = struct.pack('<HB', value['code'], down)
+            header = HEADER.pack(17, 0, 0, 0, 0, now, now)
+            wire.extend(struct.pack('<I', len(header) + len(payload)) + header + payload)
+        stream.sendall(wire)
+        return
     if set(value) != {'type', 'contacts'} or value['type'] != 'touch':
         raise ValueError('expected keyframe or touch control')
     contacts = value['contacts']

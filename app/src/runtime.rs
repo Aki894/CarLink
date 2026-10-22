@@ -25,6 +25,7 @@ pub struct Endpoint {
     epochs: [u64; 2],
     last_video: Duration,
     first_header: Vec<u8>,
+    input: crate::input::Input,
 }
 
 impl Endpoint {
@@ -36,7 +37,7 @@ impl Endpoint {
         let session = media.as_ref().map_or_else(Session::new, |m| Session::with_video_source(m.config()));
         Self { decoder: Decoder::new(Limits::default()), session, media, live: None, transport_ready: true, live_generation: 0, clock: Instant::now(),
             playing: false, audio_on: false, audio_allowed: true, hu_muted: false, epochs: [0; 2], last_video: Duration::ZERO,
-            first_header: Vec::with_capacity(8) }
+            first_header: Vec::with_capacity(8), input: crate::input::Input::default() }
     }
 
     pub fn with_source(media: Option<TestMedia>, live_path: Option<std::path::PathBuf>) -> Result<Self,String> {
@@ -92,7 +93,12 @@ impl Endpoint {
                 log("hu_video_preference", &format!("{:?}", crate::carlife::video_hint(&message.payload).map_err(|e| e.to_string())?));
             }
             if let Some(live)=self.live.as_mut() {
-                if let Some(config)=self.session.video_config() {
+                if !live.accepts_input(){self.input=crate::input::Input::default();}
+                if let Some(config)=self.session.video_config().filter(|_|live.accepts_input()) {
+                    match self.input.handle(&message,self.clock.elapsed().as_millis() as u64) {
+                        Ok(keys)=>for code in keys {live.feedback(&format!("{{\"type\":\"key-press\",\"code\":{code}}}"));},
+                        Err(error)=>log("input_ignored",&error),
+                    }
                     match crate::live::touch(&message,config) {
                         Ok(Some(control))=>live.feedback(&control),
                         Ok(None)=>{},

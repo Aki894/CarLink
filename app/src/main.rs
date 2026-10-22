@@ -4,6 +4,7 @@ mod gadget;
 mod runtime;
 mod media;
 mod live;
+mod input;
 mod auth;
 #[cfg(target_os = "linux")]
 mod usb_aio;
