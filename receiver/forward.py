@@ -405,8 +405,8 @@ def run(args):
                 message = probe.receive(stream)
                 if isinstance(message, dict):
                     kind = message.get('type')
-                    if kind == 'carlink-clock' and source_clock:
-                        value = message.get('offsetUs')
+                    if kind == 'stats' and source_clock and message.get('clockOffsetUs') is not None:
+                        value = message.get('clockOffsetUs')
                         if type(value) is not int or not -(1 << 63) <= value < (1 << 63):
                             raise ValueError('invalid producer clock mapping')
                         capture_offset = value

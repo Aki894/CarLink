@@ -79,6 +79,9 @@ with tempfile.TemporaryDirectory(prefix='carlink-live-ci-') as directory:
                 probe.send_json(source, dict(type='hello', version=0, role='producer'))
                 assert probe.receive(source)['role'] == 'consumer'
                 assert probe.receive(source)['displays']['0']['frameRate'] == 'FPS_30'
+                probe.send_json(source, dict(type='stats', screen=0, decodeMs=None, decodeQueue=0,
+                    dropped=0, rendered=0, decodedLatencyMs=None, renderedLatencyMs=None,
+                    clockOffsetUs=time.monotonic_ns() // 1000 - 1000000, rttUs=None))
                 probe.send_json(source, dict(type='session', session=dict(phase='ACTIVE')))
                 avcc = bytes.fromhex('0164001fffe10002676401000268ee')
                 probe.send_json(source, {'type': 'video-format', 'screen': 0, 'format': {

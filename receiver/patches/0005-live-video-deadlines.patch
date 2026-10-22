@@ -1,6 +1,6 @@
 --- a/rust/direlay-linux/src/stream_bridge_sink.rs
 +++ b/rust/direlay-linux/src/stream_bridge_sink.rs
-@@ -10,7 +10,31 @@
+@@ -10,7 +10,35 @@
      collections::BTreeMap,
      sync::{Arc, Mutex},
  };
@@ -10,6 +10,9 @@
 +    let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
 +    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 { return fallback; }
 +    time.tv_sec as i64 * 1_000_000 + time.tv_nsec as i64 / 1000
++}
++pub(crate) fn carlink_clock_message(offset:i64)->oxp_wire::Message {
++    oxp_wire::Message::Json(serde_json::json!({"type":"stats","screen":0,"decodeMs":null,"decodeQueue":0,"dropped":0,"rendered":0,"decodedLatencyMs":null,"renderedLatencyMs":null,"clockOffsetUs":offset,"rttUs":null}))
 +}
 +fn carlink_capture_us(sender_ns:u64, local_us:i64, anchor:&mut Option<(i64,i64)>) -> i64 {
 +    if sender_ns==0 { return local_us; }
@@ -22,6 +25,7 @@
 +#[cfg(test)]
 +#[test]
 +fn carlink_capture_detects_delayed_sender_frames() {
++    oxp_wire::write(&mut Vec::new(),&carlink_clock_message(42)).expect("clock metadata must pass real OXP encoding");
 +    let mut anchor=None;
 +    assert_eq!(carlink_capture_us(1_000_000_000,10_000_000,&mut anchor),10_000_000);
 +    assert!(12_000_000-carlink_capture_us(1_100_000_000,12_000_000,&mut anchor)>1_800_000);
@@ -32,7 +36,7 @@
      session: u64,
      codec: Option<VideoCodec>,
      format: Option<oxp_core::model::VideoFormat>,
-@@ -39,6 +63,7 @@
+@@ -39,6 +67,7 @@
              delegate,
              events,
              state: Mutex::new(BridgeState {
@@ -40,7 +44,7 @@
                  session,
                  codec: None,
                  format: None,
-@@ -68,6 +93,7 @@
+@@ -68,6 +97,7 @@
          let next = self.input.resume(s.session);
          if next != s.session {
              s.session = next;
@@ -48,7 +52,7 @@
              s.codec = None;
              s.format = None;
              s.audio.clear();
-@@ -157,6 +183,9 @@
+@@ -157,6 +187,9 @@
          let frame_arrival = self.clock.as_ref().map(|now| now()).unwrap_or(arrival);
          if kind == 110 {
              let mut s = self.state.lock().unwrap();
@@ -58,7 +62,7 @@
              if let Some(format) = &s.format {
                  match annex_b_to_avcc(data) {
                      Ok(payload) => {
-@@ -185,7 +214,7 @@
+@@ -185,7 +218,7 @@
                                  flags: if key { oxp_wire::KEYFRAME } else { 0 },
                                  sequence: s.sequence,
                                  pts_us: (frame_arrival / 1000) as i64,
@@ -67,7 +71,7 @@
                              },
                              payload,
                          };
-@@ -272,7 +301,7 @@
+@@ -272,7 +305,7 @@
                                          flags: 0,
                                          sequence: 0,
                                          pts_us: pts,
@@ -87,7 +91,7 @@
 +                            let mut now=libc::timespec {tv_sec:0,tv_nsec:0};
 +                            if unsafe {libc::clock_gettime(libc::CLOCK_MONOTONIC,&mut now)}==0 {
 +                                let offset=now.tv_sec as i64*1_000_000+now.tv_nsec as i64/1000-oxp_core::monotonic_nanos()/1000;
-+                                oxp_wire::write(&mut stream,&oxp_wire::Message::Json(serde_json::json!({"type":"carlink-clock","offsetUs":offset}))).map_err(std::io::Error::other)?;
++                                oxp_wire::write(&mut stream,&crate::stream_bridge_sink::carlink_clock_message(offset)).map_err(std::io::Error::other)?;
 +                            }
 +                        }
 +                        let (tx, rx) = mpsc::sync_channel(if std::env::var("CARLINK_LOW_LATENCY").as_deref() == Ok("1") { 32 } else { 128 });
