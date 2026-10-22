@@ -48,6 +48,7 @@ rustup toolchain install "$version" --profile minimal --target "$target"
 # ring requires the cross C compiler; all other target-specific dependencies
 # are resolved by the upstream Cargo.lock files rather than edited locally.
 cargo +"$version" test --locked --manifest-path "$relay/rust/Cargo.toml" -p carplay-iap2 -p carplay-airplay
+cargo +"$version" test --locked --manifest-path "$relay/rust/Cargo.toml" -p openxplay-relay carlink_capture_detects_delayed_sender_frames
 cargo +"$version" build --locked --release --manifest-path "$relay/rust/Cargo.toml" --target "$target" -p openxplay-relay --bin openxplay-relay
 cargo +"$version" build --locked --release --manifest-path "$stream/rust/Cargo.toml" --target "$target" -p oxp-bin --bin oxp-relay
 for name in openxplay-relay oxp-relay; do

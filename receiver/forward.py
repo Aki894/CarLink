@@ -405,7 +405,12 @@ def run(args):
                 message = probe.receive(stream)
                 if isinstance(message, dict):
                     kind = message.get('type')
-                    if kind == 'session':
+                    if kind == 'carlink-clock' and source_clock:
+                        value = message.get('offsetUs')
+                        if type(value) is not int or not -(1 << 63) <= value < (1 << 63):
+                            raise ValueError('invalid producer clock mapping')
+                        capture_offset = value
+                    elif kind == 'session':
                         next_active = message.get('session', {}).get('phase') == 'ACTIVE'
                         if next_active == active:
                             continue
@@ -452,13 +457,14 @@ def run(args):
                             link.recover_video()
                         last_video_seq = seq
                         if source_clock:
-                            capture_offset = sender - pts
                             age = (time.monotonic_ns() // 1000 - sender) / 1000000
                             link.source_ms_max = max(link.source_ms_max, age * 1000)
                             if age > VIDEO_BUDGET or age < -.05:
                                 link.source_dropped += 1
                                 link.recover_video()
                                 continue
+                            if capture_offset is None:
+                                capture_offset = sender - pts
                         data = probe.annexb(payload)
                         if flags & 1:
                             data = parameters + data
