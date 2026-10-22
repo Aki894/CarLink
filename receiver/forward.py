@@ -340,11 +340,7 @@ class AudioDecoder:
                         playback_origin = now - self.samples / 44100
                     if self.closed.wait(max(0, playback_origin + self.samples / 44100 - now)):
                         return
-                    # CarLife receives PCM on its actual playback clock. The
-                    # compressed input PTS precedes decoder buffering; forwarding
-                    # it makes the head unit hold fresh video behind old audio.
-                    origin = round(playback_origin * 1000000) if os.environ.get('CARLINK_LOW_LATENCY') == '1' else (self.origin or 0)
-                    self.emit(pcm, origin + self.samples * 1000000 // 44100)
+                    self.emit(pcm, (self.origin or 0) + self.samples * 1000000 // 44100)
                     self.samples += PCM_CHUNK // 4
         except (OSError, ValueError):
             pass
