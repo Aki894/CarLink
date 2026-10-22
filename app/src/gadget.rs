@@ -420,15 +420,25 @@ mod linux {
         }
     }
 
-    fn transmit(file: &mut File, frame: &[u8], stop: &AtomicBool, deadline: Instant) -> Result<(), String> {
+    fn transport_frames(frame: &[u8]) -> Result<Vec<&[u8]>, String> {
         if frame.len() < 8 || frame.len() > MAX_FRAME { return Err("invalid outgoing USB frame size".into()); }
-        let channel = u32::from_be_bytes(frame[..4].try_into().unwrap());
-        let length = u32::from_be_bytes(frame[4..8].try_into().unwrap()) as usize;
-        if !(1..=6).contains(&channel) || length != frame.len() - 8 {
-            return Err("invalid outgoing USB transport header".into());
+        let mut frames=Vec::new();let mut remaining=frame;
+        while !remaining.is_empty() {
+            if remaining.len()<8 || frames.len()>=32{return Err("invalid outgoing USB frame batch".into());}
+            let channel=u32::from_be_bytes(remaining[..4].try_into().unwrap());
+            let length=u32::from_be_bytes(remaining[4..8].try_into().unwrap()) as usize;
+            let end=length.checked_add(8).filter(|end|*end<=remaining.len());
+            if !(1..=6).contains(&channel) || length==0 || end.is_none(){return Err("invalid outgoing USB transport header".into());}
+            let (one,rest)=remaining.split_at(end.unwrap());frames.push(one);remaining=rest;
         }
-        // Preserve separate USB transfers for the outer header and body.
-        for part in [&frame[..8], &frame[8..]] {
+        Ok(frames)
+    }
+
+    fn transmit(file: &mut File, frame: &[u8], stop: &AtomicBool, deadline: Instant) -> Result<(), String> {
+        // Runtime may append a CMD status after an audio state change. Validate
+        // the complete batch before writing, then preserve each outer boundary.
+        for one in transport_frames(frame)? {
+        for part in [&one[..8], &one[8..]] {
             let mut offset = 0;
             while offset < part.len() && live(stop, deadline) {
                 if !ready(file.as_raw_fd(), POLLOUT, Duration::from_millis(50))? { continue; }
@@ -440,6 +450,7 @@ mod linux {
                 }
             }
             if offset != part.len() { return Err("USB transfer interrupted before completion".into()); }
+        }
         }
         Ok(())
     }
@@ -769,6 +780,17 @@ mod linux {
             let (tx, _rx) = mpsc::sync_channel(1);
             tx.try_send(Outgoing { data: vec![1], epoch: Some((0, 0)) }).unwrap();
             assert!(matches!(tx.try_send(Outgoing { data: vec![2], epoch: Some((0, 0)) }), Err(TrySendError::Full(_))));
+        }
+
+        #[test]
+        fn audio_state_and_status_batch_preserves_usb_boundaries() {
+            use crate::carlife::{Channel,Message,ids};
+            let audio=Message{channel:Channel::Media,id:0x30001,timestamp_ms:Some(42),reserved:0,payload:vec![8,1]}.encode().unwrap();
+            let status=Message::command(ids::MODULE_STATUS,vec![8,1]).unwrap().encode().unwrap();
+            let mut batch=audio.clone();batch.extend(&status);
+            assert_eq!(transport_frames(&batch).unwrap(),vec![audio.as_slice(),status.as_slice()]);
+            batch.pop();assert!(transport_frames(&batch).is_err());
+            let mut bad=audio;bad.extend([0;8]);assert!(transport_frames(&bad).is_err());
         }
     }
 }
