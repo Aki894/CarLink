@@ -1,0 +1,37 @@
+--- a/rust/carplay-airplay/src/air_play_info_plist.rs
++++ b/rust/carplay-airplay/src/air_play_info_plist.rs
+@@ -90,8 +90,9 @@
+                 AirPlayHid::telephony_hid_device(MAIN_UUID),
+             ]),
+         );
++        // Explicit false clears an OEM shortcut cached by the iPhone.
++        push(&mut info, "oemIconVisible", (!config.icons.is_empty()).into());
+         if !config.icons.is_empty() {
+-            push(&mut info, "oemIconVisible", true.into());
+             push(&mut info, "oemIconLabel", config.oem_label.clone().into());
+             push(
+                 &mut info,
+--- a/rust/carplay-airplay/tests/control_info.rs
++++ b/rust/carplay-airplay/tests/control_info.rs
+@@ -146,7 +146,8 @@
+     let c = config();
+     assert!(c.icons.is_empty());
+     let info = AirPlayInfoPlist::build(&c).unwrap();
+-    for key in ["oemIconVisible", "oemIconLabel", "oemIcons"] {
++    assert_eq!(get(&info, "oemIconVisible"), &V::Boolean(false));
++    for key in ["oemIconLabel", "oemIcons"] {
+         assert!(info.get(key).is_none(), "{key}");
+     }
+ }
+--- a/rust/direlay-linux/src/linux_wireless_platform.rs
++++ b/rust/direlay-linux/src/linux_wireless_platform.rs
+@@ -940,7 +940,8 @@
+             false,
+         );
+         let info = AirPlayInfoPlist::build(&config).unwrap();
+-        for key in ["oemIconVisible", "oemIconLabel", "oemIcons"] {
++        assert_eq!(info.get("oemIconVisible"), Some(&BplistValue::Boolean(false)));
++        for key in ["oemIconLabel", "oemIcons"] {
+             assert!(info.get(key).is_none(), "unexpected OEM tile field: {key}");
+         }
+     }
