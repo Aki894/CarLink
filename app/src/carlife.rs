@@ -594,7 +594,10 @@ pub(crate) fn input_integers(bytes: &[u8]) -> Result<[Option<i32>;4],Error> {
     for field in fields(bytes)? {
         if (1..=3).contains(&field.number) {
             match field.value {
-                Value::Integer(value)=>out[field.number as usize]=Some(value as u32 as i32),
+                Value::Integer(value)=>{
+                    if value>u32::MAX as u64 && value<0xffff_ffff_8000_0000{return Err(Error::InvalidProtobuf("input int32 overflow"));}
+                    out[field.number as usize]=Some(value as u32 as i32);
+                },
                 _=>return Err(Error::InvalidProtobuf("input integer field has wrong wire type")),
             }
         }

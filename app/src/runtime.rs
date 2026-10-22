@@ -289,11 +289,16 @@ mod tests {
     #[test]
     fn invalid_touch_does_not_terminate_live_session() {
         let path=std::env::temp_dir().join(format!("carlink-touch-{}",std::process::id()));
-        let mut endpoint=Endpoint::with_source(None,Some(path)).unwrap();
+        let mut endpoint=Endpoint::with_source(None,Some(path.clone())).unwrap();
         let version=Message::command(ids::HU_PROTOCOL_VERSION,vec![8,4,16,1]).unwrap().encode().unwrap();
         endpoint.receive(&version).unwrap();
         let init=Message::command(ids::VIDEO_INIT,vec![8,0xa0,6,16,0xe0,3,24,30]).unwrap().encode().unwrap();
         endpoint.receive(&init).unwrap();
+        endpoint.receive(&Message::command(ids::VIDEO_START,vec![]).unwrap().encode().unwrap()).unwrap();
+        let mut producer=std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let mut active=12u32.to_le_bytes().to_vec();active.extend([4,1,0,0]);active.extend(0u64.to_le_bytes());
+        producer.write_all(&active).unwrap();endpoint.poll_media().unwrap();
+        assert!(endpoint.live.as_ref().unwrap().accepts_input());
         for payload in [vec![8,0,16,1,24,1,42,5,1],vec![8,0,16,0xff,0x7f,24,1]] {
             let touch=Message::command(0x68001,payload).unwrap().encode().unwrap();
             endpoint.receive(&touch).expect("bad contact must not disconnect USB");
