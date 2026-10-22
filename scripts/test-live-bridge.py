@@ -102,7 +102,10 @@ with tempfile.TemporaryDirectory(prefix='carlink-live-ci-') as directory:
                         for seq in range(50):
                             pts = 1000000 + seq * 20000
                             for kind, payload, flags in [(1, struct.pack('>I', len(access_unit)) + access_unit, 1), (2, pcm, 0)]:
-                                frame = probe.HEADER.pack(kind, 0, flags, 0, seq, pts, time.monotonic_ns() // 1000) + payload
+                                # An unrelated compressed-audio epoch must not
+                                # become the CarLife PCM presentation clock.
+                                source_pts = pts + 30000000 if kind == 2 else pts
+                                frame = probe.HEADER.pack(kind, 0, flags, 0, seq, source_pts, time.monotonic_ns() // 1000) + payload
                                 source.sendall(struct.pack('<I', len(frame)) + frame)
                             time.sleep(.02)
                         probe.send_json(source, {'type': 'audio-format', 'stream': 0, 'format': None})
@@ -113,13 +116,16 @@ with tempfile.TemporaryDirectory(prefix='carlink-live-ci-') as directory:
                 sender.start()
                 seen = set()
                 stamps = {}
+                last_video_stamp = None
                 while not {0x20001, 0x30001, 0x30006, 0x30002} <= seen:
                     channel, kind, stamp, payload = media.packet(hu)
                     seen.add(kind)
                     if kind == 0x20001:
                         assert payload == expected_video
+                        last_video_stamp = stamp
                     elif kind == 0x30006:
                         assert len(payload) == 3528 and any(payload)
+                        assert last_video_stamp is not None and abs(stamp - last_video_stamp) < 250, (stamp, last_video_stamp)
                     if stamp is not None:
                         assert stamp >= stamps.get(channel, 0)
                         stamps[channel] = stamp
