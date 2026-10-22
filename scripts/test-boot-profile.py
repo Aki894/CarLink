@@ -51,6 +51,9 @@ class BootProfileTests(unittest.TestCase):
         self.assertIn('RestartSec=5s', unit)
         self.assertIn('RuntimeDirectoryMode=0700', unit)
         self.assertEqual(unit.count('ConditionPathExists='), 2)
+        logging = (self.root / 'etc/systemd/system/carlink.service.d/80-journal.conf').read_text()
+        self.assertIn('ExecStartPre=/usr/bin/journalctl --flush', logging)
+        self.assertIn('ExecStartPre=/usr/bin/journalctl --sync', logging)
 
     def test_updates_are_delayed_not_masked(self):
         profile.operate(self.root)
