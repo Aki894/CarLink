@@ -23,6 +23,9 @@ def main():
     live = os.environ.get('CARLINK_LIVE_SOCKET', '/run/carlink/live.sock')
     for path in ('/run/carlink', '/run/carlink-carplay'):
         Path(path).mkdir(mode=0o700, parents=True, exist_ok=True)
+    endpoints = (live, '/run/carlink-carplay/media.sock')
+    if any(os.path.lexists(name) for name in endpoints):
+        raise SystemExit('Projection socket already exists; preserve the active/stale owner for inspection')
     commands = [
         ['/usr/local/bin/carlink', 'carlife', 'usb', '--duration', '0', '--live-socket', live],
         ['/usr/local/bin/carlink-carplay', 'forward'],
@@ -45,7 +48,7 @@ def main():
                 child.kill()
                 child.wait(timeout=2)
         # These endpoints belong to the terminated child processes in private dirs.
-        for name in (live, '/run/carlink-carplay/media.sock'):
+        for name in endpoints:
             path = Path(name)
             try:
                 if stat.S_ISSOCK(path.lstat().st_mode):
