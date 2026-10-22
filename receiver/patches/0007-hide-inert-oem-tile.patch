@@ -1,0 +1,52 @@
+--- a/rust/direlay-linux/src/linux_wireless_platform.rs
++++ b/rust/direlay-linux/src/linux_wireless_platform.rs
+@@ -407,6 +407,8 @@
+         data: crate::branding::OEM_ICON_PNG.to_vec(),
+     }];
+     config.oem_label = crate::branding::OEM_ICON_LABEL.into();
++    // CarLink has no local car UI to return to; omit the inert OEM app tile.
++    config.icons.clear();
+     config
+ }
+ fn identification(
+@@ -913,7 +915,7 @@
+         assert!(shared_network(&saved, "").is_none());
+     }
+     #[test]
+-    fn air_play_config_declares_the_openxplay_car_button() {
++    fn carlink_air_play_config_omits_inert_oem_tile() {
+         let config = air_play_config(
+             "02:00:00:00:00:02".into(),
+             "02:00:00:00:00:03".into(),
+@@ -921,28 +923,9 @@
+             false,
+         );
+         let info = AirPlayInfoPlist::build(&config).unwrap();
+-        let key = |key: &str| info.get(key).unwrap();
+-        assert_eq!(key("oemIconVisible"), &BplistValue::Boolean(true));
+-        assert_eq!(key("oemIconLabel").as_str(), Some("OpenXPlay"));
+-        let icons = key("oemIcons").as_array().unwrap();
+-        assert_eq!(icons.len(), 1);
+-        let field = |key: &str| icons[0].get(key).unwrap();
+-        assert_eq!(
+-            (
+-                field("widthPixels").as_u64(),
+-                field("heightPixels").as_u64()
+-            ),
+-            (Some(192), Some(192))
+-        );
+-        let png = field("imageData").as_data().unwrap();
+-        assert_eq!(png, crate::branding::OEM_ICON_PNG);
+-        // The declared size matches the PNG: signature, then IHDR width and height.
+-        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+-        assert_eq!(&png[12..16], b"IHDR");
+-        let side = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+-        assert_eq!((side(16), side(20)), (192, 192));
+-        // Opaque 8-bit RGB: the tile has no transparent corners for the iPhone to fill.
+-        assert_eq!((png[24], png[25]), (8, 2));
++        for key in ["oemIconVisible", "oemIconLabel", "oemIcons"] {
++            assert!(info.get(key).is_none(), "unexpected OEM tile field: {key}");
++        }
+     }
+     #[test]
+     fn car_bluetooth_audio_offers_the_iphone_no_carplay_audio() {
