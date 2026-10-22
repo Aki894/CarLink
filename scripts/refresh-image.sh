@@ -262,6 +262,7 @@ fi
 "$python" "$project/scripts/install-projection-runtime.py" \
     "${APPLICATION_DIR:?Verified application artifact required}" \
     "${CARPLAY_DIR:?Verified CarPlay artifact required}" "$rootfs"
+"$python" "$project/scripts/install-boot-profile.py" --root "$rootfs"
 [[ $(boot_fingerprint) == "$boot_before" ]]
 BASE_SHA="$base_sha" BASE_APP_SHA="$app_before" BOOT_SHA="$boot_before" KERNEL_RELEASE="$kernel" \
 DRIVER_COMMIT="$driver_commit" "$python" - "$rootfs" "$output/image/carlink-refresh.json" "$work/runtime-packages.json" "$work/base-build.json" <<'PY'

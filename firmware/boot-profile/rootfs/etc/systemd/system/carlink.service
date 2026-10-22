@@ -1,0 +1,26 @@
+[Unit]
+Description=CarLink wireless CarPlay to wired CarLife bridge
+Documentation=https://github.com/Aki894/CarLink
+Wants=NetworkManager.service bluetooth.service
+After=NetworkManager.service bluetooth.service
+ConditionPathExists=/var/lib/carlink/carplay/mfi/identity.pk8
+ConditionPathExists=/var/lib/carlink/carplay/mfi/certificate.p7b
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/carlink-run
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+KillMode=control-group
+RuntimeDirectory=carlink carlink-carplay
+RuntimeDirectoryMode=0700
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=-/etc/default/carlink
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

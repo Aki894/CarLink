@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: MIT
+//! Bounded local live-media ingress. Never records media or parses private identities.
+use crate::carlife::{Channel, Message, VideoConfig};
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::{net::{UnixListener, UnixStream}, fs::{PermissionsExt, FileTypeExt}};
+
+const MAX_FRAME: usize = 1024 * 1024;
+const MAX_QUEUED: usize = 1024 * 1024;
+pub const CONFIG: VideoConfig = VideoConfig { width: 800, height: 480, fps: 30 };
+struct Frame { kind: u8, flags: u8, pts: u64, payload: Vec<u8> }
+fn decode(body: &[u8]) -> Result<Frame, String> {
+    if body.len() < 12 || body.len() > MAX_FRAME || body[2..4] != [0,0] { return Err("invalid live frame header".into()); }
+    let f = Frame { kind: body[0], flags: body[1], pts: u64::from_le_bytes(body[4..12].try_into().unwrap()), payload: body[12..].to_vec() };
+    let valid = match f.kind {
+        1 => f.flags == 0 && f.payload.len() == 12,
+        2 => f.flags <= 1 && !f.payload.is_empty() && f.payload.len() <= 512*1024 && (f.payload.starts_with(&[0,0,0,1]) || f.payload.starts_with(&[0,0,1])),
+        3 => f.flags <= 3 && !f.payload.is_empty() && f.payload.len() <= 64*1024 && f.payload.len()%4 == 0,
+        4 => f.flags <= 1 && f.payload.is_empty(),
+        5 => f.flags <= 1 && f.payload.len() == 1 && f.payload[0] <= 1,
+        _ => false,
+    };
+    if !valid { return Err("invalid live media kind, flags or payload".into()); }
+    Ok(f)
+}
+fn wire(json: &str) -> Vec<u8> {
+    let mut data = ((12+json.len()) as u32).to_le_bytes().to_vec();
+    data.extend_from_slice(&[129,0,0,0]); data.extend_from_slice(&0u64.to_le_bytes()); data.extend_from_slice(json.as_bytes()); data
+}
+
+pub struct LiveSource {
+    #[cfg(unix)] listener: UnixListener,
+    #[cfg(unix)] peer: Option<UnixStream>,
+    path: PathBuf,
+    input: Vec<u8>, output: VecDeque<Vec<u8>>, output_offset: usize,
+    queue: VecDeque<Frame>, queued: usize,
+    active: bool, configured: bool, playing: bool, waiting_key: bool,
+    audio_active: [bool; 2], audio_pending: VecDeque<Message>,
+    base_pts: Option<u64>, origin_ms: u32, last_ms: u32, generation: u64, warned_role: bool,
+}
+impl LiveSource {
+    pub fn bind(path: &Path) -> Result<Self,String> {
+        #[cfg(not(unix))] { let _=path; return Err("live socket requires Linux/Unix".into()); }
+        #[cfg(unix)] {
+            if path.exists() { return Err("live socket already exists; refuse replacing another process endpoint".into()); }
+            let listener=UnixListener::bind(path).map_err(|e|format!("live bind: {e}"))?;
+            std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600)).map_err(|e|e.to_string())?;
+            listener.set_nonblocking(true).map_err(|e|e.to_string())?;
+            Ok(Self {listener,peer:None,path:path.into(),input:Vec::new(),output:VecDeque::new(),output_offset:0,queue:VecDeque::new(),queued:0,
+                active:false,configured:false,playing:false,waiting_key:true,audio_active:[false;2],audio_pending:VecDeque::new(),base_pts:None,origin_ms:0,last_ms:0,generation:0,warned_role:false})
+        }
+    }
+    pub fn generation(&self)->u64 { self.generation }
+    pub fn feedback(&mut self,json:&str) {
+        // A slow consumer must not grow controls without bound. Dropping the
+        // connection resets touch state at the receiver on reconnect.
+        if self.output.len()>=32 { self.disconnect(); return; }
+        self.output.push_back(wire(json));
+    }
+    pub fn reset(&mut self) {
+        self.queue.clear(); self.queued=0; self.audio_pending.clear(); self.base_pts=None; self.origin_ms=self.last_ms; self.waiting_key=true; self.generation=self.generation.wrapping_add(1);
+        self.stop_audio(); self.feedback("{\"type\":\"keyframe\",\"screen\":0}");
+    }
+    fn stop_role(&mut self, role:u8) {
+        if self.audio_active[role as usize] {
+            self.audio_active[role as usize]=false;
+            self.audio_pending.push_back(packet(if role==0 {Channel::Media}else{Channel::Tts},
+                if role==0 {0x30002}else{0x40002},self.last_ms,Vec::new()));
+        }
+    }
+    fn stop_audio(&mut self) { self.stop_role(0); self.stop_role(1); }
+    pub fn set_playing(&mut self,value:bool) { if self.playing!=value { self.playing=value; self.reset(); } }
+    pub fn set_audio_allowed(&mut self,value:bool) { if !value {
+        self.queue.retain(|f|f.kind!=3);self.queued=self.queue.iter().map(|f|f.payload.len()).sum();
+        self.audio_pending.clear();self.stop_audio();
+    } }
+    fn disconnect(&mut self) {
+        #[cfg(unix)] { self.peer=None; }
+        self.active=false; self.configured=false; self.input.clear(); self.output.clear(); self.output_offset=0;
+        self.reset(); self.output.clear();
+    }
+    fn accept_frame(&mut self,f:Frame)->Result<(),String> {
+        match f.kind {
+            1 => { let v:Vec<u32>=f.payload.chunks_exact(4).map(|v|u32::from_le_bytes(v.try_into().unwrap())).collect();
+                if v != [CONFIG.width,CONFIG.height,CONFIG.fps] {return Err("live source must match advertised 800x480x30; restart with matching receiver mode".into());}
+                if !self.configured {self.reset();self.configured=true;}
+            },
+            4 => { let active=f.flags==1; if active!=self.active {self.active=active;self.reset();} },
+            5 => {
+                if f.payload[0]==0 {
+                    let role=f.flags;
+                    self.queue.retain(|q|q.kind!=3 || q.flags!=role);
+                    self.queued=self.queue.iter().map(|q|q.payload.len()).sum();
+                    self.audio_pending.retain(|m|m.channel!=if role==0{Channel::Media}else{Channel::Tts});
+                    self.stop_role(role);
+                }
+            },
+            _ => {
+                if !self.active || !self.configured || !self.playing {return Ok(());}
+                if f.kind==3 && f.flags>1 {if !self.warned_role {crate::runtime::log("live_audio_role_unsupported","VOICE/TELEPHONY require dedicated negotiation");self.warned_role=true;}return Ok(());}
+                if self.queued+f.payload.len()>MAX_QUEUED || self.queue.len()>=32 {self.reset();}
+                if f.kind==2 && self.waiting_key {if f.flags&1==0{return Ok(());}self.waiting_key=false;}
+                if f.kind==3 && self.waiting_key{return Ok(());}
+                self.queued+=f.payload.len();self.queue.push_back(f);
+            }
+        }
+        Ok(())
+    }
+    pub fn poll_io(&mut self)->Result<(),String> {
+        #[cfg(unix)] {
+            if self.peer.is_none() { match self.listener.accept() { Ok((peer,_))=>{peer.set_nonblocking(true).map_err(|e|e.to_string())?;self.peer=Some(peer);self.feedback("{\"type\":\"keyframe\",\"screen\":0}");}, Err(e) if e.kind()==io::ErrorKind::WouldBlock=>return Ok(()), Err(e)=>return Err(e.to_string()) } }
+            // Budget protects command handling from a continuously writing producer.
+            for _ in 0..16 {
+                let mut bytes=[0u8;16384];
+                match self.peer.as_mut().unwrap().read(&mut bytes) {
+                    Ok(0)=>{self.disconnect();return Ok(());},
+                    Ok(n)=>{self.input.extend_from_slice(&bytes[..n]);if self.input.len()>MAX_FRAME+4 {self.disconnect();return Err("live receive buffer exceeded".into());}},
+                    Err(e) if e.kind()==io::ErrorKind::WouldBlock=>break,
+                    Err(e) if e.kind()==io::ErrorKind::Interrupted=>continue,
+                    Err(_)=>{self.disconnect();return Ok(());}
+                }
+                while self.input.len()>=4 {
+                    let n=u32::from_le_bytes(self.input[..4].try_into().unwrap()) as usize;
+                    if !(12..=MAX_FRAME).contains(&n){self.disconnect();return Err("invalid live frame length".into());}
+                    if self.input.len()<n+4{break;}
+                    let frame=decode(&self.input[4..n+4])?;self.input.drain(..n+4);self.accept_frame(frame)?;
+                }
+            }
+            for _ in 0..16 {
+                let Some(data)=self.output.front() else{break;};
+                match self.peer.as_mut().unwrap().write(&data[self.output_offset..]) {
+                    Ok(0)=>{self.disconnect();break;}, Ok(n)=>{self.output_offset+=n;if self.output_offset==data.len(){self.output.pop_front();self.output_offset=0;}},
+                    Err(e) if e.kind()==io::ErrorKind::WouldBlock=>break,
+                    Err(e) if e.kind()==io::ErrorKind::Interrupted=>continue,
+                    Err(_)=>{self.disconnect();break;}
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn next(&mut self,audio_allowed:bool)->Option<Message> {
+        if let Some(message)=self.audio_pending.pop_front(){return Some(message);}
+        let f=self.queue.pop_front()?;self.queued-=f.payload.len();
+        let base=*self.base_pts.get_or_insert(f.pts);
+        let ms=(f.pts.saturating_sub(base)/1000).min(u32::MAX as u64) as u32;
+        self.last_ms=self.last_ms.max(self.origin_ms.saturating_add(ms));
+        if f.kind==2{return Some(packet(Channel::Video,0x20001,self.last_ms,f.payload));}
+        if !audio_allowed{return None;}
+        let channel=if f.flags==0{Channel::Media}else{Channel::Tts};
+        let data_id=if f.flags==0{0x30006}else{0x40003};
+        let data=packet(channel,data_id,self.last_ms,f.payload);
+        if !self.audio_active[f.flags as usize] {
+            self.audio_active[f.flags as usize]=true;
+            let init=packet(channel,if f.flags==0{0x30001}else{0x40001},self.last_ms,vec![8,0xc4,0xd8,2,16,2,24,16]);
+            self.audio_pending.push_back(init);self.audio_pending.push_back(data);return self.audio_pending.pop_front();
+        }
+        Some(data)
+    }
+}
+fn packet(channel:Channel,id:u32,ms:u32,payload:Vec<u8>)->Message{Message{channel,id,timestamp_ms:Some(ms),reserved:0,payload}}
+impl Drop for LiveSource { fn drop(&mut self){ #[cfg(unix)] if std::fs::symlink_metadata(&self.path).map(|m|m.file_type().is_socket()).unwrap_or(false){let _=std::fs::remove_file(&self.path);} } }
+
+/// Official CarLife single-point protobuf facts: action 0x68001 has
+/// action/x/y fields 1/2/3, separate down/up/move 0x68002..4 use x/y 1/2.
+pub fn touch(message:&Message,config:VideoConfig)->Result<Option<String>,String>{
+    if message.channel!=Channel::Touch || !(0x68001..=0x68004).contains(&message.id){return Ok(None);}
+    let mut values=[None;4];let mut pos=0;
+    while pos<message.payload.len(){
+        let tag=varint(&message.payload,&mut pos)?;if tag&7!=0{return Err("touch requires integer fields".into());}
+        let field=(tag>>3) as usize;let value=varint(&message.payload,&mut pos)?;
+        if field==0 || field>=values.len() || values[field].replace(value).is_some(){return Err("invalid touch field".into());}
+    }
+    let (down,x,y)=if message.id==0x68001{let action=values[1].ok_or("touch action missing")?;if action>2{return Ok(None);} (action!=1,values[2],values[3])}else{(message.id!=0x68003,values[1],values[2])};
+    let (x,y)=(x.ok_or("touch x missing")?,y.ok_or("touch y missing")?);
+    if x>=config.width as u64 || y>=config.height as u64{return Err("touch outside negotiated display".into());}
+    Ok(Some(format!("{{\"type\":\"touch\",\"contacts\":[{{\"id\":0,\"x\":{},\"y\":{},\"down\":{}}}]}}",x as f64/config.width as f64,y as f64/config.height as f64,down)))
+}
+fn varint(bytes:&[u8],pos:&mut usize)->Result<u64,String>{let mut out=0u64;for shift in (0..70).step_by(7){let b=*bytes.get(*pos).ok_or("truncated touch varint")?;*pos+=1;if shift==63 && b>1{return Err("touch varint overflow".into());}out|=((b&127)as u64)<<shift;if b&128==0{return Ok(out);}}Err("touch varint overflow".into())}
+#[cfg(test)]mod tests{
+ use super::*;
+ #[test]fn protocol_rejects_bad_frames(){assert!(decode(&[0;11]).is_err());let mut b=vec![3,0,0,0];b.extend(0u64.to_le_bytes());b.extend([1,2,3]);assert!(decode(&b).is_err());}
+ #[test]fn touch_normalizes_negotiated_dimensions(){let m=Message::command(0x68002,vec![8,0x90,3,16,0xf0,1]).unwrap();let s=touch(&m,CONFIG).unwrap().unwrap();assert!(s.contains("\"x\":0.5"));assert!(s.contains("\"y\":0.5"));assert!(s.contains("\"down\":true"));}
+ #[cfg(unix)]fn source()->LiveSource{let p=std::env::temp_dir().join(format!("carlink-live-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));let mut s=LiveSource::bind(&p).unwrap();s.active=true;s.configured=true;s.playing=true;s}
+ #[test]#[cfg(unix)]fn pause_overload_and_reconnect_wait_for_keyframe(){let mut s=source();let frame=|key|Frame{kind:2,flags:key,pts:1000,payload:vec![0,0,0,1,0x65]};s.accept_frame(frame(0)).unwrap();assert!(s.next(true).is_none());s.accept_frame(frame(1)).unwrap();assert!(s.next(true).is_some());s.set_playing(false);s.accept_frame(frame(1)).unwrap();assert!(s.queue.is_empty());s.set_playing(true);s.accept_frame(frame(0)).unwrap();assert!(s.queue.is_empty());s.queued=MAX_QUEUED;s.accept_frame(frame(0)).unwrap();assert!(s.waiting_key);s.disconnect();assert!(!s.configured);assert!(!s.active);}
+ #[test]#[cfg(unix)]fn monotonic_timestamp_and_audio_init(){let mut s=source();s.waiting_key=false;for pts in [100000,90000]{s.accept_frame(Frame{kind:3,flags:0,pts,payload:vec![0;4]}).unwrap();}assert_eq!(s.next(true).unwrap().id,0x30001);assert_eq!(s.next(true).unwrap().id,0x30006);assert_eq!(s.next(true).unwrap().timestamp_ms,Some(0));}
+}

@@ -88,6 +88,7 @@ jobs:
           bash scripts/refresh-image.sh --self-test
           bash scripts/test-image-validation.sh
           python3 scripts/test-runtime-install.py dist/app dist/carplay
+          python3 scripts/test-boot-profile.py
       - name: Download authenticated Debian armhf mode-switch runtime
         if: inputs.driver_run_id != ''
         run: |

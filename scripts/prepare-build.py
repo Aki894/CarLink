@@ -39,12 +39,14 @@ for line in (carplay / "SHA256SUMS").read_text().splitlines():
         raise SystemExit("Unsafe CarPlay checksum path")
     if hashlib.sha256((carplay / name).read_bytes()).hexdigest() != expected:
         raise SystemExit(f"CarPlay artifact checksum mismatch: {name}")
-for name in ["bin/openxplay-relay", "bin/oxp-relay", "probe.py", "run-carplay.sh",
+for name in ["bin/openxplay-relay", "bin/oxp-relay", "bin/carlink-audio", "probe.py", "forward.py", "supervisor.py", "run-carplay.sh", "run-carlink.sh",
              "share/admin/index.html", "share/web/receiver/index.html", "share/source/relay.tar.gz",
              "share/source/stream.tar.gz", "share/licenses/relay/LICENSE", "share/licenses/stream/LICENSE"]:
     if not (carplay / name).is_file() or not (carplay / name).stat().st_size:
         raise SystemExit(f"Missing CarPlay runtime payload: {name}")
 shutil.copytree(carplay, overlay / "carplay", dirs_exist_ok=True)
+shutil.copyfile(root / "scripts/install-boot-profile.py", builder / "userpatches/install-boot-profile.py")
+shutil.copytree(root / "firmware/boot-profile", builder / "userpatches/boot-profile", dirs_exist_ok=True)
 manifest = {
     "project_commit": subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip(),
     "sources": lock,

@@ -45,20 +45,22 @@ Error in creating formats for type 100 / telephony
 APCarPlayAudioFormatsCreate: ... kParamErr
 ```
 
-收窄通话 PCM 采样率后，iPhone 仍返回相同错误。随后开启 Opus 语音声明，音频格式初始化成功，iPhone 创建主音频、缓冲音频和提示音通道。触控启动播放后，板子收到 type 102 媒体流；初次采样为 307 个音频包、179,765 字节，格式为 AAC-LC、48 kHz、双声道。用户确认音频输出列表出现接收端并播放。
+收窄通话 PCM 采样率后，iPhone 仍返回相同错误。随后开启 Opus 语音声明，音频格式初始化成功，iPhone 创建主音频、缓冲音频和提示音通道。触控启动播放后，板子收到 type 102 媒体流；初次采样为 307 个音频包、179,765 字节，格式为 AAC-LC、48 kHz、双声道。用户确认音频输出列表出现接收端并播放。该轮累计收到 3,168 个音频包、1,760,274 字节；抽查日志中解密失败和序号缺口均为 0。
 
-探针模式默认开启 `CARLINK_CARPLAY_VOICE_OPUS=1` 和 `CARLINK_CARPLAY_BUFFERED_AUDIO=1`，可分别设为 `0` 进行对照。当前探针排空压缩音频；音频解码、外放和 CarLife 转发列入后续桥接工作。
+探针模式默认开启 `CARLINK_CARPLAY_VOICE_OPUS=1` 和 `CARLINK_CARPLAY_BUFFERED_AUDIO=1`，可分别设为 `0` 进行对照。最终启动脚本已部署，不传环境变量直接启动，再次自动重连并收到视频及 AAC 音频。当前探针排空压缩音频；音频解码、外放和 CarLife 转发列入后续桥接工作。
 
-## 完整镜像检查
+## 编译与完整镜像检查
 
-[完整增量镜像构建 39674743077](https://github.com/Aki894/CarLink/actions/runs/39674743077) 的 firmware job 成功，完成镜像内容校验、XZ 检查、校验文件生成和产物上传。
+[ARMv7 应用构建 39678214827](https://github.com/Aki894/CarLink/actions/runs/39678214827) 成功，原有应用、接收探针、上游协议测试、ARM 编译、QEMU 启动检查及产物上传均通过。
 
-该镜像包含 `b3e1c18cfcbcc4f5fa8925f7417022cf67c0b73b` 的应用和接收端，以及上述蓝牙驱动补丁。原始启动程序和内核采用已在板上运行的基线镜像，内核版本为 `6.18.57-current-sunxi`。
+[完整增量镜像构建 39678818571](https://github.com/Aki894/CarLink/actions/runs/39678818571) 的 firmware job 成功，完成镜像内容校验、XZ 检查、校验文件生成和产物上传。
+
+该镜像包含 `28f6493459a5c8079e92f3955ab99c87ce29032c` 的应用、接收端和默认音频配置，以及上述蓝牙驱动补丁。原始启动程序和内核采用已在板上运行的基线镜像，内核版本为 `6.18.57-current-sunxi`。
 
 压缩镜像 SHA256：
 
 ```text
-2b0948582b43afad49cac6feb2705ace23c3d0d0f39d6763786ddfe7dfce296d
+b948e56e0399af20b3093c40937f5960837afad38f009ee3b29bb743ea9936d2
 ```
 
 此镜像已下载并核对 SHA256。开发板采用单独部署的应用和驱动进行本轮测试；完整镜像尚未重新烧录。

@@ -20,3 +20,9 @@ function uboot_make_config__carlink_verify_boot_parameters() {
     cp .config "${SRC}/output/info/carlink-uboot.config"
     display_alert "Verified WuKongPi U-Boot" "DRAM 408 MHz; boot CPU 480 MHz" "info"
 }
+
+function post_customize_image__carlink_boot_profile() {
+    # Host-side root is mounted; no target executables and no boot trial here.
+    python3 "${SRC}/userpatches/install-boot-profile.py" --root "${SDCARD}" \
+        --profile "${SRC}/userpatches/boot-profile"
+}

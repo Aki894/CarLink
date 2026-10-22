@@ -6,8 +6,11 @@ install -m 0644 /tmp/overlay/carlink-build.json /etc/carlink-build.json
 mkdir -p /usr/local/lib/carlink/carplay
 cp -a /tmp/overlay/carplay/. /usr/local/lib/carlink/carplay/
 chmod 0755 /usr/local/lib/carlink/carplay/bin/openxplay-relay \
-    /usr/local/lib/carlink/carplay/bin/oxp-relay /usr/local/lib/carlink/carplay/probe.py
+    /usr/local/lib/carlink/carplay/bin/oxp-relay /usr/local/lib/carlink/carplay/bin/carlink-audio \
+    /usr/local/lib/carlink/carplay/probe.py /usr/local/lib/carlink/carplay/forward.py \
+    /usr/local/lib/carlink/carplay/supervisor.py
 install -m 0755 /tmp/overlay/carplay/run-carplay.sh /usr/local/bin/carlink-carplay
+install -m 0755 /tmp/overlay/carplay/run-carlink.sh /usr/local/bin/carlink-run
 mkdir -p /usr/local/lib/carlink/carplay/share/plugins
 install -d -m 0700 /var/lib/carlink/carplay /var/lib/carlink/carplay/mfi
 (cd /usr/local/lib/carlink/carplay && sha256sum -c SHA256SUMS)

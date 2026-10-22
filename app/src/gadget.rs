@@ -118,13 +118,13 @@ impl Mode {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn run(_duration: std::time::Duration, _media: Option<crate::media::TestMedia>) -> Result<(), String> {
+pub fn run(_duration: std::time::Duration, _media: Option<crate::media::TestMedia>, _live_path: Option<std::path::PathBuf>) -> Result<(), String> {
     Err("FunctionFS AOA gadget is supported only on Linux".into())
 }
 
 #[cfg(target_os = "linux")]
-pub fn run(duration: std::time::Duration, media: Option<crate::media::TestMedia>) -> Result<(), String> {
-    linux::run(duration, media)
+pub fn run(duration: std::time::Duration, media: Option<crate::media::TestMedia>, live_path: Option<std::path::PathBuf>) -> Result<(), String> {
+    linux::run(duration, media, live_path)
 }
 
 #[cfg(target_os = "linux")]
@@ -473,7 +473,7 @@ mod linux {
     }
 
     impl Workers {
-        fn start(rx: File, mut tx: File, deadline: Instant, media: Option<crate::media::TestMedia>) -> Result<Self, String> {
+        fn start(rx: File, mut tx: File, deadline: Instant, media: Option<crate::media::TestMedia>, live_path: Option<std::path::PathBuf>) -> Result<Self, String> {
             let stop = Arc::new(AtomicBool::new(false));
             let enabled = Arc::new(AtomicBool::new(true));
             let (incoming_tx, incoming_rx) = mpsc::sync_channel::<Vec<u8>>(16);
@@ -541,12 +541,15 @@ mod linux {
                 Err(e) => { own.stop.store(true, Ordering::Release); return Err(format!("start USB TX worker: {e}")); }
             }
             let stop = own.stop.clone();
+            let protocol_enabled = own.enabled.clone();
             let protocol = thread::Builder::new().name("carlink-usb-protocol".into()).spawn(move || {
                 // Construct here: Endpoint is never sent/shared across threads.
-                let mut endpoint = crate::runtime::Endpoint::with_media(media);
+                let mut endpoint = match crate::runtime::Endpoint::with_source(media, live_path) {Ok(endpoint)=>endpoint,Err(e)=>{let _=errors_tx.try_send(e);stop.store(true,Ordering::Release);return;}};
                 publish_epochs(&epochs, endpoint.epochs());
                 let result = (|| {
                     while live(&stop, deadline) {
+                        endpoint.transport_ready(protocol_enabled.load(Ordering::Acquire));
+                        publish_epochs(&epochs,endpoint.epochs());
                         match incoming_rx.recv_timeout(Duration::from_millis(10)) {
                             Ok(chunk) => {
                                 let responses = endpoint.receive(&chunk)?;
@@ -567,7 +570,7 @@ mod linux {
                             let channel = u32::from_be_bytes(header.try_into().unwrap());
                             let lane = match channel {
                                 2 => 0,
-                                3 => 1,
+                                3 | 4 | 5 => 1,
                                 _ => return Err("unexpected test-media channel".into()),
                             };
                             let current = endpoint.epochs();
@@ -641,7 +644,7 @@ mod linux {
         Ok(())
     }
 
-    fn serve(gadget: &mut Gadget, deadline: Instant, workers: &mut Option<Workers>, media: &mut Option<crate::media::TestMedia>) -> Result<(), String> {
+    fn serve(gadget: &mut Gadget, deadline: Instant, workers: &mut Option<Workers>, media: &mut Option<crate::media::TestMedia>, live_path: &mut Option<std::path::PathBuf>) -> Result<(), String> {
         let mut mode = Mode::Initial;
         let mut activated = false;
         let mut enabled = false;
@@ -675,7 +678,7 @@ mod linux {
                             eprintln!("usb_gadget: accessory bulk session enabled");
                             let rx = gadget.rx.take().ok_or("missing USB RX endpoint")?;
                             let tx = gadget.tx.take().ok_or("missing USB TX endpoint")?;
-                            *workers = Some(Workers::start(rx, tx, deadline, media.take())?);
+                            *workers = Some(Workers::start(rx, tx, deadline, media.take(), live_path.take())?);
                         }
                     }
                     4 => {
@@ -719,13 +722,13 @@ mod linux {
         Ok(())
     }
 
-    pub(super) fn run(duration: Duration, mut media: Option<crate::media::TestMedia>) -> Result<(), String> {
-        if duration.is_zero() { return Err("USB gadget duration must be positive".into()); }
+    pub(super) fn run(duration: Duration, mut media: Option<crate::media::TestMedia>, mut live_path: Option<std::path::PathBuf>) -> Result<(), String> {
+        let duration=if duration.is_zero(){Duration::from_secs(100*365*86400)}else{duration};
         let deadline = Instant::now().checked_add(duration).ok_or("USB duration overflow")?;
         let _signals = Signals::install()?;
         let mut gadget = Gadget::open(deadline)?;
         let mut workers = None;
-        let mut result = serve(&mut gadget, deadline, &mut workers, &mut media);
+        let mut result = serve(&mut gadget, deadline, &mut workers, &mut media, &mut live_path);
         if let Some(worker) = workers.as_ref() { worker.stop.store(true, Ordering::Release); }
         if let Err(error) = gadget.unbind() {
             gadget.allow_cleanup = false;

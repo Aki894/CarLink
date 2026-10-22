@@ -64,12 +64,16 @@ test -x "$mountdir/usr/local/bin/carlink"
 if [[ "$mode" == current ]]; then
 test -x "$mountdir/usr/local/bin/carlink-carplay"
 receiver="$mountdir/usr/local/lib/carlink/carplay"
-for name in openxplay-relay oxp-relay; do
+for name in openxplay-relay oxp-relay carlink-audio; do
     test -x "$receiver/bin/$name"
     readelf -h "$receiver/bin/$name" | grep -q 'Machine:.*ARM'
 done
 test -x "$receiver/probe.py"
-for payload in SOURCE.json SHA256SUMS share/source/relay.tar.gz share/source/stream.tar.gz \
+test -x "$receiver/forward.py"
+test -x "$receiver/supervisor.py"
+test -x "$mountdir/usr/local/bin/carlink-run"
+python3 "$(dirname "$0")/install-boot-profile.py" --root "$mountdir" --verify
+for payload in forward.py supervisor.py share/source/audio/SOURCE.json share/source/audio/ffmpeg.tar.gz share/licenses/audio/COPYING.LGPLv2.1 SOURCE.json SHA256SUMS share/source/relay.tar.gz share/source/stream.tar.gz \
     share/licenses/relay/LICENSE share/licenses/relay/LICENSE-GPL-3.0 share/licenses/relay/NOTICE \
     share/licenses/stream/LICENSE share/admin/index.html share/web/receiver/index.html; do
     test -s "$receiver/$payload"
@@ -82,6 +86,11 @@ receiver,build=[json.load(open(p)) for p in sys.argv[1:]]
 for key in ['rust','target','relay','stream']:
     assert receiver[key] == build['sources']['carplay'][key], f'CarPlay image lock mismatch: {key}'
 assert receiver['target']=='armv7-unknown-linux-gnueabihf'
+from pathlib import Path
+audio=json.load(open(Path(sys.argv[1]).parent/'share/source/audio/SOURCE.json'))
+for key,value in build['sources']['audio_transcoder'].items():
+    assert audio[key]==value, 'Audio source lock mismatch: '+key
+assert audio['project_commit']==receiver['project_commit']
 PY
 fi
 test -x "$mountdir/usr/sbin/sshd"

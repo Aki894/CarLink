@@ -9,8 +9,8 @@ channel=${CARLINK_CARPLAY_CHANNEL:-149}
 country=${CARLINK_CARPLAY_COUNTRY:-CN}
 mode=${1:-probe}
 case "$mode" in
-    probe|web) if [ "$#" -gt 0 ]; then shift; fi ;;
-    *) echo 'Usage: run-carplay.sh [probe|web] [receiver options...]' >&2; exit 2 ;;
+    probe|web|forward) if [ "$#" -gt 0 ]; then shift; fi ;;
+    *) echo 'Usage: run-carplay.sh [probe|web|forward] [receiver options...]' >&2; exit 2 ;;
 esac
 [ "$(id -u)" = 0 ] || { echo 'Run as root for Bluetooth and hotspot management.' >&2; exit 1; }
 for command in nmcli iw bluetoothctl python3; do
@@ -21,8 +21,8 @@ for file in identity.pk8 certificate.p7b; do
     test -s "$state/mfi/$file" || { echo "Missing local identity file: $state/mfi/$file" >&2; exit 1; }
 done
 install -d -m 700 "$state/state" /run/carlink-carplay
-if [ "$mode" = probe ]; then
-    output="$root/probe.py"
+if [ "$mode" = probe ] || [ "$mode" = forward ]; then
+    if [ "$mode" = forward ]; then output="$root/forward.py"; else output="$root/probe.py"; fi
     # iOS wireless audio initialization requires a compatible voice offer even
     # when only AAC media is playing. The probe accepts compressed OXP packets.
     export CARLINK_CARPLAY_VOICE_OPUS=${CARLINK_CARPLAY_VOICE_OPUS:-1}

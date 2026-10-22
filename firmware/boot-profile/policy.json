@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "masks": {
+    "NetworkManager-wait-online.service": "CarLink creates its own local hotspot and retries device readiness; no remote mounts or boot-time Internet dependency.",
+    "serial-getty@ttyGS0.service": "Legacy g_serial was disabled for AOA FunctionFS; ttyGS0 never appears, leaving a stale boot-time device wait. ttyS0 remains available for recovery.",
+    "ModemManager.service": "This appliance uses Ethernet and a Wi-Fi/Bluetooth adapter, not a cellular modem.",
+    "motd-news.service": "Remote login news is unnecessary for projection.",
+    "motd-news.timer": "Remote login news is unnecessary for projection.",
+    "man-db.timer": "Scheduled manual-page indexing is unnecessary; manual indexing remains available."
+  },
+  "preserved": ["NetworkManager.service", "bluetooth.service", "dbus.service", "systemd-udevd.service", "ssh.service", "systemd-journald.service", "systemd-fsck-root.service", "armbian-zram-config.service", "chrony.service"],
+  "links": {
+    "etc/systemd/system/multi-user.target.wants/carlink.service": "../carlink.service",
+    "etc/systemd/system/default.target": "/usr/lib/systemd/system/multi-user.target"
+  },
+  "remove": ["etc/systemd/system/getty.target.wants/serial-getty@ttyGS0.service"]
+}

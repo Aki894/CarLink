@@ -14,6 +14,9 @@ pub struct Endpoint {
     decoder: Decoder,
     session: Session,
     media: Option<TestMedia>,
+    live: Option<crate::live::LiveSource>,
+    transport_ready: bool,
+    live_generation: u64,
     clock: Instant,
     playing: bool,
     audio_on: bool,
@@ -31,9 +34,21 @@ impl Endpoint {
 
     pub fn with_media(media: Option<TestMedia>) -> Self {
         let session = media.as_ref().map_or_else(Session::new, |m| Session::with_video_source(m.config()));
-        Self { decoder: Decoder::new(Limits::default()), session, media, clock: Instant::now(),
+        Self { decoder: Decoder::new(Limits::default()), session, media, live: None, transport_ready: true, live_generation: 0, clock: Instant::now(),
             playing: false, audio_on: false, audio_allowed: true, hu_muted: false, epochs: [0; 2], last_video: Duration::ZERO,
             first_header: Vec::with_capacity(8) }
+    }
+
+    pub fn with_source(media: Option<TestMedia>, live_path: Option<std::path::PathBuf>) -> Result<Self,String> {
+        let mut endpoint=Self::with_media(media);
+        if let Some(path)=live_path { endpoint.live=Some(crate::live::LiveSource::bind(&path)?); endpoint.session=Session::with_video_source(crate::live::CONFIG); }
+        Ok(endpoint)
+    }
+    fn sync_live_epoch(&mut self) {
+        if let Some(live)=self.live.as_ref() {if live.generation()!=self.live_generation {self.live_generation=live.generation();self.epochs[0]+=1;self.epochs[1]+=1;}}
+    }
+    pub fn transport_ready(&mut self, ready:bool) {
+        if self.transport_ready!=ready {self.transport_ready=ready;if let Some(live)=self.live.as_mut(){live.set_playing(ready && self.playing);}self.sync_live_epoch();}
     }
 
     fn music_status(&self) -> Result<Vec<u8>, String> {
@@ -55,7 +70,7 @@ impl Endpoint {
     }
 
     fn start_audio(&mut self, packets: &mut Vec<Vec<u8>>) -> Result<(), String> {
-        if self.playing && self.audio_allowed && !self.hu_muted && !self.audio_on {
+        if self.media.is_some() && self.playing && self.audio_allowed && !self.hu_muted && !self.audio_on {
             self.epochs[1] += 1;
             self.audio_on = true;
             packets.push(self.music_status()?);
@@ -76,11 +91,15 @@ impl Endpoint {
             if message.id == ids::VIDEO_INIT {
                 log("hu_video_preference", &format!("{:?}", crate::carlife::video_hint(&message.payload).map_err(|e| e.to_string())?));
             }
+            if let Some(live)=self.live.as_mut() {
+                if let Some(config)=self.session.video_config() { if let Some(control)=crate::live::touch(&message,config)? {live.feedback(&control);} }
+            }
             let outcome = self.session.handle(&message).map_err(|e| e.to_string())?;
             for event in outcome.events {
                 log("carlife_state", &format!("{event:?}"));
                 match event {
                     Event::VideoNegotiated(config) => {
+                        if self.live.is_some() && self.session.video_state()!=VideoState::AwaitingVideoSource {self.playing=false;if let Some(live)=self.live.as_mut(){live.set_playing(false);}}
                         if let Some(media) = self.media.as_mut() {
                             media.set_fps(config.fps)?;
                             if self.session.video_state() != VideoState::AwaitingVideoSource {
@@ -92,6 +111,7 @@ impl Endpoint {
                         if !self.playing { self.stop_audio(&mut packets)?; }
                     },
                     Event::AwaitingVideoSource => {
+                        if let Some(live)=self.live.as_mut(){self.playing=true;live.set_playing(self.transport_ready);}
                         if let Some(media) = self.media.as_mut().filter(|_| !self.playing) {
                             self.epochs[0] += 1;
                             media.set_playing(true, self.clock.elapsed());
@@ -103,14 +123,17 @@ impl Endpoint {
                     Event::VideoPaused => {
                         self.epochs[0] += 1;
                         self.playing = false;
+                        if let Some(live)=self.live.as_mut(){live.set_playing(false);}
                         if let Some(media) = self.media.as_mut() { media.set_playing(false, self.clock.elapsed()); }
                         self.stop_audio(&mut packets)?;
                     },
                     Event::VideoReset { .. } if self.playing => {
+                        if let Some(live)=self.live.as_mut(){live.reset();}
                         self.epochs[0] += 1;
                         if let Some(media) = self.media.as_mut() { media.set_playing(true, self.clock.elapsed()); }
                     },
                     Event::FrameRateChanged { fps } => {
+                        if let Some(live)=self.live.as_mut(){live.reset();}
                         self.epochs[0] += 1;
                         if let Some(media) = self.media.as_mut() {
                             media.set_fps(fps)?;
@@ -119,11 +142,12 @@ impl Endpoint {
                     },
                     Event::AudioTransport { usb } => {
                         self.audio_allowed = usb;
+                        if let Some(live)=self.live.as_mut(){live.set_audio_allowed(usb);}
                         if !usb { self.stop_audio(&mut packets)?; }
                         else { self.start_audio(&mut packets)?; }
                     },
-                    Event::MusicControl { status } if self.media.is_some() => {
-                        if status == 0 { self.hu_muted = true; self.stop_audio(&mut packets)?; }
+                    Event::MusicControl { status } if self.media.is_some() || self.live.is_some() => {
+                        if status == 0 { self.hu_muted = true; self.stop_audio(&mut packets)?;if let Some(live)=self.live.as_mut(){live.set_audio_allowed(false);} }
                         packets.push(self.music_status()?);
                     },
                     _ => {},
@@ -136,6 +160,7 @@ impl Endpoint {
                 packets.push(packet);
             }
         }
+        self.sync_live_epoch();
         Ok(packets)
     }
 
@@ -145,6 +170,18 @@ impl Endpoint {
 
     pub fn poll_media(&mut self) -> Result<Option<Vec<u8>>, String> {
         let now = self.clock.elapsed();
+        if let Some(live)=self.live.as_mut(){
+            live.poll_io()?;
+            let message=live.next(self.audio_allowed && !self.hu_muted && self.transport_ready);
+            self.sync_live_epoch();
+            if let Some(message)=message {
+                let state=match message.id {0x30001=>Some(true),0x30002=>Some(false),_=>None};
+                let mut wire=message.encode().map_err(|e|e.to_string())?;
+                if let Some(on)=state {self.audio_on=on;wire.extend(self.music_status()?);}
+                return Ok(Some(wire));
+            }
+            return Ok(None);
+        }
         if let Some(media) = self.media.as_mut() {
             if let Some(message) = media.next(now)? {
                 if message.channel == crate::carlife::Channel::Video { self.last_video = now; }
@@ -163,6 +200,7 @@ impl Endpoint {
     pub fn epochs(&self) -> [u64; 2] { self.epochs }
 
     pub fn media_backpressure(&mut self, video: bool) {
+        if self.live.is_some() {if let Some(live)=self.live.as_mut(){live.reset();}self.sync_live_epoch();return;}
         if video && self.playing {
             self.epochs[0] += 1;
             if let Some(media) = self.media.as_mut() { media.set_playing(true, self.clock.elapsed()); }
@@ -170,7 +208,7 @@ impl Endpoint {
     }
 }
 
-pub fn tcp(address: SocketAddr, duration: Duration, media: Option<TestMedia>) -> Result<(), String> {
+pub fn tcp(address: SocketAddr, duration: Duration, media: Option<TestMedia>, live_path: Option<std::path::PathBuf>) -> Result<(), String> {
     if !address.ip().is_loopback() {
         return Err("TCP lab listener must use a loopback address; use SSH forwarding for board tests".into());
     }
@@ -178,7 +216,7 @@ pub fn tcp(address: SocketAddr, duration: Duration, media: Option<TestMedia>) ->
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let actual = listener.local_addr().map_err(|e| e.to_string())?;
     log("tcp_listening", &actual.to_string());
-    let deadline = Instant::now() + duration;
+    let deadline = Instant::now() + if duration.is_zero(){Duration::from_secs(100*365*86400)}else{duration};
     let mut stream = loop {
         if Instant::now() >= deadline { return Err("TCP lab deadline waiting for host".into()); }
         match listener.accept() {
@@ -191,7 +229,7 @@ pub fn tcp(address: SocketAddr, duration: Duration, media: Option<TestMedia>) ->
     stream.set_nodelay(true).map_err(|e| e.to_string())?;
     stream.set_read_timeout(Some(Duration::from_millis(2))).map_err(|e| e.to_string())?;
     stream.set_write_timeout(Some(Duration::from_secs(2))).map_err(|e| e.to_string())?;
-    let mut endpoint = Endpoint::with_media(media);
+    let mut endpoint = Endpoint::with_source(media,live_path)?;
     let mut bytes = [0_u8; 16384];
     log("tcp_connected", "one development session");
     loop {

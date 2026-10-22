@@ -67,7 +67,7 @@ def install(project, app, receiver, rootfs):
     receiver_files = checksums(receiver)
     if 'carlink' not in app_files:
         raise ValueError('Application binary missing from checksum manifest')
-    required = ['bin/openxplay-relay', 'bin/oxp-relay', 'probe.py', 'run-carplay.sh', 'SOURCE.json',
+    required = ['bin/openxplay-relay', 'bin/oxp-relay', 'probe.py', 'forward.py', 'supervisor.py', 'run-carplay.sh', 'run-carlink.sh', 'bin/carlink-audio', 'share/source/audio/SOURCE.json', 'share/source/audio/ffmpeg.tar.gz', 'share/licenses/audio/COPYING.LGPLv2.1', 'SOURCE.json',
                 'share/web/receiver/index.html', 'share/admin/index.html', 'share/source/relay.tar.gz',
                 'share/source/stream.tar.gz', 'share/licenses/relay/LICENSE',
                 'share/licenses/relay/LICENSE-GPL-3.0', 'share/licenses/relay/NOTICE',
@@ -75,7 +75,11 @@ def install(project, app, receiver, rootfs):
     for name in required:
         if name not in receiver_files or not (receiver / name).stat().st_size:
             raise ValueError('Missing receiver payload: ' + name)
-    for path in (app / 'carlink', receiver / 'bin/openxplay-relay', receiver / 'bin/oxp-relay'):
+    audio_source = json.loads((receiver / 'share/source/audio/SOURCE.json').read_text())
+    for key, value in lock['audio_transcoder'].items():
+        if audio_source[key] != value:
+            raise ValueError('Audio transcoder source lock mismatch: ' + key)
+    for path in (app / 'carlink', receiver / 'bin/openxplay-relay', receiver / 'bin/oxp-relay', receiver / 'bin/carlink-audio'):
         armhf(path)
     destination = (rootfs / 'usr/local/lib/carlink/carplay').resolve()
     if not destination.is_relative_to(rootfs):
@@ -84,11 +88,11 @@ def install(project, app, receiver, rootfs):
     if destination.exists():
         shutil.rmtree(destination)
     shutil.copytree(receiver, destination)
-    for name in ('bin/openxplay-relay', 'bin/oxp-relay', 'probe.py', 'run-carplay.sh'):
+    for name in ('bin/openxplay-relay', 'bin/oxp-relay', 'bin/carlink-audio', 'probe.py', 'forward.py', 'supervisor.py', 'run-carplay.sh', 'run-carlink.sh'):
         (destination / name).chmod(0o755)
     bindir = rootfs / 'usr/local/bin'
     bindir.mkdir(parents=True, exist_ok=True)
-    for src, name in ((app / 'carlink', 'carlink'), (receiver / 'run-carplay.sh', 'carlink-carplay')):
+    for src, name in ((app / 'carlink', 'carlink'), (receiver / 'run-carplay.sh', 'carlink-carplay'), (receiver / 'run-carlink.sh', 'carlink-run')):
         shutil.copyfile(src, bindir / name)
         (bindir / name).chmod(0o755)
     for name in ('var/lib/carlink/carplay', 'var/lib/carlink/carplay/mfi'):

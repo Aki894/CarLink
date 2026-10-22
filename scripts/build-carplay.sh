@@ -69,6 +69,13 @@ test -s "$out/share/admin/index.html"
 mkdir -p "$out/share/plugins"
 install -m 0755 "$root/scripts/run-carplay.sh" "$out/run-carplay.sh"
 install -m 0755 "$root/receiver/probe.py" "$out/probe.py"
+install -m 0755 "$root/receiver/forward.py" "$root/receiver/supervisor.py" "$out/"
+install -m 0755 "$root/scripts/run-carlink.sh" "$out/run-carlink.sh"
+bash "$root/scripts/build-audio.sh"
+cp -a "$root/dist/audio/bin/." "$out/bin/"
+cp -a "$root/dist/audio/share/." "$out/share/"
+cp "$root/dist/audio/SOURCE.json" "$out/share/source/audio/SOURCE.json"
+cp "$root/dist/audio/audio-validation.txt" "$root/dist/audio/audio.version.txt" "$root/dist/audio/audio.elf.txt" "$out/share/source/audio/"
 for name in LICENSE LICENSE-GPL-3.0 NOTICE; do cp "$relay/$name" "$out/share/licenses/relay/"; done
 cp -a "$relay/LICENSES" "$out/share/licenses/relay/"
 for name in LICENSE NOTICE THIRD-PARTY-LICENSES.md; do cp "$stream/$name" "$out/share/licenses/stream/"; done
