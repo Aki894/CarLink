@@ -303,6 +303,7 @@ class AudioDecoder:
 
     def _read(self):
         pending = bytearray()
+        playback_origin = None
         try:
             while not self.closed.is_set():
                 data = self.process.stdout.read(PCM_CHUNK)
@@ -312,6 +313,14 @@ class AudioDecoder:
                 while len(pending) >= PCM_CHUNK:
                     pcm = bytes(pending[:PCM_CHUNK])
                     del pending[:PCM_CHUNK]
+                    # Pipe buffering can deliver many decoded blocks together.
+                    # Pace PCM at its sample clock so the USB queue is not
+                    # flooded by a decoder burst every few hundred ms.
+                    now = time.monotonic()
+                    if playback_origin is None or now - (playback_origin + self.samples / 44100) > .3:
+                        playback_origin = now - self.samples / 44100
+                    if self.closed.wait(max(0, playback_origin + self.samples / 44100 - now)):
+                        return
                     self.emit(pcm, (self.origin or 0) + self.samples * 1000000 // 44100)
                     self.samples += PCM_CHUNK // 4
         except (OSError, ValueError):

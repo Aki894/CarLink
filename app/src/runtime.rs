@@ -214,7 +214,10 @@ impl Endpoint {
     pub fn epochs(&self) -> [u64; 2] { self.epochs }
 
     pub fn media_backpressure(&mut self, video: bool) {
-        if self.live.is_some() {if let Some(live)=self.live.as_mut(){live.reset();}self.sync_live_epoch();return;}
+        if let Some(live)=self.live.as_mut() {
+            if video {live.recover_video();self.sync_live_epoch();}
+            return;
+        }
         if video && self.playing {
             self.epochs[0] += 1;
             if let Some(media) = self.media.as_mut() { media.set_playing(true, self.clock.elapsed()); }

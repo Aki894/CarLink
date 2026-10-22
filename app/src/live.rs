@@ -65,6 +65,14 @@ impl LiveSource {
         self.queue.clear(); self.queued=0; self.audio_pending.clear(); self.base_pts=None; self.origin_ms=self.last_ms; self.waiting_key=true; self.generation=self.generation.wrapping_add(1);
         self.stop_audio(); self.feedback("{\"type\":\"keyframe\",\"screen\":0}");
     }
+    pub fn recover_video(&mut self) {
+        // A missed video AU invalidates dependent video only. Keep the audio
+        // player alive instead of repeatedly stopping/reinitializing its track.
+        self.queue.retain(|f|f.kind!=2);
+        self.queued=self.queue.iter().map(|f|f.payload.len()).sum();
+        self.waiting_key=true;self.generation=self.generation.wrapping_add(1);
+        self.feedback("{\"type\":\"keyframe\",\"screen\":0}");
+    }
     fn stop_role(&mut self, role:u8) {
         if self.audio_active[role as usize] {
             self.audio_active[role as usize]=false;
@@ -102,7 +110,11 @@ impl LiveSource {
             _ => {
                 if !self.active || !self.configured || !self.playing {return Ok(());}
                 if f.kind==3 && f.flags>1 {if !self.warned_role {crate::runtime::log("live_audio_role_unsupported","VOICE/TELEPHONY require dedicated negotiation");self.warned_role=true;}return Ok(());}
-                if self.queued+f.payload.len()>MAX_QUEUED || self.queue.len()>=32 {self.reset();}
+                if self.queued+f.payload.len()>MAX_QUEUED || self.queue.len()>=32 {
+                    if f.kind==3{return Ok(());}
+                    self.recover_video();
+                    if self.queued+f.payload.len()>MAX_QUEUED || self.queue.len()>=32{return Ok(());}
+                }
                 if f.kind==2 && self.waiting_key {if f.flags&1==0{return Ok(());}self.waiting_key=false;}
                 if f.kind==3 && self.waiting_key{return Ok(());}
                 self.queued+=f.payload.len();self.queue.push_back(f);
@@ -218,6 +230,14 @@ fn varint(bytes:&[u8],pos:&mut usize)->Result<u64,String>{let mut out=0u64;for s
   assert_eq!(s.next(true).unwrap().timestamp_ms,Some(0));
   assert_eq!(s.next(true).unwrap().timestamp_ms,Some(1000));
   assert_eq!(s.next(true).unwrap().timestamp_ms,Some(500));
+ }
+ #[test]#[cfg(unix)]fn video_recovery_and_audio_overflow_keep_audio_track_alive(){
+  let mut s=source();s.waiting_key=false;s.audio_active[0]=true;
+  s.recover_video();assert!(s.audio_active[0]);assert!(s.audio_pending.is_empty());
+  s.waiting_key=false;
+  for _ in 0..32{s.accept_frame(Frame{kind:3,flags:0,pts:1000,payload:vec![0;4]}).unwrap();}
+  s.accept_frame(Frame{kind:3,flags:0,pts:2000,payload:vec![0;4]}).unwrap();
+  assert!(s.audio_active[0]);assert!(s.audio_pending.is_empty());assert_eq!(s.queue.len(),32);
  }
 
 }
