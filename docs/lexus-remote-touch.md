@@ -26,3 +26,10 @@
 Rust 检查覆盖：负数位移、无按下时移动、步数上限、异常位移、双击和机械确认去重、特殊通道消息往返与相邻编号拒绝。Python 检查完整键脉冲和无效键值。合成端到端用例发送 Lexus 按下和负位移消息，验证其经过实际 Rust 会话及 Python 转发后成为 OXP 左键的按下/抬起。
 
 真实 iPhone 与安卓车机端的画面、声音、触屏已经通过。触控板消息先用合成对端验证；Lexus 实车后需要确认原始消息、方向、步进阈值和按压手感。
+
+2026-10-22 构建和部署记录：
+
+- 应用来源 `945ba844b16b7da57fb1e9079eaaf69b9ada68d7`；[应用 job 39729533171](https://github.com/Aki894/CarLink/actions/runs/39729533171) 成功，包括新增触控板合成闭环。
+- [完整 firmware job 39730049076](https://github.com/Aki894/CarLink/actions/runs/39730049076) 成功。日志确认 13 项启动配置核验、`mode=current` 全镜像内容与源码/校验和核验、压缩校验以及镜像上传全部完成。
+- 镜像 artifact ID `12404372896`，ZIP SHA256 `57da2977ced6b47398464dd1b0a5241c146f699beef8acae5b5f4acefe1165ac`。
+- 已远程安装到板子，原版本备份 `/var/backups/carlink/touch-20261022T054846Z`。启动后 iPhone 与安卓车机端恢复连接；音频回归成功创建并启动 AudioTrack，数分钟内服务 `NRestarts=0`。
