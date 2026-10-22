@@ -407,9 +407,9 @@ def run(args):
                     kind = message.get('type')
                     if kind == 'stats' and source_clock and message.get('clockOffsetUs') is not None:
                         value = message.get('clockOffsetUs')
-                        if type(value) is not int or not -(1 << 63) <= value < (1 << 63):
+                        if not isinstance(value, str) or not value.lstrip('-').isdigit() or not -(1 << 63) <= int(value) < (1 << 63):
                             raise ValueError('invalid producer clock mapping')
-                        capture_offset = value
+                        capture_offset = int(value)
                     elif kind == 'session':
                         next_active = message.get('session', {}).get('phase') == 'ACTIVE'
                         if next_active == active:

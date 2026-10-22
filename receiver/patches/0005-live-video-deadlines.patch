@@ -12,7 +12,7 @@
 +    time.tv_sec as i64 * 1_000_000 + time.tv_nsec as i64 / 1000
 +}
 +pub(crate) fn carlink_clock_message(offset:i64)->oxp_wire::Message {
-+    oxp_wire::Message::Json(serde_json::json!({"type":"stats","screen":0,"decodeMs":null,"decodeQueue":0,"dropped":0,"rendered":0,"decodedLatencyMs":null,"renderedLatencyMs":null,"clockOffsetUs":offset,"rttUs":null}))
++    oxp_wire::Message::Json(serde_json::json!({"type":"stats","screen":0,"decodeMs":null,"decodeQueue":0,"dropped":0,"rendered":0,"decodedLatencyMs":null,"renderedLatencyMs":null,"clockOffsetUs":offset.to_string(),"rttUs":null}))
 +}
 +fn carlink_capture_us(sender_ns:u64, local_us:i64, anchor:&mut Option<(i64,i64)>) -> i64 {
 +    if sender_ns==0 { return local_us; }
