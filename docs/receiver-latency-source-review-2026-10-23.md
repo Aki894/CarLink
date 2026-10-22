@@ -103,3 +103,13 @@ OpenXPlay 固定版本默认 display fps 为 60；CarLink CarLife 输出固定�
 | 6 | 正确处理 AU、IDR、时钟切换后，比较更短但有上限的视频缓存 | 以点击到屏幕的 P50/P95/P99 和断音次数验收，保留画质与恢复时间比较 |
 
 20 fps、1.5–2 Mbps 等数值只能作为后续实验档位；当前没有验证可直接控制 iPhone 码率的接收端接口。优先测量和部署已经准备好的源头 30 fps 改动。
+
+## 第一阶段部署记录（2026-10-23 00:18）
+
+- 接收端产物 `carplay-armv7`（artifact `12436739878`，源码 `2785fb3`）已部署；本地与板端均完成清单中 60 个文件的 SHA-256 校验。
+- 复用已完成的[应用构建 39805684763](https://github.com/Aki894/CarLink/actions/runs/39805684763)与[完整固件构建 39807108167](https://github.com/Aki894/CarLink/actions/runs/39807108167)。后者已完成镜像校验和产物上传。
+- 仅替换接收端运行目录；CarLife 应用保持 `2785fb3`，SHA-256 `efdceea8f6f18ed2571b05e1527dda59a1524526be71cdc0b9cb8c27140a9289`。板端部署收据 `/etc/carlink-receiver-deploy.json`，回退目录 `/var/backups/carlink/receiver-20261022T161805Z`。
+- iPhone 自动重连，华为端重新完成协议连接。00:19:39–00:19:55 的五秒统计窗口中，实际视频输入为 9.51–26.14 fps、1.064–5.886 Mbps；Python 队列峰值 20.39–21.65 ms，发送峰值 1.31–4.10 ms。持续音频转发与视频页面更新均有记录，播放与暂停的屏幕延迟对照待用户反馈。
+- 应用重开及连接恢复期间出现两次 USB accessory disable 后服务自动恢复；00:19:33 之后至 00:20:02 的采样段没有新增重启。原始日志保存在本地忽略目录 `.build/carlink-30fps-test.log`。
+
+此阶段为桌面手机端验证；Lexus 实车连接与 Remote Touch 操作另行回归。
