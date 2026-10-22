@@ -94,6 +94,8 @@ class LiveLink:
         self.last_recovery = 0.
         self.queue_ms_max = self.send_ms_max = self.source_ms_max = 0.
         self.source_dropped = 0
+        self.video_frames = self.video_bytes = 0
+        self.report_at = time.monotonic()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -149,11 +151,16 @@ class LiveLink:
 
     def report(self):
         with self.lock:
+            elapsed = max(.001, time.monotonic() - self.report_at)
             value = dict(event='forward_latency', sent=self.sent, dropped=self.dropped,
                 reconnects=self.reconnects, pending=len(self.pending), pending_bytes=self.size,
                 queue_ms_max=round(self.queue_ms_max, 2), send_ms_max=round(self.send_ms_max, 2),
-                source_video_ms_max=round(self.source_ms_max, 2), source_video_dropped=self.source_dropped)
+                source_video_ms_max=round(self.source_ms_max, 2), source_video_dropped=self.source_dropped,
+                source_video_fps=round(self.video_frames / elapsed, 2),
+                source_video_mbps=round(self.video_bytes * 8 / elapsed / 1000000, 3))
             self.queue_ms_max = self.send_ms_max = self.source_ms_max = 0.
+            self.video_frames = self.video_bytes = 0
+            self.report_at = time.monotonic()
         print(json.dumps(value), flush=True)
 
     def media(self, kind, payload, pts, flags=0):
@@ -454,6 +461,8 @@ def run(args):
                     if not active:
                         continue
                     if kind == 1 and ident == 0 and parameters:
+                        link.video_frames += 1
+                        link.video_bytes += len(payload)
                         if last_video_seq is not None and seq != (last_video_seq + 1) & 0xffffffff and not flags & 1:
                             link.recover_video()
                         last_video_seq = seq

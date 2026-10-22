@@ -1,0 +1,30 @@
+--- a/rust/direlay-linux/src/linux_wireless_platform.rs
++++ b/rust/direlay-linux/src/linux_wireless_platform.rs
+@@ -384,6 +384,17 @@
+     }
+ }
+ /// The AirPlay receiver the Linux relay declares to the iPhone, for a session of (fps, HEVC).
++fn carlink_frame_rate(requested:u32, low_latency:bool)->u32 {
++    if low_latency { requested.min(30) } else { requested }
++}
++#[cfg(test)]
++#[test]
++fn carlink_headless_caps_initial_video_offer_at_30fps() {
++    assert_eq!(carlink_frame_rate(60,true),30);
++    assert_eq!(carlink_frame_rate(30,true),30);
++    assert_eq!(carlink_frame_rate(60,false),60);
++}
++
+ fn air_play_config(
+     device_id: String,
+     bt_mac: String,
+@@ -396,7 +407,8 @@
+     config.microphone_opus = false;
+     // The Linux relay cannot decode Opus and its receivers play only PCM and AAC.
+     config.output_opus = false;
+-    config.main.fps = session.0;
++    config.main.fps = carlink_frame_rate(session.0,
++        std::env::var("CARLINK_LOW_LATENCY").as_deref()==Ok("1"));
+     config.hevc = session.1;
+     config.device_name = crate::branding::DEVICE_NAME.into();
+     config.model = crate::branding::MODEL.into();
