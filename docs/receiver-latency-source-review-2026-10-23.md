@@ -109,7 +109,9 @@ OpenXPlay 固定版本默认 display fps 为 60；CarLink CarLife 输出固定�
 - 接收端产物 `carplay-armv7`（artifact `12436739878`，源码 `2785fb3`）已部署；本地与板端均完成清单中 60 个文件的 SHA-256 校验。
 - 复用已完成的[应用构建 39805684763](https://github.com/Aki894/CarLink/actions/runs/39805684763)与[完整固件构建 39807108167](https://github.com/Aki894/CarLink/actions/runs/39807108167)。后者已完成镜像校验和产物上传。
 - 仅替换接收端运行目录；CarLife 应用保持 `2785fb3`，SHA-256 `efdceea8f6f18ed2571b05e1527dda59a1524526be71cdc0b9cb8c27140a9289`。板端部署收据 `/etc/carlink-receiver-deploy.json`，回退目录 `/var/backups/carlink/receiver-20261022T161805Z`。
-- iPhone 自动重连，华为端重新完成协议连接。00:19:39–00:19:55 的五秒统计窗口中，实际视频输入为 9.51–26.14 fps、1.064–5.886 Mbps；Python 队列峰值 20.39–21.65 ms，发送峰值 1.31–4.10 ms。持续音频转发与视频页面更新均有记录，播放与暂停的屏幕延迟对照待用户反馈。
+- iPhone 自动重连，华为端重新完成协议连接。00:19:39–00:19:55 的五秒统计窗口中，实际视频输入为 9.51–26.14 fps、1.064–5.886 Mbps；Python 队列峰值 20.39–21.65 ms，发送峰值 1.31–4.10 ms。
+- 用户反馈：播放与暂停音乐时滑动、点击均流畅，声音连续；打开应用、返回主界面仍短暂停顿且缺少过渡动画。保留当前 30 fps 配置，下一项比较 CarPlay 重连前后的应用切换行为及源头视频帧。
+- 采样中 `source_video_dropped` 曾累计到 15，并出现关键帧恢复记录（其中一次请求后约 114 ms 收到 IDR）；需对齐应用切换时刻，再区分会话行为与视频恢复。上游 `view_area_command` 的 300 ms 参数用于视区切换，尚未找到控制普通应用进出动画的配置，暂不修改该参数。
 - 应用重开及连接恢复期间出现两次 USB accessory disable 后服务自动恢复；00:19:33 之后至 00:20:02 的采样段没有新增重启。原始日志保存在本地忽略目录 `.build/carlink-30fps-test.log`。
 
 此阶段为桌面手机端验证；Lexus 实车连接与 Remote Touch 操作另行回归。
