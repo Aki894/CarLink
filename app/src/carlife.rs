@@ -305,7 +305,6 @@ pub struct Session {
     auth_accepted: bool,
     feature_requested: bool,
     statistic_seen: bool,
-    hu_info_seen: bool,
     peer_accepted: bool,
     auth_proceeded: bool,
 }
@@ -314,7 +313,7 @@ impl Default for Session { fn default() -> Self { Self::new() } }
 impl Session {
     pub fn new() -> Self { Self { version: None, video: None, state: VideoState::Uninitialized, generation: 0, failed: false, source: None,
         auth_identity: None, auth_sent: false, auth_accepted: false, feature_requested: false,
-        statistic_seen: false, hu_info_seen: false, peer_accepted: false, auth_proceeded: false } }
+        statistic_seen: false, peer_accepted: false, auth_proceeded: false } }
     pub fn with_video_source(config: VideoConfig) -> Self { Self { source: Some(config), ..Self::new() } }
     pub fn video_state(&self) -> VideoState { self.state }
     pub fn video_config(&self) -> Option<VideoConfig> { self.video }
@@ -373,7 +372,6 @@ impl Session {
         match message.id {
             HU_INFO => {
                 fields(&message.payload)?;
-                self.hu_info_seen = true;
                 // MD_INFO was sent at VERSION. Echoing it here causes the HU
                 // to send HU_INFO/challenge again, restarting its handshake.
                 if !self.feature_requested {
@@ -510,7 +508,10 @@ impl Session {
         // The MD chooses to accept this locally connected HU without issuing
         // a reverse challenge. This peer notice is distinct from the computed
         // HU_AUTH_REQUEST response and from HU_AUTH_RESULT acceptance.
-        if self.auth_sent && self.hu_info_seen && self.statistic_seen && !self.peer_accepted {
+        // STATISTIC_INFO is the trigger used by the MD protocol. Older HUs
+        // need this notice before advancing and may never issue a challenge.
+        // Do not make accepting the HU depend on the HU authenticating the MD.
+        if self.statistic_seen && !self.peer_accepted {
             out.outgoing.push(cmd(MD_PEER_ACCEPT, integers(&[(1,1)]))?);
             self.peer_accepted = true;
             out.events.push(Event::UsbPeerAccepted);
@@ -727,7 +728,10 @@ mod tests {
         s.handle(&init()).unwrap(); s.handle(&cmd(ids::VIDEO_START,vec![]).unwrap()).unwrap();
         let repeat=s.handle(&version()).unwrap(); assert!(repeat.outgoing.is_empty());
         assert_eq!(s.video_state(),VideoState::AwaitingVideoSource);
-        let stats=s.handle(&cmd(ids::STATISTIC_INFO,vec![]).unwrap()).unwrap(); assert!(stats.outgoing.is_empty());
+        let stats=s.handle(&cmd(ids::STATISTIC_INFO,vec![]).unwrap()).unwrap();
+        assert_eq!(stats.outgoing.iter().map(|m|m.id).collect::<Vec<_>>(),vec![ids::MD_PEER_ACCEPT]);
+        assert_eq!(s.video_state(),VideoState::AwaitingVideoSource);
+        assert!(!s.auth_accepted);
     }
     #[test]
     fn md_info_uses_own_named_android_wire_compatibility_profile() {
@@ -812,19 +816,39 @@ mod tests {
         assert!(s.handle(&info).unwrap().outgoing.is_empty());
     }
     #[test]
-    fn peer_notice_is_once_after_metadata_and_calculated_auth_response() {
+    fn peer_notice_follows_statistics_without_waiting_for_a_challenge() {
         let mut s=Session::new(); s.handle(&version()).unwrap();
+        let stats=cmd(ids::STATISTIC_INFO,Vec::new()).unwrap();
+        let accepted=s.handle(&stats).unwrap();
+        assert_eq!(accepted.outgoing.iter().map(|m|m.id).collect::<Vec<_>>(),vec![ids::MD_PEER_ACCEPT]);
+        assert!(!s.auth_sent); assert!(!s.auth_accepted);
+        assert!(s.handle(&stats).unwrap().outgoing.is_empty());
         s.handle(&cmd(ids::HU_INFO,Vec::new()).unwrap()).unwrap();
-        assert!(s.handle(&cmd(ids::STATISTIC_INFO,Vec::new()).unwrap()).unwrap().outgoing.is_empty());
         let mut body=Vec::new(); put_bytes(&mut body,1,b"2.0;lab-nonce");
         let request=cmd(ids::HU_AUTH_REQUEST,body).unwrap();
-        assert_eq!(s.handle(&request).unwrap().outgoing.iter().map(|m|m.id).collect::<Vec<_>>(),vec![ids::MD_AUTH_RESPONSE,ids::MD_PEER_ACCEPT]);
+        assert_eq!(s.handle(&request).unwrap().outgoing.iter().map(|m|m.id).collect::<Vec<_>>(),vec![ids::MD_AUTH_RESPONSE]);
         assert!(!s.auth_accepted);
         assert_eq!(s.handle(&request).unwrap().outgoing.len(),1);
         let next=s.handle(&init()).unwrap();
         assert!(next.events.contains(&Event::HuProceededToVideo));
         assert!(!s.auth_accepted); // The HU chose video without an explicit result.
         s.handle(&cmd(ids::VIDEO_START,Vec::new()).unwrap()).unwrap();
+    }
+    #[test]
+    fn legacy_hu_can_advance_without_challenge_but_rejection_still_closes() {
+        let mut legacy=Session::new();
+        legacy.handle(&cmd(ids::HU_PROTOCOL_VERSION,integers(&[(1,1),(2,0)])).unwrap()).unwrap();
+        let accepted=legacy.handle(&cmd(ids::STATISTIC_INFO,Vec::new()).unwrap()).unwrap();
+        assert_eq!(accepted.outgoing[0].id,ids::MD_PEER_ACCEPT);
+        legacy.handle(&init()).unwrap();
+        legacy.handle(&cmd(ids::VIDEO_START,Vec::new()).unwrap()).unwrap();
+        assert_eq!(legacy.video_state(),VideoState::AwaitingVideoSource);
+        let mut modern=Session::new();modern.handle(&version()).unwrap();
+        modern.handle(&cmd(ids::STATISTIC_INFO,Vec::new()).unwrap()).unwrap();
+        let mut body=Vec::new();put_bytes(&mut body,1,b"2.0;lab-nonce");
+        modern.handle(&cmd(ids::HU_AUTH_REQUEST,body).unwrap()).unwrap();
+        assert!(modern.handle(&cmd(ids::HU_AUTH_RESULT,integers(&[(1,0)])).unwrap()).is_err());
+        assert!(modern.is_failed());
     }
     #[test]
     fn protobuf_bad_wire_overflow_missing_duplicate_fields() {
