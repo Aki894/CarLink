@@ -128,6 +128,15 @@ class LiveLink:
             self.size = sum(len(w) for _, w, _ in kept)
             self._put(5, bytes([int(active)]), flags=role)
 
+    def recover_video(self):
+        with self.lock:
+            self._clear()
+            self._put(4, flags=0)
+            self._put(4, flags=int(self.active))
+            if self.config:
+                self._put(1, self.config)
+        self.feedback({'type': 'keyframe', 'screen': 0})
+
     def media(self, kind, payload, pts, flags=0):
         request = False
         with self.lock:
@@ -141,6 +150,7 @@ class LiveLink:
                 self.dropped += 1
                 if kind == 2:
                     self._clear()
+                    self._put(4, flags=0)
                     self._put(4, flags=int(self.active))
                     self._put(1, self.config)
                     request = True
@@ -178,6 +188,7 @@ class LiveLink:
                             if kind in (2, 3) and time.monotonic() - queued > .3:
                                 with self.lock:
                                     self._clear()
+                                    self._put(4, flags=0)
                                     self._put(4, flags=int(self.active))
                                     if self.config:
                                         self._put(1, self.config)
@@ -210,6 +221,7 @@ class LiveLink:
                 with self.lock:
                     self.connected = False
                     self._clear()
+                self.feedback({'type': 'touch', 'contacts': []})
             self.closed.wait(.25)
 
     def close(self):
@@ -325,7 +337,7 @@ class AudioDecoder:
 def run(args):
     server = probe.listener(args.unix)
     link = None
-    decoders, formats = {}, {}
+    decoders, formats, retry_due = {}, {}, {}
     generation = [0]
     try:
         stream, _ = server.accept()
@@ -369,6 +381,7 @@ def run(args):
                             decoder.close()
                         decoders.clear()
                         formats.clear()
+                        retry_due.clear()
                         link.session(active)
                         if active:
                             feedback({'type': 'keyframe', 'screen': 0})
@@ -405,7 +418,7 @@ def run(args):
                         if flags & 1:
                             data = parameters + data
                         if len(data) > MAX_VIDEO:
-                            feedback({'type': 'keyframe', 'screen': 0})
+                            link.recover_video()
                             continue
                         link.media(2, data, pts, flags & 1)
                     elif kind == 2 and ident in formats:
@@ -418,7 +431,10 @@ def run(args):
                             decoder.close()
                             del decoders[ident]
                             decoder = None
+                            retry_due[ident] = time.monotonic() + .5
                         if decoder is None:
+                            if time.monotonic() < retry_due.get(ident, 0):
+                                continue
                             epoch = generation[0]
 
                             def emit(pcm, timestamp, r=role, e=epoch):
