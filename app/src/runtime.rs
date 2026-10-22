@@ -92,7 +92,13 @@ impl Endpoint {
                 log("hu_video_preference", &format!("{:?}", crate::carlife::video_hint(&message.payload).map_err(|e| e.to_string())?));
             }
             if let Some(live)=self.live.as_mut() {
-                if let Some(config)=self.session.video_config() { if let Some(control)=crate::live::touch(&message,config)? {live.feedback(&control);} }
+                if let Some(config)=self.session.video_config() {
+                    match crate::live::touch(&message,config) {
+                        Ok(Some(control))=>live.feedback(&control),
+                        Ok(None)=>{},
+                        Err(error)=>log("touch_ignored",&error),
+                    }
+                }
             }
             let outcome = self.session.handle(&message).map_err(|e| e.to_string())?;
             for event in outcome.events {
@@ -264,6 +270,23 @@ pub fn tcp(address: SocketAddr, duration: Duration, media: Option<TestMedia>, li
         for _ in 0..4 {
             let Some(packet) = endpoint.poll_media()? else { break; };
             stream.write_all(&packet).map_err(|e| format!("write media: {e}"))?;
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    #[test]
+    fn invalid_touch_does_not_terminate_live_session() {
+        let path=std::env::temp_dir().join(format!("carlink-touch-{}",std::process::id()));
+        let mut endpoint=Endpoint::with_source(None,Some(path)).unwrap();
+        let init=Message::command(ids::VIDEO_INIT,vec![8,0xa0,6,16,0xe0,3,24,30]).unwrap().encode().unwrap();
+        endpoint.receive(&init).unwrap();
+        for payload in [vec![8,0,16,1,24,1,42,5,1],vec![8,0,16,0xff,0x7f,24,1]] {
+            let touch=Message::command(0x68001,payload).unwrap().encode().unwrap();
+            endpoint.receive(&touch).expect("bad contact must not disconnect USB");
+            endpoint.receive(&init).expect("session must still process commands");
         }
     }
 }

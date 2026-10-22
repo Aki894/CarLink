@@ -172,9 +172,24 @@ pub fn touch(message:&Message,config:VideoConfig)->Result<Option<String>,String>
     if message.channel!=Channel::Touch || !(0x68001..=0x68004).contains(&message.id){return Ok(None);}
     let mut values=[None;4];let mut pos=0;
     while pos<message.payload.len(){
-        let tag=varint(&message.payload,&mut pos)?;if tag&7!=0{return Err("touch requires integer fields".into());}
-        let field=(tag>>3) as usize;let value=varint(&message.payload,&mut pos)?;
-        if field==0 || field>=values.len() || values[field].replace(value).is_some(){return Err("invalid touch field".into());}
+        let tag=varint(&message.payload,&mut pos)?;
+        let field=tag>>3;
+        if field==0 || field>0x1fffffff{return Err("invalid touch field".into());}
+        if field<values.len() as u64 {
+            if tag&7!=0{return Err("touch requires integer fields".into());}
+            // Protobuf singular fields use the last value. Newer head units
+            // append metadata fields that do not affect the contact position.
+            values[field as usize]=Some(varint(&message.payload,&mut pos)?);
+        }else{
+            let size=match tag&7 {
+                0=>{varint(&message.payload,&mut pos)?;0},
+                1=>8,
+                2=>usize::try_from(varint(&message.payload,&mut pos)?).map_err(|_|"touch extension too large")?,
+                5=>4,
+                _=>return Err("unsupported touch extension wire type".into()),
+            };
+            pos=pos.checked_add(size).filter(|end|*end<=message.payload.len()).ok_or("truncated touch extension")?;
+        }
     }
     let (down,x,y)=if message.id==0x68001{let action=values[1].ok_or("touch action missing")?;if action>2{return Ok(None);} (action!=1,values[2],values[3])}else{(message.id!=0x68003,values[1],values[2])};
     let (x,y)=(x.ok_or("touch x missing")?,y.ok_or("touch y missing")?);
@@ -186,6 +201,13 @@ fn varint(bytes:&[u8],pos:&mut usize)->Result<u64,String>{let mut out=0u64;for s
  use super::*;
  #[test]fn protocol_rejects_bad_frames(){assert!(decode(&[0;11]).is_err());let mut b=vec![3,0,0,0];b.extend(0u64.to_le_bytes());b.extend([1,2,3]);assert!(decode(&b).is_err());}
  #[test]fn touch_normalizes_negotiated_dimensions(){let m=Message::command(0x68002,vec![8,0x90,3,16,0xf0,1]).unwrap();let s=touch(&m,CONFIG).unwrap().unwrap();assert!(s.contains("\"x\":0.5"));assert!(s.contains("\"y\":0.5"));assert!(s.contains("\"down\":true"));}
+ #[test]fn touch_accepts_protobuf_extensions_and_last_singular_value(){
+  let m=Message::command(0x68001,vec![8,0,16,1,16,0x90,3,24,0xf0,1,32,123,42,2,9,8,53,0,0,0,0,57,0,0,0,0,0,0,0,0]).unwrap();
+  let s=touch(&m,CONFIG).unwrap().unwrap();assert!(s.contains("\"x\":0.5"));assert!(s.contains("\"y\":0.5"));
+  for payload in [vec![8,0,16,1,24,1,42,3,1],vec![8,0,16,1,24,1,32,128],vec![8,0,16,1,24,1,0]]{
+   assert!(touch(&Message::command(0x68001,payload).unwrap(),CONFIG).is_err());
+  }
+ }
  #[cfg(unix)]fn source()->LiveSource{let p=std::env::temp_dir().join(format!("carlink-live-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));let mut s=LiveSource::bind(&p).unwrap();s.active=true;s.configured=true;s.playing=true;s}
  #[test]#[cfg(unix)]fn pause_overload_and_reconnect_wait_for_keyframe(){let mut s=source();let frame=|key|Frame{kind:2,flags:key,pts:1000,payload:vec![0,0,0,1,0x65]};s.accept_frame(frame(0)).unwrap();assert!(s.next(true).is_none());s.accept_frame(frame(1)).unwrap();assert!(s.next(true).is_some());s.set_playing(false);s.accept_frame(frame(1)).unwrap();assert!(s.queue.is_empty());s.set_playing(true);s.accept_frame(frame(0)).unwrap();assert!(s.queue.is_empty());s.queued=MAX_QUEUED;s.accept_frame(frame(0)).unwrap();assert!(s.waiting_key);s.disconnect();assert!(!s.configured);assert!(!s.active);}
  #[test]#[cfg(unix)]fn monotonic_timestamp_and_audio_init(){let mut s=source();s.waiting_key=false;for pts in [100000,90000]{s.accept_frame(Frame{kind:3,flags:0,pts,payload:vec![0;4]}).unwrap();}assert_eq!(s.next(true).unwrap().id,0x30001);assert_eq!(s.next(true).unwrap().id,0x30006);assert_eq!(s.next(true).unwrap().timestamp_ms,Some(0));}
