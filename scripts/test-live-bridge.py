@@ -2,6 +2,7 @@
 import base64
 import importlib.util
 import json
+import os
 from pathlib import Path
 import socket
 import struct
@@ -69,7 +70,8 @@ with tempfile.TemporaryDirectory(prefix='carlink-live-ci-') as directory:
             hu.sendall(lab.command(0x18009))
             wait_path(live)
             children.append(subprocess.Popen([sys.executable, str(root / 'receiver/forward.py'), '--unix', str(oxp),
-                '--live-socket', str(live), '--audio-binary', str(wrapper)], stdout=subprocess.DEVNULL))
+                '--live-socket', str(live), '--audio-binary', str(wrapper)], stdout=subprocess.DEVNULL,
+                env=dict(os.environ, CARLINK_LOW_LATENCY='1')))
             wait_path(oxp)
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as source:
                 source.settimeout(5)
@@ -86,13 +88,18 @@ with tempfile.TemporaryDirectory(prefix='carlink-live-ci-') as directory:
                 pcm = struct.pack('<hh', 1200, -1200) * 960
                 access_unit = b'\x65\x80'
                 expected_video = probe.avc_parameters(avcc) + b'\0\0\0\1' + access_unit
+                # A two-second-old IDR must never reach the head unit, even if
+                # newly delivered by an upstream/kernel queue.
+                old = struct.pack('>I', 2) + b'\x65\xff'
+                h = probe.HEADER.pack(1, 0, 1, 0, 999, 1, time.monotonic_ns() // 1000 - 2000000)
+                source.sendall(struct.pack('<I', len(h)+len(old))+h+old)
 
                 def send_media():
                     try:
                         for seq in range(50):
                             pts = 1000000 + seq * 20000
                             for kind, payload, flags in [(1, struct.pack('>I', len(access_unit)) + access_unit, 1), (2, pcm, 0)]:
-                                frame = probe.HEADER.pack(kind, 0, flags, 0, seq, pts, pts) + payload
+                                frame = probe.HEADER.pack(kind, 0, flags, 0, seq, pts, time.monotonic_ns() // 1000) + payload
                                 source.sendall(struct.pack('<I', len(frame)) + frame)
                             time.sleep(.02)
                         probe.send_json(source, {'type': 'audio-format', 'stream': 0, 'format': None})

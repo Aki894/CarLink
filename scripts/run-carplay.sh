@@ -22,6 +22,7 @@ for file in identity.pk8 certificate.p7b; do
 done
 install -d -m 700 "$state/state" /run/carlink-carplay
 if [ "$mode" = probe ] || [ "$mode" = forward ]; then
+    if [ "$mode" = forward ]; then export CARLINK_LOW_LATENCY=1; fi
     if [ "$mode" = forward ]; then output="$root/forward.py"; else output="$root/probe.py"; fi
     # iOS wireless audio initialization requires a compatible voice offer even
     # when only AAC media is playing. The probe accepts compressed OXP packets.

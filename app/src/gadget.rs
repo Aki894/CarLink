@@ -457,12 +457,14 @@ mod linux {
 
     #[derive(Debug)]
     struct Outgoing {
+        queued: Instant,
         data: Vec<u8>,
         // Control responses (including audio INIT/STOP) remain FIFO and durable.
         epoch: Option<(usize, u64)>,
     }
 
     impl Outgoing {
+        fn expired(&self)->bool {self.epoch.is_some() && self.queued.elapsed()>Duration::from_millis(120)}
         fn current(&self, epochs: &[AtomicU64; 2]) -> bool {
             self.epoch.map_or(true, |(lane, generation)| {
                 epochs[lane].load(Ordering::Acquire) == generation
@@ -524,8 +526,11 @@ mod linux {
             }).map_err(|e| format!("start USB RX worker: {e}"))?);
             let stop = own.stop.clone(); let enabled = own.enabled.clone(); let errors_tx_tx = errors_tx.clone();
             let writer_epochs = epochs.clone();
+            let recover_video=Arc::new(AtomicBool::new(false));
+            let writer_recover=recover_video.clone();
             let writer = thread::Builder::new().name("carlink-usb-tx".into()).spawn(move || {
                 let result = (|| {
+                    let mut report=Instant::now();let mut queue_max=0u128;let mut write_max=0u128;let mut bytes=0u64;let mut stale=0u64;
                     while live(&stop, deadline) {
                         if !enabled.load(Ordering::Acquire) { thread::sleep(Duration::from_millis(10)); continue; }
                         match outgoing_rx.recv_timeout(Duration::from_millis(50)) {
@@ -534,7 +539,19 @@ mod linux {
                                 // started, finish the entire packet without fencing
                                 // in the middle of a USB transfer.
                                 if frame.current(&writer_epochs) {
-                                    transmit(&mut tx, &frame.data, &stop, deadline)?;
+                                    let age=frame.queued.elapsed();queue_max=queue_max.max(age.as_micros());
+                                    if frame.expired(){
+                                        stale+=1;
+                                        if frame.epoch.is_some_and(|(lane,_)|lane==0){writer_recover.store(true,Ordering::Release);}
+                                    }else{
+                                        let start=Instant::now();
+                                        transmit(&mut tx, &frame.data, &stop, deadline)?;
+                                        write_max=write_max.max(start.elapsed().as_micros());bytes+=frame.data.len() as u64;
+                                    }
+                                    if report.elapsed()>=Duration::from_secs(5){
+                                        crate::runtime::log("usb_tx_latency",&format!("queue_max_us={queue_max} write_max_us={write_max} bytes={bytes} stale={stale}"));
+                                        report=Instant::now();queue_max=0;write_max=0;bytes=0;
+                                    }
                                 }
                             },
                             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -559,16 +576,17 @@ mod linux {
                 publish_epochs(&epochs, endpoint.epochs());
                 let result = (|| {
                     while live(&stop, deadline) {
+                        if recover_video.swap(false,Ordering::AcqRel){endpoint.media_backpressure(true);}
                         endpoint.transport_ready(protocol_enabled.load(Ordering::Acquire));
                         publish_epochs(&epochs,endpoint.epochs());
-                        match incoming_rx.recv_timeout(Duration::from_millis(10)) {
+                        match incoming_rx.recv_timeout(Duration::from_millis(2)) {
                             Ok(chunk) => {
                                 let responses = endpoint.receive(&chunk)?;
                                 publish_epochs(&epochs, endpoint.epochs());
                                 if responses.len() > 32 { return Err("too many responses to one USB chunk".into()); }
                                 for frame in responses {
                                     if frame.len() > MAX_FRAME { return Err("USB response exceeds frame bound".into()); }
-                                    send_bounded(&outgoing_tx, Outgoing { data: frame, epoch: None }, &stop, deadline)?;
+                                    send_bounded(&outgoing_tx, Outgoing { queued:Instant::now(), data: frame, epoch: None }, &stop, deadline)?;
                                 }
                             }
                             Err(mpsc::RecvTimeoutError::Timeout) => {},
@@ -586,7 +604,7 @@ mod linux {
                             };
                             let current = endpoint.epochs();
                             publish_epochs(&epochs, current);
-                            let packet = Outgoing { data: frame, epoch: Some((lane, current[lane])) };
+                            let packet = Outgoing { queued:Instant::now(), data: frame, epoch: Some((lane, current[lane])) };
                             match outgoing_tx.try_send(packet) {
                                 Ok(()) => {},
                                 Err(TrySendError::Full(_)) => {
@@ -765,9 +783,9 @@ mod linux {
         #[test]
         fn epochs_discard_old_media_without_discarding_control_responses() {
             let epochs = [AtomicU64::new(3), AtomicU64::new(7)];
-            let video = Outgoing { data: Vec::new(), epoch: Some((0, 3)) };
-            let audio = Outgoing { data: Vec::new(), epoch: Some((1, 7)) };
-            let control = Outgoing { data: Vec::new(), epoch: None };
+            let video = Outgoing { queued:Instant::now(), data: Vec::new(), epoch: Some((0, 3)) };
+            let audio = Outgoing { queued:Instant::now(), data: Vec::new(), epoch: Some((1, 7)) };
+            let control = Outgoing { queued:Instant::now(), data: Vec::new(), epoch: None };
             assert!(video.current(&epochs)); assert!(audio.current(&epochs));
             publish_epochs(&epochs, [4, 7]);
             assert!(!video.current(&epochs)); assert!(audio.current(&epochs));
@@ -778,8 +796,8 @@ mod linux {
         #[test]
         fn full_media_queue_reports_backpressure_without_waiting() {
             let (tx, _rx) = mpsc::sync_channel(1);
-            tx.try_send(Outgoing { data: vec![1], epoch: Some((0, 0)) }).unwrap();
-            assert!(matches!(tx.try_send(Outgoing { data: vec![2], epoch: Some((0, 0)) }), Err(TrySendError::Full(_))));
+            tx.try_send(Outgoing { queued:Instant::now(), data: vec![1], epoch: Some((0, 0)) }).unwrap();
+            assert!(matches!(tx.try_send(Outgoing { queued:Instant::now(), data: vec![2], epoch: Some((0, 0)) }), Err(TrySendError::Full(_))));
         }
 
         #[test]
@@ -791,6 +809,13 @@ mod linux {
             assert_eq!(transport_frames(&batch).unwrap(),vec![audio.as_slice(),status.as_slice()]);
             batch.pop();assert!(transport_frames(&batch).is_err());
             let mut bad=audio;bad.extend([0;8]);assert!(transport_frames(&bad).is_err());
+        }
+        #[test]
+        fn queued_media_expires_but_protocol_responses_do_not(){
+            let old=Instant::now()-Duration::from_millis(200);
+            let media=Outgoing{queued:old,data:vec![],epoch:Some((0,1))};
+            let command=Outgoing{queued:old,data:vec![],epoch:None};
+            assert!(media.expired());assert!(!command.expired());
         }
     }
 }

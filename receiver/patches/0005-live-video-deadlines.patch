@@ -1,0 +1,76 @@
+--- a/rust/direlay-linux/src/stream_bridge_sink.rs
++++ b/rust/direlay-linux/src/stream_bridge_sink.rs
+@@ -10,6 +10,13 @@
+     collections::BTreeMap,
+     sync::{Arc, Mutex},
+ };
++// CarLink uses a cross-process clock only in its headless live mode.
++fn carlink_clock_us(fallback: i64) -> i64 {
++    if std::env::var("CARLINK_LOW_LATENCY").as_deref() != Ok("1") { return fallback; }
++    let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 { return fallback; }
++    time.tv_sec as i64 * 1_000_000 + time.tv_nsec as i64 / 1000
++}
+ struct BridgeState {
+     session: u64,
+     codec: Option<VideoCodec>,
+@@ -185,7 +192,7 @@
+                                 flags: if key { oxp_wire::KEYFRAME } else { 0 },
+                                 sequence: s.sequence,
+                                 pts_us: (frame_arrival / 1000) as i64,
+-                                sender_clock_us: (frame_arrival / 1000) as i64,
++                                sender_clock_us: carlink_clock_us((frame_arrival / 1000) as i64),
+                             },
+                             payload,
+                         };
+@@ -272,7 +279,7 @@
+                                         flags: 0,
+                                         sequence: 0,
+                                         pts_us: pts,
+-                                        sender_clock_us: pts,
++                                        sender_clock_us: carlink_clock_us(pts),
+                                     },
+                                     payload,
+                                 },
+--- a/rust/direlay-linux/src/stream_connection.rs
++++ b/rust/direlay-linux/src/stream_connection.rs
+@@ -96,7 +96,7 @@
+                                 .map_err(std::io::Error::other)?,
+                         )
+                         .map_err(std::io::Error::other)?;
+-                        let (tx, rx) = mpsc::sync_channel(128);
++                        let (tx, rx) = mpsc::sync_channel(if std::env::var("CARLINK_LOW_LATENCY").as_deref() == Ok("1") { 32 } else { 128 });
+                         {
+                             let mut s = input.state.lock().unwrap();
+                             if let Some(settings) = s.declarations.get("display-settings") {
+@@ -126,6 +126,7 @@
+                                 fail.store(true, Ordering::Release);
+                             }),
+                         )?;
++                        let mut last_recovery = Instant::now() - Duration::from_secs(1);
+                         let result = loop {
+                             if closed.load(Ordering::Acquire) {
+                                 break Ok(());
+@@ -145,6 +146,22 @@
+                             }
+                             match rx.recv_timeout(Duration::from_millis(100)) {
+                                 Ok(m) => {
++                                    if std::env::var("CARLINK_LOW_LATENCY").as_deref() == Ok("1") {
++                                        if let oxp_wire::Message::Binary { header, .. } = &m {
++                                            if header.kind == oxp_wire::Kind::Video {
++                                                let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++                                                let valid = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } == 0;
++                                                let age = now.tv_sec as i64 * 1_000_000 + now.tv_nsec as i64 / 1000 - header.sender_clock_us;
++                                                if valid && age > 120_000 {
++                                                    if last_recovery.elapsed() >= Duration::from_millis(250) {
++                                                        let _ = input.control(&oxp_wire::Message::Json(serde_json::json!({"type":"keyframe","screen":0})));
++                                                        last_recovery = Instant::now();
++                                                    }
++                                                    continue;
++                                                }
++                                            }
++                                        }
++                                    }
+                                     if let Err(e) = oxp_wire::write(&mut stream, &m) {
+                                         break Err(std::io::Error::other(e));
+                                     }

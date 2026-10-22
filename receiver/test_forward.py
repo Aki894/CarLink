@@ -57,12 +57,30 @@ class ForwardTests(unittest.TestCase):
         link.connected = True
         link.session(True)
         link.configure(800, 480, 30)
-        for _ in range(10):
+        for _ in range(6):
             self.assertTrue(link.media(3, b'\0' * 4, 0))
         self.assertFalse(link.media(3, b'\0' * 4, 0))
         link.audio_state(0, False)
         self.assertFalse(any(k == 3 for k, _, _ in link.pending))
         self.assertEqual(link.pending[-1][1][4:6], b'\x05\x00')
+
+    def test_video_recovery_preserves_audio_and_rate_limits_keyframes(self):
+        controls = []
+        link = forward.LiveLink('unused', controls.append)
+        link.connected = True
+        link.session(True)
+        link.configure(800, 480, 30)
+        link.media(3, b'\0' * 4, 1)
+        link.media(2, b'I', 1, 1)
+        link.recover_video()
+        link.recover_video()
+        self.assertTrue(link.active)
+        self.assertTrue(any(k == 3 for k, _, _ in link.pending))
+        self.assertFalse(any(k == 2 for k, _, _ in link.pending))
+        self.assertEqual(sum(k == 6 for k, _, _ in link.pending), 1)
+        self.assertEqual(len(controls), 1)
+        self.assertFalse(link.media(2, b'P', 2))
+        self.assertTrue(link.media(2, b'I', 3, 3))
 
 
 if __name__ == '__main__':

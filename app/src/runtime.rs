@@ -16,7 +16,7 @@ pub struct Endpoint {
     media: Option<TestMedia>,
     live: Option<crate::live::LiveSource>,
     transport_ready: bool,
-    live_generation: u64,
+    live_generation: [u64;2],
     clock: Instant,
     playing: bool,
     audio_on: bool,
@@ -35,7 +35,7 @@ impl Endpoint {
 
     pub fn with_media(media: Option<TestMedia>) -> Self {
         let session = media.as_ref().map_or_else(Session::new, |m| Session::with_video_source(m.config()));
-        Self { decoder: Decoder::new(Limits::default()), session, media, live: None, transport_ready: true, live_generation: 0, clock: Instant::now(),
+        Self { decoder: Decoder::new(Limits::default()), session, media, live: None, transport_ready: true, live_generation: [0;2], clock: Instant::now(),
             playing: false, audio_on: false, audio_allowed: true, hu_muted: false, epochs: [0; 2], last_video: Duration::ZERO,
             first_header: Vec::with_capacity(8), input: crate::input::Input::default() }
     }
@@ -46,7 +46,11 @@ impl Endpoint {
         Ok(endpoint)
     }
     fn sync_live_epoch(&mut self) {
-        if let Some(live)=self.live.as_ref() {if live.generation()!=self.live_generation {self.live_generation=live.generation();self.epochs[0]+=1;self.epochs[1]+=1;}}
+        if let Some(live)=self.live.as_ref() {
+            for (lane,value) in live.generation().into_iter().enumerate(){
+                if value!=self.live_generation[lane]{self.live_generation[lane]=value;self.epochs[lane]+=1;}
+            }
+        }
     }
     pub fn transport_ready(&mut self, ready:bool) {
         if self.transport_ready!=ready {self.transport_ready=ready;if let Some(live)=self.live.as_mut(){live.set_playing(ready && self.playing);}self.sync_live_epoch();}

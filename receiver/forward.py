@@ -20,12 +20,14 @@ import probe
 LIVE = struct.Struct('<BBHQ')
 MAX_VIDEO = 512 * 1024
 MAX_QUEUE = 1024 * 1024
+VIDEO_BUDGET = .12
+AUDIO_BUDGET = .12
 PCM_CHUNK = 3528  # 20 ms, 44100 Hz, stereo S16LE
 ROLES = {'MEDIA': 0, 'ALERT': 1}
 
 
 def packet(kind, payload=b'', flags=0, pts=0):
-    if kind not in (1, 2, 3, 4, 5) or not 0 <= flags <= 255 or not 0 <= pts < 1 << 64:
+    if kind not in (1, 2, 3, 4, 5, 6) or not 0 <= flags <= 255 or not 0 <= pts < 1 << 64:
         raise ValueError('invalid live header')
     if len(payload) > (MAX_VIDEO if kind == 2 else 65536):
         raise ValueError('live payload too large')
@@ -88,6 +90,9 @@ class LiveLink:
         self.wait_key = True
         self.closed = threading.Event()
         self.sent = self.dropped = self.reconnects = 0
+        self.last_recovery = 0.
+        self.queue_ms_max = self.send_ms_max = self.source_ms_max = 0.
+        self.source_dropped = 0
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -130,12 +135,25 @@ class LiveLink:
 
     def recover_video(self):
         with self.lock:
-            self._clear()
-            self._put(4, flags=0)
-            self._put(4, flags=int(self.active))
-            if self.config:
-                self._put(1, self.config)
-        self.feedback({'type': 'keyframe', 'screen': 0})
+            kept = [(k, w, t) for k, w, t in self.pending if k != 2 and k != 6]
+            self.pending = deque(kept)
+            self.size = sum(len(w) for _, w, _ in kept)
+            self.wait_key = True
+            self._put(6)  # Video-only fence; audio player remains alive.
+            request = time.monotonic() - self.last_recovery >= .25
+            if request:
+                self.last_recovery = time.monotonic()
+        if request:
+            self.feedback({'type': 'keyframe', 'screen': 0})
+
+    def report(self):
+        with self.lock:
+            value = dict(event='forward_latency', sent=self.sent, dropped=self.dropped,
+                reconnects=self.reconnects, pending=len(self.pending), pending_bytes=self.size,
+                queue_ms_max=round(self.queue_ms_max, 2), send_ms_max=round(self.send_ms_max, 2),
+                source_video_ms_max=round(self.source_ms_max, 2), source_video_dropped=self.source_dropped)
+            self.queue_ms_max = self.send_ms_max = self.source_ms_max = 0.
+        print(json.dumps(value), flush=True)
 
     def media(self, kind, payload, pts, flags=0):
         request = False
@@ -146,13 +164,10 @@ class LiveLink:
             if kind == 2 and self.wait_key and not flags & 1:
                 self.dropped += 1
                 return False
-            if self.size + len(payload) + 16 > MAX_QUEUE or (kind == 3 and sum(k == 3 for k, _, _ in self.pending) >= 10):
+            limit = 4 if kind == 2 else 6
+            if self.size + len(payload) + 16 > MAX_QUEUE or sum(k == kind for k, _, _ in self.pending) >= limit:
                 self.dropped += 1
                 if kind == 2:
-                    self._clear()
-                    self._put(4, flags=0)
-                    self._put(4, flags=int(self.active))
-                    self._put(1, self.config)
                     request = True
             else:
                 self._put(kind, payload, flags, max(0, pts))
@@ -160,13 +175,14 @@ class LiveLink:
                     self.wait_key = False
                 return True
         if request:
-            self.feedback({'type': 'keyframe', 'screen': 0})
+            self.recover_video()
         return False
 
     def _run(self):
         while not self.closed.is_set():
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32768)
                     s.settimeout(.2)
                     s.connect(self.path)
                     with self.lock:
@@ -185,17 +201,16 @@ class LiveLink:
                                 self.size -= len(item[1])
                         if item:
                             kind, wire, queued = item
-                            if kind in (2, 3) and time.monotonic() - queued > .3:
-                                with self.lock:
-                                    self._clear()
-                                    self._put(4, flags=0)
-                                    self._put(4, flags=int(self.active))
-                                    if self.config:
-                                        self._put(1, self.config)
-                                    self.dropped += 1
-                                self.feedback({'type': 'keyframe', 'screen': 0})
+                            age = time.monotonic() - queued
+                            self.queue_ms_max = max(self.queue_ms_max, age * 1000)
+                            if kind in (2, 3) and age > (VIDEO_BUDGET if kind == 2 else AUDIO_BUDGET):
+                                self.dropped += 1
+                                if kind == 2:
+                                    self.recover_video()
                             else:
+                                started = time.monotonic()
                                 s.sendall(wire)
+                                self.send_ms_max = max(self.send_ms_max, (time.monotonic() - started) * 1000)
                                 self.sent += 1
                         readable, _, _ = select.select([s], [], [], 0 if item else .02)
                         if readable:
@@ -250,7 +265,7 @@ class AudioDecoder:
                    '-f', 's16le', '-flush_packets', '1', 'pipe:1']
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL, bufsize=0)
-        self.emit, self.queue = emit, queue.Queue(maxsize=16)
+        self.emit, self.queue = emit, queue.Queue(maxsize=6)
         self.closed = threading.Event()
         self.origin = None
         self.samples = 0
@@ -279,7 +294,7 @@ class AudioDecoder:
         if len(data) > 65536 or (self.codec == 'PCM_S16LE' and len(data) % (2 * self.channels)):
             raise ValueError('invalid source audio packet')
         try:
-            self.queue.put_nowait(data)
+            self.queue.put_nowait((data, time.monotonic()))
             return True
         except queue.Full:
             self.failed = True
@@ -289,9 +304,12 @@ class AudioDecoder:
         try:
             while not self.closed.is_set():
                 try:
-                    data = self.queue.get(timeout=.1)
+                    data, queued = self.queue.get(timeout=.1)
                 except queue.Empty:
                     continue
+                if time.monotonic() - queued > AUDIO_BUDGET:
+                    self.failed = True
+                    return
                 view = memoryview(data)
                 while view and not self.closed.is_set():
                     size = self.process.stdin.write(view)
@@ -350,6 +368,10 @@ def run(args):
     generation = [0]
     try:
         stream, _ = server.accept()
+        source_clock = os.environ.get('CARLINK_LOW_LATENCY') == '1'
+        capture_offset = None
+        last_video_seq = None
+        report_at = time.monotonic() + 5
         with stream:
             stream.settimeout(5)
             hello = probe.receive(stream)
@@ -374,6 +396,9 @@ def run(args):
             link.start()
             parameters, video_format, active = b'', None, False
             while True:
+                if time.monotonic() >= report_at:
+                    link.report()
+                    report_at = time.monotonic() + 5
                 ready, _, _ = select.select([stream], [], [], 1)
                 if not ready:
                     continue
@@ -423,13 +448,24 @@ def run(args):
                     if not active:
                         continue
                     if kind == 1 and ident == 0 and parameters:
+                        if last_video_seq is not None and seq != (last_video_seq + 1) & 0xffffffff and not flags & 1:
+                            link.recover_video()
+                        last_video_seq = seq
+                        if source_clock:
+                            capture_offset = sender - pts
+                            age = (time.monotonic_ns() // 1000 - sender) / 1000000
+                            link.source_ms_max = max(link.source_ms_max, age * 1000)
+                            if age > VIDEO_BUDGET or age < -.05:
+                                link.source_dropped += 1
+                                link.recover_video()
+                                continue
                         data = probe.annexb(payload)
                         if flags & 1:
                             data = parameters + data
                         if len(data) > MAX_VIDEO:
                             link.recover_video()
                             continue
-                        link.media(2, data, pts, flags & 1)
+                        link.media(2, data, sender if source_clock else pts, (flags & 1) | (2 if source_clock else 0))
                     elif kind == 2 and ident in formats:
                         fmt = formats[ident]
                         if fmt.get('role') not in ROLES or fmt.get('codec') not in ('AAC_LC', 'PCM_S16LE', 'OPUS'):
@@ -453,7 +489,7 @@ def run(args):
                             decoder = AudioDecoder(args.audio_binary, fmt, emit)
                             decoders[ident] = decoder
                             link.audio_state(role, True)
-                        decoder.feed(payload, pts)
+                        decoder.feed(payload, pts + capture_offset if source_clock and capture_offset is not None else sender if source_clock else pts)
     finally:
         generation[0] += 1
         for decoder in decoders.values():
