@@ -230,7 +230,7 @@ fn report(root: &Path) -> String {
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args == ["--help"] || args == ["-h"] {
-        println!("Usage:\n  carlink doctor --json\n  carlink carlife tcp [--listen 127.0.0.1:7240] [--duration 60] [--test-media DIR | --live-socket PATH]\n  carlink carlife usb [--duration 120] [--test-media DIR | --live-socket PATH]\nTCP is a loopback lab transport. USB creates a temporary AOA FunctionFS gadget. Test media is opt-in generated H.264 and PCM.");
+        println!("Usage:\n  carlink doctor --json\n  carlink carlife tcp [--listen 127.0.0.1:7240] [--duration 60] [--test-media DIR | --live-socket PATH]\n  carlink carlife usb [--duration 120] [--test-media DIR | --live-socket PATH]\nTCP is a loopback lab transport. USB creates a temporary AOA FunctionFS gadget. Duration 0 runs continuously. Live mode accepts H.264 and PCM from the local forwarder; test media is opt-in generated media.");
         return;
     }
     if args.first().map(String::as_str) == Some("carlife") {

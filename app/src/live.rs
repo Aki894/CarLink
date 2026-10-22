@@ -53,6 +53,8 @@ impl LiveSource {
         }
     }
     pub fn generation(&self)->u64 { self.generation }
+    pub fn clock_floor(&mut self, ms:u32) {if self.base_pts.is_none(){self.origin_ms=self.last_ms.max(ms);}}
+    pub fn heartbeat(&mut self, ms:u32)->u32 {self.stamps[0]=self.stamps[0].max(ms);self.last_ms=self.last_ms.max(ms);self.stamps[0]}
     pub fn feedback(&mut self,json:&str) {
         // A slow consumer must not grow controls without bound. Dropping the
         // connection resets touch state at the receiver on reconnect.

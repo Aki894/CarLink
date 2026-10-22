@@ -172,6 +172,7 @@ impl Endpoint {
         let now = self.clock.elapsed();
         if let Some(live)=self.live.as_mut(){
             live.poll_io()?;
+            live.clock_floor(now.as_millis() as u32);
             let message=live.next(self.audio_allowed && !self.hu_muted && self.transport_ready);
             self.sync_live_epoch();
             if let Some(message)=message {
@@ -183,7 +184,8 @@ impl Endpoint {
             }
             if self.session.video_config().is_some() && now.saturating_sub(self.last_video)>=Duration::from_secs(1) {
                 self.last_video=now;
-                return Message{channel:crate::carlife::Channel::Video,id:0x20002,timestamp_ms:Some(now.as_millis() as u32),reserved:0,payload:Vec::new()}
+                let timestamp=self.live.as_mut().unwrap().heartbeat(now.as_millis() as u32);
+                return Message{channel:crate::carlife::Channel::Video,id:0x20002,timestamp_ms:Some(timestamp),reserved:0,payload:Vec::new()}
                     .encode().map(Some).map_err(|e|e.to_string());
             }
             return Ok(None);
