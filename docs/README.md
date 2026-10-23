@@ -13,6 +13,7 @@
 | [后续路线](roadmap.md) | 当前优先级、验收方式和参考版本 |
 | [板卡与接线](../firmware/HARDWARE.md) | 厂商资料、DRAM、USB 角色和供电 |
 | [CarLife 应用](../app/README.md) | CLI、合成媒体、独立 USB/TCP 测试和诊断 JSON |
+| [无线 HiCar 计划](hicar.md) | 阶段验收、认证技术路线与隔离探针 |
 | [CarPlay 接收端](../receiver/README.md) | OpenXPlay、探针、录制和许可证 |
 | [AIC 驱动](../drivers/aic8800d80/README.md) | 精确内核构建、驱动 profile 与安装 |
 

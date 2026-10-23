@@ -1,5 +1,22 @@
 name: Refresh existing firmware
 on:
+  workflow_call:
+    inputs:
+      base_run_id:
+        type: string
+        required: true
+      app_run_id:
+        type: string
+        required: true
+      driver_run_id:
+        type: string
+        default: ''
+      variant:
+        type: string
+        default: main
+      disable_onboard_wifi:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       base_run_id:

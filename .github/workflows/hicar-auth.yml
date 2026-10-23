@@ -1,0 +1,68 @@
+name: Experimental Linux HiCar authentication
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    container: debian:bookworm
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native and ARMv7 build dependencies
+        run: |
+          dpkg --add-architecture armhf
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git cmake ninja-build \
+            build-essential gcc-arm-linux-gnueabihf python3 python3-venv qemu-user \
+            libssl-dev libmbedtls-dev libcjson-dev \
+            libssl-dev:armhf libmbedtls-dev:armhf libcjson-dev:armhf
+      - name: Test transport, private identity and fixed PIN
+        run: |
+          python3 -m venv .build/hicar-test-python
+          .build/hicar-test-python/bin/pip install --require-hashes -r experiments/hicar/requirements.txt
+          .build/hicar-test-python/bin/python -m unittest discover -s experiments/hicar -p 'test_*.py'
+      - name: Fetch pinned public sources and build native host library
+        run: |
+          python3 experiments/hicar/native/fetch.py "$PWD/.build/hicar-native-deps"
+          cmake -S experiments/hicar/native -B .build/hicar-native-host -G Ninja \
+            -DSOURCE_ROOT="$PWD/.build/hicar-native-deps" -DCMAKE_BUILD_TYPE=Release
+          cmake --build .build/hicar-native-host --parallel 4
+          python3 experiments/hicar/native/test_library.py .build/hicar-native-host/libcarlink_hichain.so
+      - name: Cross compile and package ARMv7 authentication library
+        run: |
+          cmake -S experiments/hicar/native -B .build/hicar-native-armhf -G Ninja \
+            -DSOURCE_ROOT="$PWD/.build/hicar-native-deps" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/experiments/hicar/native/armhf.cmake"
+          cmake --build .build/hicar-native-armhf --parallel 4
+          mkdir -p dist/hicar-auth/lib dist/hicar-auth/licenses
+          cp .build/hicar-native-armhf/libcarlink_hichain.so dist/hicar-auth/
+          cp -L /usr/lib/arm-linux-gnueabihf/libmbedcrypto.so.7 dist/hicar-auth/lib/
+          cp -L /usr/lib/arm-linux-gnueabihf/libcjson.so.1 dist/hicar-auth/lib/
+          cp experiments/hicar/native/sources.json dist/hicar-auth/
+          for name in deviceauth huks securec; do
+            cp ".build/hicar-native-deps/$name/LICENSE" "dist/hicar-auth/licenses/$name.txt"
+          done
+          cp /usr/share/doc/libmbedcrypto7/copyright dist/hicar-auth/licenses/mbedtls.txt
+          cp /usr/share/doc/libcjson1/copyright dist/hicar-auth/licenses/cjson.txt
+          arm-linux-gnueabihf-readelf -h dist/hicar-auth/libcarlink_hichain.so > dist/hicar-auth/elf-header.txt
+          grep -q 'Machine:.*ARM' dist/hicar-auth/elf-header.txt
+          (cd dist/hicar-auth && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hicar-auth-armv7-experimental
+          path: dist/hicar-auth/
+          if-no-files-found: error
+          retention-days: 14
+  firmware:
+    needs: native
+    uses: ./.github/workflows/refresh-image.yml
+    with:
+      base_run_id: '39459953269'
+      app_run_id: '39818918089'
+      driver_run_id: '39670639717'
+      variant: main
+      disable_onboard_wifi: true
+    secrets: inherit
