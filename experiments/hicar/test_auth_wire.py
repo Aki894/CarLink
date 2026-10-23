@@ -81,5 +81,8 @@ class AuthWireTests(unittest.TestCase):
         self.assertNotIn(identity.pin.encode(), reply)
         self.assertEqual(meta['replies'], 2)
         self.assertFalse(meta['key_ready'])
+        backend.results = [2, 1]
+        with self.assertRaisesRegex(AuthError, 'authentication failed'):
+            session.receive(dict(oper_type=3, data='{"message":2}'))
         session.close()
         self.assertTrue(backend.closed)

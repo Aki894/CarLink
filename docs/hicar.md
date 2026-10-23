@@ -1,81 +1,73 @@
 # Linux 无线 HiCar 实施计划
 
-## 目标与现状
+## 目标与当前结果
 
-目标平台为悟空派 H3（ARMv7、512 MiB）、AX900/AIC8800、Linux/BlueZ，手机范围为鸿蒙 4.2。HiCar 接收后复用现有 CarLife 输出，保留有线 SSH。开发与现有 CarPlay 接收端隔离，先用手动诊断程序验证协议，再接入常驻服务。
+目标平台为悟空派 H3（ARMv7、512 MiB）、AX900/AIC8800、Linux/BlueZ，手机范围为鸿蒙 4.2。HiCar 接收后复用现有 CarLife 输出，保留有线 SSH。探索程序与现有 CarPlay 接收端隔离，暂不随生产固件安装或自启。
 
-2026-10-23 已实测：FDEE BLE 广播使手机发现设备，点击后出现六位连接码输入框。参考 Android 程序的连接码由安全随机数生成，供 HiChain 原生认证使用。当前尚未实现连接码认证、Wi-Fi 建链或 HiCar 媒体接收。
+2026-10-23 已实测走通：FDEE 发现 → FE35 控制通道 → FE36 业务 19 → 身份 JSON → 固定六位 PIN → HiChain 认证成功。手机为 HiCar 14.2.0.400；H3 上两次独立进程测试均得到结果 `[2,3,0]`，即处理中、密钥协商完成、认证成功。两次使用同一持久化身份与 PIN。
 
-## 实施顺序与阶段验收
+下一处接入点是认证后的 Nearby ResourceManager / P2P 数据通道。手机发送 kind 4 / TLV 1，申请 channel 3 的 Wi-Fi/P2P 能力。网络、DMSDP 和 HiCar 媒体接收待实现；完整会话完成后的免 PIN 自动重连另作验收。
 
-| 阶段 | 实现内容 | 验收证据 |
+## 阶段与验收
+
+| 阶段 | 状态与实现内容 | 验收方式 |
 | --- | --- | --- |
-| 1. 发现与传输 | FDEE 广播；注册 FE35 RFCOMM 服务；限制运行时间、连接数和捕获大小 | 手机发现；BlueZ 注册成功；手机真实连接与首包；退出后注销，原 CarLink 服务保持正常 |
-| 2. Nearby 封装 | 确认 BR 控制通道、业务 19、FE36 业务通道和实际帧边界；实现拆包、粘包、长度校验与状态机 | 手机抓包与参考源码相互对应；分片、合包、畸形长度和断开重连用例通过 |
-| 3. 身份认证 | 实现握手 JSON、会话连接码、HiChain 数据交互与可信设备存储 | 新配对成功；错误码失败路径；断开后可信重连；密钥与配对资料只落在设备私有目录 |
-| 4. 网络与接收 | 按手机实际请求确定 AP/P2P 模式、网络参数、端口与控制协议；协商视频、音频和输入能力 | 无线会话建立；收到可解码视频及连续音频；输入回传被手机接受 |
-| 5. CarLife 桥接 | 接入现有本地媒体接口；H.264 格式与分辨率适配；音频格式、时钟和有界队列；触控/Remote Touch 回传 | 华为 HiCar 源与独立 CarLife HU 联调；随后 Lexus 实车连接、声音、控制、重连与延迟验证 |
-| 6. 交付与启动 | 常驻服务、互斥选择 CarPlay/HiCar、日志与失败恢复、固件打包 | GitHub Actions 完整 firmware job、镜像校验和上传成功；冷启动、长时间播放及异常断电恢复实测 |
+| 1. 发现与传输 | 已通过；FDEE、FE35/FE36、限定手机 SSP 代理、退出恢复设置 | 手机发现并建立双通道；SIGTERM 释放通道；原 CarLink 保持 active |
+| 2. Nearby 封装 | 已通过所观察 BR 路径；变长整数/TLV/CRC、拆包粘包、有界捕获 | 真实首包及业务 19 请求与参考实现对应；异常长度/校验测试 |
+| 3. 身份认证 | 固定 PIN、持久化身份/HUKS、公开 Linux HiChain 后端已实测成功 | 正确/错误 PIN 本机对照；华为手机两次成功；可信免 PIN 重连待完整会话完成后验收 |
+| 4. 网络与接收 | 下一阶段；按 ResourceManager 请求实现 P2P/AP 参数、端口和 DMSDP | 建立无线会话；连续收到可解码视频和音频；输入回传有效 |
+| 5. CarLife 桥接 | 待网络阶段；接入本地媒体接口、有界队列、Remote Touch | 独立 CarLife HU 联调，再测 Lexus 的声音、控制、重连与延迟 |
+| 6. 启动与交付 | 待桥接稳定；服务互斥、日志、恢复、固件集成 | 完整 firmware job、镜像校验和上传；冷启动、长时播放与断电恢复 |
 
-阶段 1 的发现已通过，RFCOMM 探针已开始实现。GATT `046A/046C` 与 BR 通道的关系需要通过手机实际访问确认；参考实现的 `046C` 读取路径会触发 P2P 状态机并返回 MAC 或 `busy`，不能简单当作连接码特征。先观察实际链路，再补必要服务。
+## 已确定的协议与适配
 
-首版探针验证记录（2026-10-23）：
+- HCI 曾因 `connectable` 关闭以 `Unacceptable BD_ADDR` 拒绝手机；临时开放后，SSP 又因缺少代理被拒绝。探针现在只为指定手机、FE35/FE36 注册 NoInputNoOutput 代理，退出恢复原 connectable/bondable 设置。
+- 手机请求 CCMP v5、加密偏好 2；参考实现兼容的 v2/明文控制封装已实测。CRC 用于帧完整性；身份认证由后续 HiChain 完成。
+- FE35 默认 RFCOMM 23；FE36 默认 24。BR 流创建请求为 channel 2、业务 19、协议 0。
+- 首包是 `oper_type=1`、`version=14.2.0.400`，`data` 为嵌套 JSON 字符串，允许省略 `discover_type`。身份回复声明 `has_pin=true`，无线业务流不直接传送 PIN。
+- 认证请求为 `oper_type=3`，内层 `message=1/2/3`；手机声明版本范围 `1.0.0..2.0.31`。后端返回相应的 `32769/32770/32771`，完成 PAKE 和身份交换。
+- 有未完成的网络连接时，手机可能直接重试 P2P，跳过新一轮认证。本轮结束旧 HiCar 连接进程后，恢复了 BR 身份/认证流程；没有清除手机应用数据。
 
-- 本地 7 项测试通过，覆盖广播字段、无效型号、D-Bus 签名、SDP 通道、分片字节流、大小上限和取消清理。
-- 开发板实测通过 BlueZ 广播/FE35 注册、控制器实际地址上的 RFCOMM 通道占用、SIGTERM 清理、退出后通道释放；最终运行 stderr 为空。
-- 退出后 BlueZ `ActiveInstances=0`，原 `carlink` 服务仍为 `active`。探针没有加入开机启动，也没有修改固件或构建流程。
-- 手机此前已完成发现并出现六位码输入框；新版 RFCOMM 的手机首包和身份认证待验证。
+## 认证后端与固定 PIN
 
-后续进展（同日）：新增独立实现的 Nearby 控制帧解析器，支持逆向确认的变长整数、TLV、CRC16-ARC、拆包/粘包和长度限制；加密负载只记录元信息。本地测试总计 14 项通过，其中 7 项帧解析测试在 H3 上也通过，探针监听与退出清理回归通过。首轮 180 秒捕获窗口没有收到 RFCOMM 首包，手机实际交互验证继续等待操作。
+本地参考 APK 的认证库依赖 Bionic、JNI 与 Android 日志。采用公开 OpenHarmony 源码编译 Linux C 后端，通过 Python ctypes 接入，避免在 glibc 上模拟整个 Android 运行库。公开源提交固定于 [sources.json](../experiments/hicar/native/sources.json)；DeviceAuth 基线为 [OpenHarmony-v1.1.4-LTS hichain.h](https://github.com/openharmony/security_deviceauth/blob/552edb521d0bd7c17f2dab2791e7cdc3de284405/interfaces/innerkits/deviceauth_lite/hichain.h)。包名/服务名按本地 JNI 常量使用 `com.huawei.authagent` / `SFXTEST`。
 
-实机推进结果（同日）：
+- 每设备首次生成六位 ASCII PIN，保留前导零，后续启动保留；操作员可通过标准输入修改。认证失败不会轮换 PIN。
+- 身份/PIN 为 `/var/lib/carlink/hicar/identity.json`，0600；HUKS 目录 `/var/lib/carlink/hicar/keys` 为 0700，三个存储文件均为 0600。原始认证包、密钥及厂商资料不提交。
+- ctypes 启动时核对结构体大小；回调先排队，退出原生调用后再发送；认证失败关闭连接，防止错误包互相循环。
+- OpenSSL 3 的公开 EVP 接口适配旧 HUKS 的 Ed25519 函数。RFC 8032 空消息测试向量和签名篡改拒绝在 Actions 主机及 H3 均通过。
+- 真实双端 PAKE 对照在 Actions 主机和 H3 均通过：正确 PIN 六个消息完成认证、会话密钥一致；错误 PIN 在第三个消息失败。
 
-1. 手机能收到广播，但部分轮次进入 `FindFarawayState`；探针增加广播功率和序号参数后，重新观察到发现窗口。功率和序号同时变更，分别影响后续再对照。
-2. 第一处接入阻碍为控制器 `connectable` 关闭，HCI 明确记录开发板以 `Unacceptable BD_ADDR` 拒绝华为手机的 ACL 请求。
-3. 临时打开接入后，下一处阻碍为 SSP 确认被 BlueZ 拒绝，日志为 `device_confirm_passkey: Operation not permitted`。增加限定手机的 NoInputNoOutput 代理并临时开放 bondable 后，FE35 收到真实首包。
-4. 手机请求 CCMP v5、传输加密偏好值 2；探针选择参考实现支持的 v2/明文控制帧后，手机继续发送 channel 2、业务 19、协议 0 的流创建请求。兼容协商已实测通过。
-5. 注册 FE36/SDP 并回复真实可用的业务端点后，手机建立第二条 RFCOMM 连接，发送 343 字节 JSON：`oper_type=1`、`version=14.2.0.400`；嵌套 `data` 包含 `deviceId`、`devicename`、`has_pin`、`usb_connection` 等字段，`has_pin=true`。此包未含 `discover_type`，后续解析须兼容缺省字段。
-6. 手动停止后，两条流正常关闭，临时 bondable/connectable 恢复关闭，原 `carlink` 服务仍 active。阶段 1 和阶段 2 的已观测路径通过，接下来实施双方身份握手及 HiChain。
+运行命令、配置和测试入口见 [实验说明](../experiments/hicar/README.md)。目前 Python 共 28 项测试在 Windows 与 H3 通过。
 
-当前本地和 H3 板上均为 20 项测试通过。原始业务数据和设备身份留在设备私有捕获目录与本机 `.build/hicar-research/`，不写入公开文档或源码。运行事件证据：设备 `/var/tmp/hicar-agent-11.log`，本机 `.build/hicar-research/session-11-events.jsonl`；原始业务流单独保存为私有资料。
+## 构建与证据
 
-本地运行证据为 `.build/hicar-research/smoke-result.json`，认证 ELF 清单为同目录 `native-inventory.json`。测试脚本、参考二进制和运行证据按本地研究资料管理。
+手动工作流 `.github/workflows/hicar-auth.yml` 先构建和测试主机库，再交叉编译 ARMv7，打包依赖、许可证、ELF 信息和 SHA-256 清单；随后调用完整生产镜像刷新任务。
 
-## 认证技术路线与决策点
+[Actions 39930292376](https://github.com/Aki894/CarLink/actions/runs/39930292376) 的 native 和 firmware job 全部成功，镜像验证与产物上传完成。认证独立产物下载后已核对 artifact SHA-256、每个成员校验和，H3 依赖加载及原生测试通过。本轮生产镜像沿用已成功的应用/驱动基线；HiCar 实验通过 SSH 单独部署，无需刷卡。
 
-认证是优先调查的依赖，同时推进传输层取证，避免媒体接口写完后才发现认证不可用。参考 APK 通过 JNI 调用 `libConnectAuthNative`、`libHwDeviceAuthSDK`、`libHwKeystoreSDK` 等库；先核对 ELF 架构、动态依赖、导出接口和初始化要求。
+私有证据保存在 `.build/hicar-research/`：主机/ARM 构建日志、原生库清单、手机日志与原始业务流。板上 `/var/tmp/hicar-agent-16.log`、`hicar-agent-17.log` 为两次真实认证事件记录，包含状态与长度，不输出 PIN 或密钥。已有 `smoke-result.json` 保留探针监听与清理证据。
 
-1. 优先寻找参考资料中已有的 ARMv7 Linux 原生接收端/认证实现，确认其运行依赖与使用条件。
-2. Android 原生库若依赖 Bionic、JNI 或 Android 服务，先记录具体依赖，再评估小范围适配成本。
-3. 如需自行实现认证，比较公开 DeviceAuth/HiChain 实现与手机实际消息的版本、消息结构和密码算法。公开实现与当前手机的兼容性需实测确定。
+## 下一阶段实现顺序
 
-首轮 ELF 检查已确认：参考包提供 ARMv7 库，`libHwDeviceAuthSDK` 导出 `start_pake`、`receive_data`、`authenticate_peer` 等接口；包装库导出 JNI 方法并依赖 `liblog.so`，底层认证/密钥库存在 Bionic 的 `__sF` 等导入。下一步优先检查底层 C 接口和回调结构，以及可对应的公开实现，评估替换包装层和运行库适配的工作量。
+1. 解析 kind 4 资源协商：请求 TLV 1 内首个变长整数是目标通道（本机为 3），随后为 channel 3 的详细能力 TLV；回复 TLV 2 和结果 TLV 7 的状态机按参考实现衔接。
+2. AX900 驱动已声明 P2P-client、P2P-GO、P2P-device 及 AP 模式，组合上限包含一个 P2P client/GO。在有线 SSH 下停止 CarPlay 无线会话后，实测 GO 建立、手机加入和 DHCP，避免现有热点占用。
+3. 实现参数与端点交换，先建立网络和控制通道，再处理 DMSDP 认证/会话。仅在网络就绪后声明相应能力。
+4. 验证 HiCar 输出的编码、分辨率、音频和输入事件，再复用现有 CarLife 输出；尽量直转 H.264，减少 H3 上的软件解码/重编码。
 
-已锁定公开研究基线：OpenHarmony `security_deviceauth` 的 `OpenHarmony-v1.1.4-LTS`，提交 `552edb521d0bd7c17f2dab2791e7cdc3de284405`。其 [hichain.h](https://github.com/openharmony/security_deviceauth/blob/552edb521d0bd7c17f2dab2791e7cdc3de284405/interfaces/innerkits/deviceauth_lite/hichain.h) 中的 14 个公开 API 名称全部存在于参考库导出符号中。回调结构、编译宏导致的 ABI 差异、PAKE 版本和 HUKS 存储依赖仍需逐项核对；暂未构建或加载该认证库。比较清单保存在 `.build/hicar-research/auth-api-comparison.json`。
+当前同一台华为手机承担供电、CarLife HU 测试和 HiCar 源测试。媒体桥接阶段使用第二个 HU 测试端或实车；现阶段保持现有接线。
 
-在认证通过前，不向手机发送虚假的成功结果，也不以任意六位码反复尝试。研究脚本不持久化可信身份；正式实现再设计设备私有存储和清除配对流程。
+## 参考定位
 
-## 代码与运行方式
-
-- 探索阶段使用 Python，便于对照抓包调整 D-Bus 和协议字段；代码位于 [experiments/hicar](../experiments/hicar/README.md)，不进入固件和开机服务。
-- 协议稳定后，常驻接收端采用 Rust，与现有 CarLife 应用共享进程管理和有界媒体队列设计。是否复用进程按接口与故障隔离需求决定。
-- 音视频尽量直接转发。先验证 HiCar 输出编码、分辨率、音频格式，再决定是否需要转换，避免 H3 上不必要的软件解码/重编码。
-- AX900 的 AP/P2P 能力与并发模式在网络阶段专项验证。切换无线模式前安排受控测试窗口，避免与 CarPlay 同时抢占热点。
-- 当前同一台华为手机承担供电、CarLife HU 测试和 HiCar 源测试。媒体桥接阶段需要第二个 HU 测试端或实车；现在保持现有接线，先做无线发现和协议验证。
-
-## 逆向依据与本地证据管理
-
-本地参考资料在 `hellocar/reference`，反编译、抓包和临时依赖在 CarLink 的 `.build/hicar-research/`。这些目录不进入公开仓库。以下仅记录接口观察和定位点，探针独立编写：
-
-| 参考定位 | 观察 |
+| 本地参考源码 | 用途 |
 | --- | --- |
-| Nearby `f/a.java`、`f/d/a.java`、`PublishDeviceInfo` | FDEE service data：版本、TLV 类型、型号/子型号、序号 |
-| Nearby `g/a/a.java` | `NearbyServerSocket` 使用 FE35 非配对 RFCOMM 服务 |
-| Nearby `transfertype/message/MessageManager.java` | 部分业务连接路径使用 FE36；业务协商类型 9/10，需继续确认帧封装 |
-| Nearby `BleDevice`、`P2pChannelStateMachine.t2` | `046C` 读请求返回 P2P 地址或 `busy` 并触发状态转换 |
-| AuthAgent `PinCodeProducer` | 六位数字由 `SecureRandom` 逐位生成，允许前导零 |
-| AuthAgent `NearbyConnectControl` | 业务 19；握手 `oper_type=1`，认证转发 `oper_type=3`；PIN 交给原生 HiChain |
+| Nearby `PublishDeviceInfo`、BLE 广播实现 | FDEE service data：版本、型号/子型号、序号 |
+| Nearby `h/e/e.java`、`h/e/h.java` | 自定义变长整数、TLV、CRC 与 CCMP |
+| Nearby `transfertype/message/MessageManager.java` | 业务流创建与 FE36 |
+| Nearby `transfertype/resource/ResourceManager.java`、`resource/a.java` | kind 4、数据通道能力和 P2P 协商 |
+| Nearby `BleDevice`、`P2pChannelStateMachine` | `046C` 返回 P2P 地址或 busy、网络状态机 |
+| AuthAgent `NearbyConnectControl`、`HiChainAuthControl` | 身份 JSON、oper_type 3、原生回调及 PIN |
 
-官方资料：[HiCar 平台](https://developer.huawei.com/consumer/cn/HiCar)、[连接方式接口](https://developer.huawei.com/consumer/cn/doc/HiCar-Guides/obtain-connection-mode-0000001052220416)。协议细节以本机参考程序与鸿蒙 4.2 手机实测为依据。
+参考资料位于 `hellocar/reference`，反编译和临时依赖位于本地 `.build/hicar-research/`。探针独立编写，公开仓库保留接口观察与源版本引用。
 
-探针的 BlueZ 接口依据：[ProfileManager](https://github.com/bluez/bluez/blob/master/doc/org.bluez.ProfileManager.rst)、[LEAdvertisement](https://github.com/bluez/bluez/blob/master/doc/org.bluez.LEAdvertisement.rst)。当前开发板 BlueZ 还会通过 `Properties.Set` 回报实际 `TxPower`，探针已处理该行为。
+官方接口资料：[HiCar 平台](https://developer.huawei.com/consumer/cn/HiCar)、[连接方式](https://developer.huawei.com/consumer/cn/doc/HiCar-Guides/obtain-connection-mode-0000001052220416)；BlueZ [ProfileManager](https://github.com/bluez/bluez/blob/master/doc/org.bluez.ProfileManager.rst) 与 [LEAdvertisement](https://github.com/bluez/bluez/blob/master/doc/org.bluez.LEAdvertisement.rst)。
