@@ -31,6 +31,7 @@ jobs:
             -DSOURCE_ROOT="$PWD/.build/hicar-native-deps" -DCMAKE_BUILD_TYPE=Release
           cmake --build .build/hicar-native-host --parallel 4
           python3 experiments/hicar/native/test_library.py .build/hicar-native-host/libcarlink_hichain.so
+          python3 experiments/hicar/native/test_pake.py .build/hicar-native-host/libcarlink_hichain.so
       - name: Cross compile and package ARMv7 authentication library
         run: |
           cmake -S experiments/hicar/native -B .build/hicar-native-armhf -G Ninja \

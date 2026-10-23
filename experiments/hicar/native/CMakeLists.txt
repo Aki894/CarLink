@@ -20,6 +20,7 @@ find_library(CJSON_LIB cjson REQUIRED)
 find_library(MBEDCRYPTO_LIB mbedcrypto REQUIRED)
 add_library(carlink_hichain SHARED compat.c ${AUTH_C} ${HUKS_C} ${SECUREC_C})
 target_include_directories(carlink_hichain PRIVATE
+  "${SOURCE_ROOT}/huks/interfaces/innerkits/huks_lite" "${HUKS}/.."
   compat "${SECUREC}/include" "${SOURCE_ROOT}/deviceauth/interfaces/innerkits/deviceauth_lite"
   "${AUTH}/base" "${AUTH}/auth_info" "${AUTH}/huks_adapter" "${AUTH}/json"
   "${AUTH}/key_agreement" "${AUTH}/log" "${AUTH}/schedule" "${AUTH}/struct"
