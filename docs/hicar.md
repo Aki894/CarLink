@@ -6,7 +6,7 @@
 
 2026-10-23 已实测走通：FDEE 发现 → FE35 控制通道 → FE36 业务 19 → 身份 JSON → 固定六位 PIN → HiChain 认证成功。手机为 HiCar 14.2.0.400；H3 上两次独立进程测试均得到结果 `[2,3,0]`，即处理中、密钥协商完成、认证成功。两次使用同一持久化身份与 PIN。
 
-下一处接入点是认证后的 Nearby ResourceManager / P2P 数据通道。手机发送 kind 4 / TLV 1，申请 channel 3 的 Wi-Fi/P2P 能力。网络、DMSDP 和 HiCar 媒体接收待实现；完整会话完成后的免 PIN 自动重连另作验收。
+认证后的 Nearby ResourceManager、5 GHz 热点加入、TCP 控制通道和业务 20 数据通道已实测通过；DMSDP 控制端口协商也通过，手机已连接该端口。下一阶段是 DMSDP 控制会话的加密与能力协商，然后接收媒体；完整会话完成后的免 PIN 自动重连另作验收。
 
 ## 阶段与验收
 
@@ -15,7 +15,7 @@
 | 1. 发现与传输 | 已通过；FDEE、FE35/FE36、限定手机 SSP 代理、退出恢复设置 | 手机发现并建立双通道；SIGTERM 释放通道；原 CarLink 保持 active |
 | 2. Nearby 封装 | 已通过所观察 BR 路径；变长整数/TLV/CRC、拆包粘包、有界捕获 | 真实首包及业务 19 请求与参考实现对应；异常长度/校验测试 |
 | 3. 身份认证 | 固定 PIN、持久化身份/HUKS、公开 Linux HiChain 后端已实测成功 | 正确/错误 PIN 本机对照；华为手机两次成功；可信免 PIN 重连待完整会话完成后验收 |
-| 4. 网络与接收 | 下一阶段；按 ResourceManager 请求实现 P2P/AP 参数、端口和 DMSDP | 建立无线会话；连续收到可解码视频和音频；输入回传有效 |
+| 4. 网络与接收 | 热点/TCP/业务 20/控制端口通过；DMSDP 加密与媒体待实现 | 网络通道已实测；后续验收连续视频、音频与输入回传 |
 | 5. CarLife 桥接 | 待网络阶段；接入本地媒体接口、有界队列、Remote Touch | 独立 CarLife HU 联调，再测 Lexus 的声音、控制、重连与延迟 |
 | 6. 启动与交付 | 待桥接稳定；服务互斥、日志、恢复、固件集成 | 完整 firmware job、镜像校验和上传；冷启动、长时播放与断电恢复 |
 
@@ -38,24 +38,41 @@
 - OpenSSL 3 的公开 EVP 接口适配旧 HUKS 的 Ed25519 函数。RFC 8032 空消息测试向量和签名篡改拒绝在 Actions 主机及 H3 均通过。
 - 真实双端 PAKE 对照在 Actions 主机和 H3 均通过：正确 PIN 六个消息完成认证、会话密钥一致；错误 PIN 在第三个消息失败。
 
-运行命令、配置和测试入口见 [实验说明](../experiments/hicar/README.md)。目前 Python 共 28 项测试在 Windows 与 H3 通过。
+运行命令、配置和测试入口见 [实验说明](../experiments/hicar/README.md)。目前 Python 共 37 项测试在 Windows 与 H3 通过。
 
 ## 构建与证据
 
 手动工作流 `.github/workflows/hicar-auth.yml` 先构建和测试主机库，再交叉编译 ARMv7，打包依赖、许可证、ELF 信息和 SHA-256 清单；随后调用完整生产镜像刷新任务。
 
-[Actions 39930292376](https://github.com/Aki894/CarLink/actions/runs/39930292376) 的 native 和 firmware job 全部成功，镜像验证与产物上传完成。认证独立产物下载后已核对 artifact SHA-256、每个成员校验和，H3 依赖加载及原生测试通过。本轮生产镜像沿用已成功的应用/驱动基线；HiCar 实验通过 SSH 单独部署，无需刷卡。
+[认证基线 Actions 39930292376](https://github.com/Aki894/CarLink/actions/runs/39930292376) 与 [网络/端口协商 Actions 39935892052](https://github.com/Aki894/CarLink/actions/runs/39935892052) 的 native 和完整 firmware job 均成功，镜像验证与产物上传完成。认证独立产物下载后已核对 artifact SHA-256、每个成员校验和，H3 依赖加载及原生测试通过。本轮生产镜像沿用已成功的应用/驱动基线；HiCar 实验通过 SSH 单独部署，无需刷卡。
 
 私有证据保存在 `.build/hicar-research/`：主机/ARM 构建日志、原生库清单、手机日志与原始业务流。板上 `/var/tmp/hicar-agent-16.log`、`hicar-agent-17.log` 为两次真实认证事件记录，包含状态与长度，不输出 PIN 或密钥。已有 `smoke-result.json` 保留探针监听与清理证据。
 
+## 无线网络与 DMSDP 实测（2026-10-23）
+
+独立实验入口增加 `--network-interface`。程序先确认 192.168.77.1 仍走有线管理网口，保存当前无线连接和 CarLink 服务状态，再临时建立 5 GHz/channel 149 热点。退出、SIGTERM 或建网失败时删除本次临时连接、恢复原无线连接及 CarLink 服务，不修改开机配置。
+
+已走通的链路：
+
+1. HiChain 成功后才接受 kind 4 的资源协商。手机申请 channel 3；开发板返回已就绪的 5745 MHz 热点端能力，手机通过 TLV 7 确认自己作为客户端。
+2. 开发板以 kind 33 / TLV 1 索取手机 Wi-Fi 地址，收到 TLV 2 后，通过 TLV 3 发送本次热点参数。参数采用参考实现的软件 AP 路径，包含 version 3、控制端口和 hicarApIp；临时密码不进入日志。
+3. 手机自动加入热点，使用 192.168.49.2 连接开发板 192.168.49.1:4005，完成 TCP 上的 CCMP。
+4. 手机请求 channel 3、业务 20、tag 为 DMSDP、协议 1。开发板只在 4006 已监听后回复实际端点；手机随后连接并发送 21 字节首包。
+5. 首包为 DMSDP module 1、16 字节全零载荷，CRC16-ARC 正确。其外层为 `7f | module varint | size varint | payload | CRC`，没有 CCMP 的 flags TLV。
+6. 对照原生 `VirtualDeviceSink::OnReceiveData` / `SendNegData`，接收端先创建新的控制监听，再回复 16 字节结果：状态 0、两字节大端端口、13 字节保留位。手机接受 4007 并建立连接。
+
+第 19/20 轮完成热点及业务 20 测试；第 21 轮在独立 USB 供电、开发板重启后完成控制端口协商。私有事件日志为 `/var/tmp/hicar-agent-19.log` 至 `hicar-agent-21.log`；原始帧和关机前快照在本地 `.build/hicar-research/`。
+
+AX900 驱动声明支持 P2P-client/GO/device。直接调用现有 supplicant 创建 GO 时命令返回 FAIL，因此当前采用已实测的软件 AP 兼容路径；不依赖创建真正的 Wi-Fi Direct 组。
+
 ## 下一阶段实现顺序
 
-1. 解析 kind 4 资源协商：请求 TLV 1 内首个变长整数是目标通道（本机为 3），随后为 channel 3 的详细能力 TLV；回复 TLV 2 和结果 TLV 7 的状态机按参考实现衔接。
-2. AX900 驱动已声明 P2P-client、P2P-GO、P2P-device 及 AP 模式，组合上限包含一个 P2P client/GO。在有线 SSH 下停止 CarPlay 无线会话后，实测 GO 建立、手机加入和 DHCP，避免现有热点占用。
-3. 实现参数与端点交换，先建立网络和控制通道，再处理 DMSDP 认证/会话。仅在网络就绪后声明相应能力。
-4. 验证 HiCar 输出的编码、分辨率、音频和输入事件，再复用现有 CarLife 输出；尽量直转 H.264，减少 H3 上的软件解码/重编码。
+1. 独立实现 DMSDP 控制会话封装。参考原生 `NetworkSessionCommon::Session::CtrlReadBuffer` / `SendRequestInternal`：控制流先有一字节标志和两字节大端长度，再是控制消息或密文；与 Nearby 及业务 20 的封装分别处理。
+2. 实现接收端主动发起的 `OPTIONS * DMSDP/1.0` 协商，核对 CryptoVer、CryptoAbility、CryptoAlg、CSeq；按真实能力提供选项。参考 `VirtualDeviceSink::DoNetConnected` / `SendCryptoNeg`；这层加密与 HiChain 配对分开验收。
+3. 完成设备/服务能力交换和实际媒体端口协商，解析 H.264、音频与输入事件，再复用 CarLife 输出；尽量直接转发，减少 H3 上的软件解码/重编码。
+4. 将稳定协议迁入常驻接收端，完成真实 HU、可信重连及长时间运行测试后再加入生产固件。
 
-当前同一台华为手机承担供电、CarLife HU 测试和 HiCar 源测试。媒体桥接阶段使用第二个 HU 测试端或实车；现阶段保持现有接线。
+无线 HiCar 阶段不需要手机连接开发板 OTG；开发板现已由独立 USB 电源供电，手机可独立充电。CarLife 桥接阶段再接第二个 HU 测试端或实车。
 
 ## 参考定位
 
