@@ -22,6 +22,7 @@ from control import FE36, Negotiator
 from auth_wire import AuthError, AuthSession, JsonStream
 from identity import DEFAULT_PATH, load_or_create
 from dmsdp_wire import Decoder as DmsdpDecoder, Negotiation as DmsdpNegotiation
+from control_wire import Session as ControlSession
 
 FDEE = '0000fdee-0000-1000-8000-00805f9b34fb'
 FE35 = '0000fe35-0000-1000-8000-00805f9b34fb'
@@ -107,11 +108,12 @@ def log(event, **fields):
 
 
 async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
-                  decode_control=True, auth_session=None, resource=None, dmsdp=None):
+                  decode_control=True, auth_session=None, resource=None, dmsdp=None, control=None):
     """Observe a byte stream without treating recv boundaries as protocol frames."""
     total = 0
     digest = hashlib.sha256()
     capture = None
+    plaintext_capture = None
     decoder = Decoder()
     parsing = decode_control
     auth_stream = JsonStream() if auth_session else None
@@ -121,8 +123,20 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
             path = Path(capture_dir) / f'session-{time.time_ns()}-{session}.bin'
             capture = os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                                        0o600), 'wb')
+            if control:
+                plaintext_capture = os.fdopen(os.open(str(path) + '.plain',
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb')
+                def save_plaintext(payload):
+                    # Length-delimited private records, bounded by the same
+                    # receive limit. Never store the session key itself.
+                    plaintext_capture.write(len(payload).to_bytes(2, 'big') + payload)
+                    plaintext_capture.flush()
+                control.on_plaintext = save_plaintext
         sock.setblocking(False)
         loop = asyncio.get_running_loop()
+        if control:
+            await asyncio.wait_for(loop.sock_sendall(sock, control.initial()), 2)
+            log('control_options_sent', session=session, crypto_ability=222)
         while total < limit:
             data = await loop.sock_recv(sock, min(4096, limit - total))
             if not data:
@@ -133,6 +147,16 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                 capture.write(data)
                 capture.flush()
             log('rx_chunk', session=session, size=len(data), total=total)
+            if control:
+                try:
+                    for event in control.receive(data):
+                        log('control_message', session=session, **event)
+                    for reply in control.take_pending():
+                        await asyncio.wait_for(loop.sock_sendall(sock, reply), 2)
+                        log('control_reply_sent', session=session, size=len(reply))
+                except ProtocolError as error:
+                    log('control_parse_stopped', session=session, reason=str(error))
+                    return
             if dmsdp_stream:
                 try:
                     for packet in dmsdp_stream.feed(data):
@@ -151,6 +175,7 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                         if (resource and metadata.get('backend') == 'hichain'
                                 and 0 in metadata.get('results', ()) and metadata.get('key_ready')):
                             resource.authenticated = True
+                            resource.session_key = auth_session.backend.session_key
                         if reply:
                             await asyncio.wait_for(loop.sock_sendall(sock, reply), 2)
                             log('authentication_reply', session=session, size=len(reply))
@@ -184,12 +209,19 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
         if total == limit:
             log('capture_limit', session=session, limit=limit)
     finally:
+        if plaintext_capture:
+            plaintext_capture.close()
+        if control:
+            control.close()
         if dmsdp_stream:
             try:
                 dmsdp_stream.finish()
             except ProtocolError as error:
                 log('incomplete_dmsdp_stream', session=session, reason=str(error))
         if auth_session:
+            if resource:
+                resource.authenticated = False
+                resource.session_key = None
             auth_session.close()
         if auth_stream:
             try:
@@ -427,7 +459,7 @@ async def run(args):
             tcp_listener.listen(4)
             tcp_listener.setblocking(False)
 
-            async def accept_tcp(listener, port, decode_control, dmsdp_port=None):
+            async def accept_tcp(listener, port, decode_control, dmsdp_port=None, control=False):
                 sequence = 0
                 while True:
                     client, address = await loop.sock_accept(listener)
@@ -442,7 +474,9 @@ async def run(args):
                     negotiator = Negotiator(profile.control_summary, resource=profile.resource) if decode_control else None
                     task = asyncio.create_task(observe(client, session, args.capture_dir,
                                                        negotiator=negotiator, decode_control=decode_control,
-                                                       dmsdp=DmsdpNegotiation(dmsdp_port) if dmsdp_port else None))
+                                                       dmsdp=DmsdpNegotiation(dmsdp_port) if dmsdp_port else None,
+                                                       control=ControlSession(profile.resource.session_key)
+                                                       if control else None))
                     tcp_clients.add(task)
                     tcp_sockets.add(client)
 
@@ -467,7 +501,8 @@ async def run(args):
             tcp_task = asyncio.create_task(accept_tcp(tcp_listener, args.network_offer.port, True))
             data_task = asyncio.create_task(accept_tcp(data_listener, profile.resource.data_port, False,
                                                        args.network_offer.port + 2))
-            control_task = asyncio.create_task(accept_tcp(control_listener, args.network_offer.port + 2, False))
+            control_task = asyncio.create_task(accept_tcp(control_listener, args.network_offer.port + 2,
+                                                         False, control=args.dmsdp_options))
             log('network_listener_ready', port=args.network_offer.port, frequency=args.network_offer.frequency)
         if args.allow_incoming:
             settings = mgmt_settings(controller_index)
@@ -510,7 +545,7 @@ async def run(args):
         await am.call_register_advertisement(ROOT + '/advertisement', {})
         advertisement_registered = True
         log('ready', duration=args.duration, transport='FE35', channel=args.channel,
-            hichain_authentication=False)
+            hichain_authentication=bool(args.auth_library))
         waiter = asyncio.create_task(stop.wait())
         disconnected = asyncio.create_task(bus.wait_for_disconnect())
         try:
@@ -590,6 +625,8 @@ def main():
     parser.add_argument('--auth-store', default='/var/lib/carlink/hicar/keys',
                         help='private persistent HUKS directory')
     parser.add_argument('--network-interface', help='temporarily replace CarPlay hotspot with a HiCar AP')
+    parser.add_argument('--dmsdp-options', action='store_true',
+                        help='negotiate DMSDP AES control and reply to keepalives')
     parser.add_argument('--capture-dir', help='optional private directory for raw streams')
     args = parser.parse_args()
     if not 1 <= args.duration <= 300:
@@ -605,6 +642,8 @@ def main():
         parser.error('--auth-library requires --reply-identity')
     if args.network_interface and not args.auth_library:
         parser.error('--network-interface requires --auth-library')
+    if args.dmsdp_options and not args.network_interface:
+        parser.error('--dmsdp-options requires --network-interface')
     if args.peer:
         parts = args.peer.split(':')
         if len(parts) != 6 or any(len(part) != 2 for part in parts):

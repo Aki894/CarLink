@@ -6,7 +6,7 @@
 
 2026-10-23 已实测走通：FDEE 发现 → FE35 控制通道 → FE36 业务 19 → 身份 JSON → 固定六位 PIN → HiChain 认证成功。手机为 HiCar 14.2.0.400；H3 上两次独立进程测试均得到结果 `[2,3,0]`，即处理中、密钥协商完成、认证成功。两次使用同一持久化身份与 PIN。
 
-认证后的 Nearby ResourceManager、5 GHz 热点加入、TCP 控制通道和业务 20 数据通道已实测通过；DMSDP 控制端口协商也通过，手机已连接该端口。下一阶段是 DMSDP 控制会话的加密与能力协商，然后接收媒体；完整会话完成后的免 PIN 自动重连另作验收。
+认证后的 Nearby ResourceManager、5 GHz 热点加入、TCP 控制通道和业务 20 数据通道已实测通过。DMSDP 控制端口、OPTIONS/SET_PARAMETER 协商、AES-128-CTR 解密和加密保活应答也已在 H3 与鸿蒙 4.2 手机上通过。下一阶段处理时间同步、设备/服务能力及媒体协商；完整会话完成后的免 PIN 自动重连另作验收。
 
 ## 阶段与验收
 
@@ -15,7 +15,7 @@
 | 1. 发现与传输 | 已通过；FDEE、FE35/FE36、限定手机 SSP 代理、退出恢复设置 | 手机发现并建立双通道；SIGTERM 释放通道；原 CarLink 保持 active |
 | 2. Nearby 封装 | 已通过所观察 BR 路径；变长整数/TLV/CRC、拆包粘包、有界捕获 | 真实首包及业务 19 请求与参考实现对应；异常长度/校验测试 |
 | 3. 身份认证 | 固定 PIN、持久化身份/HUKS、公开 Linux HiChain 后端已实测成功 | 正确/错误 PIN 本机对照；华为手机两次成功；可信免 PIN 重连待完整会话完成后验收 |
-| 4. 网络与接收 | 热点/TCP/业务 20/控制端口通过；DMSDP 加密与媒体待实现 | 网络通道已实测；后续验收连续视频、音频与输入回传 |
+| 4. 网络与接收 | 热点/TCP/业务 20/控制端口、AES 控制及保活通过；服务与媒体待实现 | 已收到时间同步请求和模块 3 二进制业务；后续验收服务协商、连续视频、音频与输入回传 |
 | 5. CarLife 桥接 | 待网络阶段；接入本地媒体接口、有界队列、Remote Touch | 独立 CarLife HU 联调，再测 Lexus 的声音、控制、重连与延迟 |
 | 6. 启动与交付 | 待桥接稳定；服务互斥、日志、恢复、固件集成 | 完整 firmware job、镜像校验和上传；冷启动、长时播放与断电恢复 |
 
@@ -38,7 +38,7 @@
 - OpenSSL 3 的公开 EVP 接口适配旧 HUKS 的 Ed25519 函数。RFC 8032 空消息测试向量和签名篡改拒绝在 Actions 主机及 H3 均通过。
 - 真实双端 PAKE 对照在 Actions 主机和 H3 均通过：正确 PIN 六个消息完成认证、会话密钥一致；错误 PIN 在第三个消息失败。
 
-运行命令、配置和测试入口见 [实验说明](../experiments/hicar/README.md)。目前 Python 共 37 项测试在 Windows 与 H3 通过。
+运行命令、配置和测试入口见 [实验说明](../experiments/hicar/README.md)。目前 Python 共 48 项测试在 Windows 与 H3 通过，包括 NIST SP 800-38A 的 AES-128-CTR 标准向量、分片协商、加密保活和异常输入拒绝。
 
 ## 构建与证据
 
@@ -67,10 +67,18 @@ AX900 驱动声明支持 P2P-client/GO/device。直接调用现有 supplicant �
 
 ## 下一阶段实现顺序
 
-1. 独立实现 DMSDP 控制会话封装。参考原生 `NetworkSessionCommon::Session::CtrlReadBuffer` / `SendRequestInternal`：控制流先有一字节标志和两字节大端长度，再是控制消息或密文；与 Nearby 及业务 20 的封装分别处理。
-2. 实现接收端主动发起的 `OPTIONS * DMSDP/1.0` 协商，核对 CryptoVer、CryptoAbility、CryptoAlg、CSeq；按真实能力提供选项。参考 `VirtualDeviceSink::DoNetConnected` / `SendCryptoNeg`；这层加密与 HiChain 配对分开验收。
-3. 完成设备/服务能力交换和实际媒体端口协商，解析 H.264、音频与输入事件，再复用 CarLife 输出；尽量直接转发，减少 H3 上的软件解码/重编码。
-4. 将稳定协议迁入常驻接收端，完成真实 HU、可信重连及长时间运行测试后再加入生产固件。
+1. 处理时间同步请求，解析模块 3 的设备/服务消息；目前手机等待后续业务约 30 秒后结束连接。
+2. 完成设备/服务能力交换和实际媒体端口协商，解析 H.264、音频与输入事件，再复用 CarLife 输出；尽量直接转发，减少 H3 上的软件解码/重编码。
+3. 将稳定协议迁入常驻接收端，完成真实 HU、可信重连及长时间运行测试后再加入生产固件。
+
+### 2026-10-23 控制会话实测
+
+- 核对手机实际 `/system/app/HwDMSDP/HwDMSDP.apk`（`com.huawei.dmsdp`，4.0.0.334）及 ARM64 库，确认三字节外层封装与参考接收端一致。
+- `CryptoAbility=222` 是原生实现检查的协议值；发送 0 时手机不应答。接收端发出 OPTIONS 后，手机以 SET_PARAMETER 返回 `CryptoSwitch=222`，本端按手机 CSeq 应答。
+- AES-128-CTR 使用本轮认证产生的会话密钥前 16 字节；每帧为 16 字节随机 IV 加密文，外层标记 `0xAB`。调用系统 OpenSSL EVP，密钥只留在内存，关闭会话时释放本端可变密钥缓冲区。
+- `hicar-agent-31.log` 成功解密 GET_PARAMETER；`hicar-agent-32.log` 连续应答约 30 次加密保活，同时收到 TimeServerPort/TimeUsHigh/TimeUsLow，以及模块 3、类型 `0xffffffff`、394 字节业务消息。
+- DMSDP 的 CTR 记录没有独立认证标签；软件 AP 的 WPA2 和 HiChain 身份认证继续保留，解密内容受长度、格式和状态约束。
+- 显式启用私有捕获时，解密控制记录写入同目录 `.plain` 文件，0600，沿用接收大小上限。密钥不写入捕获文件；参考 APK、手机程序及所有捕获均留在忽略目录。
 
 无线 HiCar 阶段不需要手机连接开发板 OTG；开发板现已由独立 USB 电源供电，手机可独立充电。CarLife 桥接阶段再接第二个 HU 测试端或实车。
 

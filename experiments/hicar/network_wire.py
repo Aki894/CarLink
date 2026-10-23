@@ -26,6 +26,7 @@ class Resource:
     def __init__(self, offer):
         self.offer = offer
         self.authenticated = False
+        self.session_key = None
         self.negotiated = False
         self.credentials_sent = False
         self.pending = []
