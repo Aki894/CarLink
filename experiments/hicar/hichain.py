@@ -192,7 +192,9 @@ class Session:
             self.pending.append(C.string_at(data, length))
 
     def get_params(self, _, operation, pin, params):
-        if operation not in (1, 2, 99):
+        # start_pake builds its object before assigning BIND, so its initial
+        # parameter callback uses NO_OPERATION_CODE (0).
+        if operation not in (0, 1, 2, 99):
             self.callback_error = True
             return
         C.memmove(pin, C.byref(self.pin), C.sizeof(self.pin))

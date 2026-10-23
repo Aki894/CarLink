@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded HiCar transport experiment with optional control replies, no HiChain auth."""
+"""Bounded HiCar transport experiment with an optional native auth backend."""
 import argparse
 import asyncio
 import ctypes
@@ -137,7 +137,7 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                         log('hicar_envelope', session=session, **metadata)
                         if reply:
                             await asyncio.wait_for(loop.sock_sendall(sock, reply), 2)
-                            log('identity_reply', session=session, size=len(reply))
+                            log('authentication_reply', session=session, size=len(reply))
                 except AuthError as error:
                     log('auth_parse_stopped', session=session, reason=str(error))
                     auth_stream = None
@@ -162,6 +162,8 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
         if total == limit:
             log('capture_limit', session=session, limit=limit)
     finally:
+        if auth_session:
+            auth_session.close()
         if auth_stream:
             try:
                 auth_stream.finish()
@@ -296,7 +298,8 @@ class Profile(ServiceInterface):
         self.sequence += 1
         session = self.sequence
         negotiator = Negotiator(self.control_summary, self.business_channel) if self.control_summary else None
-        auth_session = AuthSession(self.auth_identity, self.auth_model) if self.auth_identity else None
+        auth_session = AuthSession(self.auth_identity, self.auth_model,
+                                   getattr(self, 'backend_factory', None)) if self.auth_identity else None
         task = asyncio.create_task(observe(sock, session, self.capture_dir,
                                            negotiator=negotiator, decode_control=self.decode_control,
                                            auth_session=auth_session))
@@ -352,6 +355,11 @@ async def run(args):
     if args.reply_identity:
         business_profile.auth_identity = load_or_create(args.identity)
         business_profile.auth_model = args.model.upper()
+        if args.auth_library:
+            from hichain import Runtime, Session
+            runtime = Runtime(args.auth_library, args.auth_store,
+                              business_profile.auth_identity.device_id)
+            business_profile.backend_factory = lambda own, peer, pin: Session(runtime, own, peer, pin)
     bus.export(ROOT + '/profile', profile)
     bus.export(ROOT + '/business', business_profile)
     bus.export(ROOT + '/advertisement', Advertisement(payload, stop, args.tx_power))
@@ -474,6 +482,9 @@ def main():
                         help='reply to channel negotiation and offer the FE36 HiCar business socket')
     parser.add_argument('--reply-identity', action='store_true', help='reply to the HiCar identity handshake')
     parser.add_argument('--identity', default=DEFAULT_PATH, help='private persistent identity/PIN file')
+    parser.add_argument('--auth-library', help='optional pinned Linux HiChain shared library')
+    parser.add_argument('--auth-store', default='/var/lib/carlink/hicar/keys',
+                        help='private persistent HUKS directory')
     parser.add_argument('--capture-dir', help='optional private directory for raw streams')
     args = parser.parse_args()
     if not 1 <= args.duration <= 300:
@@ -485,6 +496,8 @@ def main():
         parser.error('--allow-incoming requires --peer')
     if args.reply_identity and not (args.reply_control and args.peer):
         parser.error('--reply-identity requires --reply-control and --peer')
+    if args.auth_library and not args.reply_identity:
+        parser.error('--auth-library requires --reply-identity')
     if args.peer:
         parts = args.peer.split(':')
         if len(parts) != 6 or any(len(part) != 2 for part in parts):

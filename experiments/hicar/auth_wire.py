@@ -1,4 +1,4 @@
-"""HiCar JSON business stream and identity handshake; no HiChain crypto yet."""
+"""HiCar JSON business stream with optional native HiChain authentication."""
 import codecs
 import json
 
@@ -85,10 +85,12 @@ class JsonStream:
 
 
 class AuthSession:
-    def __init__(self, identity, model):
+    def __init__(self, identity, model, backend_factory=None):
         self.identity = identity
         self.model = model
         self.peer_id = None
+        self.backend_factory = backend_factory
+        self.backend = None
 
     def receive(self, envelope):
         if not isinstance(envelope, dict):
@@ -111,6 +113,8 @@ class AuthSession:
             if inner.get('usb_connection', False) is not False:
                 raise AuthError('wireless probe received a USB handshake')
             self.peer_id = peer
+            if self.backend_factory:
+                self.backend = self.backend_factory(self.identity.device_id, peer, self.identity.pin)
             details = dict(deviceId=self.identity.device_id, devicename=self.identity.name,
                            has_pin=True, usb_connection=False, CONNECT_ABILITY_KEY='1',
                            CAR_MODE_ID=self.model)
@@ -125,5 +129,23 @@ class AuthSession:
         message = inner.get('message')
         if type(message) is not int or not 0 <= message <= 0xffffffff:
             message = None
-        return None, dict(operation=3, message=message,
-                          backend='not_connected')
+        if self.backend is None:
+            return None, dict(operation=3, message=message, backend='not_connected')
+        code, packets = self.backend.receive(data.encode('utf-8'))
+        replies = []
+        for packet in packets:
+            # Validate native output before embedding it in the business envelope.
+            parsed = parse_json(packet.decode('utf-8'))
+            if not isinstance(parsed, dict):
+                raise AuthError('invalid native authentication output')
+            reply = dict(version='A_0', discover_type=1, oper_type=3,
+                         data=packet.decode('utf-8'), usb_connection=False)
+            replies.append(json.dumps(reply, separators=(',', ':')).encode('utf-8'))
+        return b''.join(replies) or None, dict(operation=3, message=message,
+                   backend='hichain', native_code=code, replies=len(replies),
+                   results=list(self.backend.results), key_ready=self.backend.session_key is not None)
+
+    def close(self):
+        if self.backend:
+            self.backend.close()
+            self.backend = None
