@@ -23,6 +23,10 @@ def exchange(runtime, mismatch):
             messages.append(json.loads(packet)['message'])
             code, replies = target.receive(packet)
             codes.append(code)
+            # Native INFORM_MESSAGE can elicit another INFORM_MESSAGE. The
+            # transport must terminate a failed session rather than echo errors.
+            if 1 in target.results:
+                break
             queue.extend((source, target, reply) for reply in replies)
         else:
             raise AssertionError('unbounded PAKE packet exchange')

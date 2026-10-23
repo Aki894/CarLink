@@ -53,3 +53,33 @@ class AuthWireTests(unittest.TestCase):
         for invalid in (hello(deviceId='a' * 65), hello(usb_connection=True)):
             with self.assertRaises(AuthError):
                 AuthSession(session.identity, '00112233').receive(invalid)
+
+    def test_native_packets_are_wrapped_and_session_closed(self):
+        class Backend:
+            results = [2]
+            session_key = None
+            closed = False
+
+            def receive(self, data):
+                self.request = json.loads(data)
+                return 0, [b'{"message":32769,"payload":{}}', b'{"message":32770}']
+
+            def close(self):
+                self.closed = True
+        backend = Backend()
+        calls = []
+        def factory(*params):
+            calls.append(params)
+            return backend
+        identity = Identity('b' * 64, '000042')
+        session = AuthSession(identity, '00112233', factory)
+        session.receive(hello())
+        self.assertEqual(calls, [(identity.device_id, 'a' * 64, identity.pin)])
+        reply, meta = session.receive(dict(oper_type=3, data='{"message":1}'))
+        frames = JsonStream().feed(reply)
+        self.assertEqual([json.loads(f['data'])['message'] for f in frames], [32769, 32770])
+        self.assertNotIn(identity.pin.encode(), reply)
+        self.assertEqual(meta['replies'], 2)
+        self.assertFalse(meta['key_ready'])
+        session.close()
+        self.assertTrue(backend.closed)

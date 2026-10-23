@@ -132,6 +132,8 @@ class AuthSession:
         if self.backend is None:
             return None, dict(operation=3, message=message, backend='not_connected')
         code, packets = self.backend.receive(data.encode('utf-8'))
+        if 1 in self.backend.results:
+            raise AuthError('HiChain authentication failed')
         replies = []
         for packet in packets:
             # Validate native output before embedding it in the business envelope.
