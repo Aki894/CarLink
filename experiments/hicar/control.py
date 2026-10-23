@@ -10,12 +10,13 @@ FE36 = '0000fe36-0000-1000-8000-00805f9b34fb'
 
 
 class Negotiator:
-    def __init__(self, summary, business_channel=None):
+    def __init__(self, summary, business_channel=None, resource=None):
         if not 1 <= len(summary) <= 256:
             raise ValueError('local summary length must be 1..256 bytes')
         self.summary = summary
         self.seen = set()
         self.business_channel = business_channel
+        self.resource = resource
 
     def business_response(self, frame):
         if not self.complete or self.business_channel is None:
@@ -46,6 +47,8 @@ class Negotiator:
     def respond(self, frame):
         if frame.encrypted:
             return None
+        if frame.kind in (4, 33) and self.resource and self.complete:
+            return self.resource.respond(frame)
         if frame.kind == 2:
             return self.business_response(frame)
         if frame.kind != 0:

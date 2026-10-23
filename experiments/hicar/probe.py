@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import ctypes
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -105,7 +106,7 @@ def log(event, **fields):
 
 
 async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
-                  decode_control=True, auth_session=None):
+                  decode_control=True, auth_session=None, resource=None):
     """Observe a byte stream without treating recv boundaries as protocol frames."""
     total = 0
     digest = hashlib.sha256()
@@ -135,6 +136,9 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                     for envelope in auth_stream.feed(data):
                         reply, metadata = auth_session.receive(envelope)
                         log('hicar_envelope', session=session, **metadata)
+                        if (resource and metadata.get('backend') == 'hichain'
+                                and 0 in metadata.get('results', ()) and metadata.get('key_ready')):
+                            resource.authenticated = True
                         if reply:
                             await asyncio.wait_for(loop.sock_sendall(sock, reply), 2)
                             log('authentication_reply', session=session, size=len(reply))
@@ -146,7 +150,7 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                     for frame in decoder.feed(data):
                         fields = dict(session=session, kind=frame.kind, flags=frame.flags,
                                       encrypted=frame.encrypted, size=len(frame.payload))
-                        if frame.kind == 0 and not frame.encrypted:
+                        if frame.kind in (0, 2, 4, 33) and not frame.encrypted:
                             fields['tlvs'] = [dict(tag=tag, size=len(value))
                                               for tag, value in read_tlvs(frame.payload)]
                         log('nearby_frame', **fields)
@@ -154,8 +158,14 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                             response = negotiator.respond(frame)
                             if response:
                                 await asyncio.wait_for(loop.sock_sendall(sock, pack_frame(frame.kind, response)), 2)
-                                log('ccmp_response' if frame.kind == 0 else 'business_socket_offered', session=session,
+                                event = {0: 'ccmp_response', 2: 'business_socket_offered',
+                                         4: 'resource_response', 33: 'network_command_response'}[frame.kind]
+                                log(event, session=session,
                                     complete=negotiator.complete, framing_encryption=False)
+                            if negotiator.resource:
+                                for kind, payload in negotiator.resource.take_pending():
+                                    await asyncio.wait_for(loop.sock_sendall(sock, pack_frame(kind, payload)), 2)
+                                    log('network_followup', session=session, kind=kind)
                 except ProtocolError as error:
                     log('parse_stopped', session=session, reason=str(error))
                     parsing = False  # Keep private capture for unsupported formats.
@@ -278,6 +288,7 @@ class Profile(ServiceInterface):
         self.business_channel = None
         self.auth_identity = None
         self.auth_model = None
+        self.resource = None
 
     @method()
     def Release(self):
@@ -297,12 +308,13 @@ class Profile(ServiceInterface):
             raise
         self.sequence += 1
         session = self.sequence
-        negotiator = Negotiator(self.control_summary, self.business_channel) if self.control_summary else None
+        negotiator = Negotiator(self.control_summary, self.business_channel,
+                                 self.resource) if self.control_summary else None
         auth_session = AuthSession(self.auth_identity, self.auth_model,
                                    getattr(self, 'backend_factory', None)) if self.auth_identity else None
         task = asyncio.create_task(observe(sock, session, self.capture_dir,
                                            negotiator=negotiator, decode_control=self.decode_control,
-                                           auth_session=auth_session))
+                                           auth_session=auth_session, resource=self.resource))
         self.tasks[device] = task
         self.sockets[device] = sock
 
@@ -352,6 +364,9 @@ async def run(args):
     peer_path = args.adapter + '/dev_' + args.peer.upper().replace(':', '_') if args.peer else None
     profile = Profile(stop, args.capture_dir, peer_path)
     business_profile = Profile(stop, args.capture_dir, peer_path, decode_control=False)
+    if args.network_offer:
+        from network_wire import Resource
+        profile.resource = business_profile.resource = Resource(args.network_offer)
     if args.reply_identity:
         business_profile.auth_identity = load_or_create(args.identity)
         business_profile.auth_model = args.model.upper()
@@ -369,6 +384,10 @@ async def run(args):
     business_registered = False
     restore_connectable = False
     restore_bondable = False
+    tcp_listener = tcp_task = None
+    data_listener = data_task = None
+    tcp_clients = set()
+    tcp_sockets = set()
     controller_index = int(args.adapter.rsplit('hci', 1)[1])
     try:
         intro = await bus.introspect('org.bluez', '/org/bluez')
@@ -383,6 +402,47 @@ async def run(args):
             address = (await props.call_get('org.bluez.Adapter1', 'Address')).value
             seed = args.model.upper() + address.replace(':', '').upper()
             profile.control_summary = hashlib.sha256(seed.encode('ascii')).hexdigest().upper().encode('ascii')
+        if args.network_offer:
+            tcp_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tcp_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            tcp_listener.bind((args.network_offer.owner_ip, args.network_offer.port))
+            tcp_listener.listen(4)
+            tcp_listener.setblocking(False)
+
+            async def accept_tcp(listener, port, decode_control):
+                sequence = 0
+                while True:
+                    client, address = await loop.sock_accept(listener)
+                    if (address[0] != args.network_offer.client_ip
+                            or not profile.resource.authenticated or len(tcp_clients) >= 4):
+                        client.close()
+                        log('tcp_rejected', reason='unselected_or_unauthenticated_peer')
+                        continue
+                    sequence += 1
+                    session = f'tcp-{port}-{sequence}'
+                    log('tcp_connected', session=session, port=port)
+                    negotiator = Negotiator(profile.control_summary, resource=profile.resource) if decode_control else None
+                    task = asyncio.create_task(observe(client, session, args.capture_dir,
+                                                       negotiator=negotiator, decode_control=decode_control))
+                    tcp_clients.add(task)
+                    tcp_sockets.add(client)
+
+                    def completed(task, client=client):
+                        tcp_clients.discard(task)
+                        tcp_sockets.discard(client)
+                        client.close()
+                        if not task.cancelled() and task.exception():
+                            log('tcp_stream_error', error=type(task.exception()).__name__)
+                    task.add_done_callback(completed)
+            data_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            data_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            data_listener.bind((args.network_offer.owner_ip, args.network_offer.port + 1))
+            data_listener.listen(4)
+            data_listener.setblocking(False)
+            profile.resource.data_port = args.network_offer.port + 1
+            tcp_task = asyncio.create_task(accept_tcp(tcp_listener, args.network_offer.port, True))
+            data_task = asyncio.create_task(accept_tcp(data_listener, profile.resource.data_port, False))
+            log('network_listener_ready', port=args.network_offer.port, frequency=args.network_offer.frequency)
         if args.allow_incoming:
             settings = mgmt_settings(controller_index)
             restore_connectable = not bool(settings & 2)
@@ -452,6 +512,20 @@ async def run(args):
                     log('unregister_error', error=type(error).__name__)
         await profile.close()
         await business_profile.close()
+        if tcp_task:
+            tcp_task.cancel()
+        if data_task:
+            data_task.cancel()
+        for task in list(tcp_clients):
+            task.cancel()
+        for client in list(tcp_sockets):
+            client.close()
+        await asyncio.gather(*(task for task in (tcp_task, data_task) if task),
+                             *list(tcp_clients), return_exceptions=True)
+        if tcp_listener:
+            tcp_listener.close()
+        if data_listener:
+            data_listener.close()
         if agent_registered:
             try:
                 await asyncio.wait_for(agent_manager.call_unregister_agent(ROOT + '/agent'), 3)
@@ -485,6 +559,7 @@ def main():
     parser.add_argument('--auth-library', help='optional pinned Linux HiChain shared library')
     parser.add_argument('--auth-store', default='/var/lib/carlink/hicar/keys',
                         help='private persistent HUKS directory')
+    parser.add_argument('--network-interface', help='temporarily replace CarPlay hotspot with a HiCar AP')
     parser.add_argument('--capture-dir', help='optional private directory for raw streams')
     args = parser.parse_args()
     if not 1 <= args.duration <= 300:
@@ -498,6 +573,8 @@ def main():
         parser.error('--reply-identity requires --reply-control and --peer')
     if args.auth_library and not args.reply_identity:
         parser.error('--auth-library requires --reply-identity')
+    if args.network_interface and not args.auth_library:
+        parser.error('--network-interface requires --auth-library')
     if args.peer:
         parts = args.peer.split(':')
         if len(parts) != 6 or any(len(part) != 2 for part in parts):
@@ -524,7 +601,13 @@ def main():
     except BlockingIOError:
         parser.error('another HiCar probe is already running')
     try:
-        asyncio.run(asyncio.wait_for(run(args), timeout=args.duration + 30))
+        if args.network_interface:
+            from network import Hotspot
+            context = Hotspot(args.network_interface)
+        else:
+            context = nullcontext(None)
+        with context as args.network_offer:
+            asyncio.run(asyncio.wait_for(run(args), timeout=args.duration + 30))
     finally:
         lock.close()
 
