@@ -21,6 +21,7 @@ from nearby_wire import Decoder, ProtocolError, pack_frame, read_tlvs
 from control import FE36, Negotiator
 from auth_wire import AuthError, AuthSession, JsonStream
 from identity import DEFAULT_PATH, load_or_create
+from dmsdp_wire import Decoder as DmsdpDecoder, Negotiation as DmsdpNegotiation
 
 FDEE = '0000fdee-0000-1000-8000-00805f9b34fb'
 FE35 = '0000fe35-0000-1000-8000-00805f9b34fb'
@@ -106,7 +107,7 @@ def log(event, **fields):
 
 
 async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
-                  decode_control=True, auth_session=None, resource=None):
+                  decode_control=True, auth_session=None, resource=None, dmsdp=None):
     """Observe a byte stream without treating recv boundaries as protocol frames."""
     total = 0
     digest = hashlib.sha256()
@@ -114,6 +115,7 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
     decoder = Decoder()
     parsing = decode_control
     auth_stream = JsonStream() if auth_session else None
+    dmsdp_stream = DmsdpDecoder() if dmsdp else None
     try:
         if capture_dir:
             path = Path(capture_dir) / f'session-{time.time_ns()}-{session}.bin'
@@ -131,6 +133,16 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                 capture.write(data)
                 capture.flush()
             log('rx_chunk', session=session, size=len(data), total=total)
+            if dmsdp_stream:
+                try:
+                    for packet in dmsdp_stream.feed(data):
+                        log('dmsdp_packet', session=session, module=packet.module, size=len(packet.payload))
+                        reply = dmsdp.respond(packet)
+                        await asyncio.wait_for(loop.sock_sendall(sock, reply), 2)
+                        log('dmsdp_control_port_offered', session=session, port=dmsdp.port)
+                except ProtocolError as error:
+                    log('dmsdp_parse_stopped', session=session, reason=str(error))
+                    return
             if auth_stream:
                 try:
                     for envelope in auth_stream.feed(data):
@@ -172,6 +184,11 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
         if total == limit:
             log('capture_limit', session=session, limit=limit)
     finally:
+        if dmsdp_stream:
+            try:
+                dmsdp_stream.finish()
+            except ProtocolError as error:
+                log('incomplete_dmsdp_stream', session=session, reason=str(error))
         if auth_session:
             auth_session.close()
         if auth_stream:
@@ -386,6 +403,7 @@ async def run(args):
     restore_bondable = False
     tcp_listener = tcp_task = None
     data_listener = data_task = None
+    control_listener = control_task = None
     tcp_clients = set()
     tcp_sockets = set()
     controller_index = int(args.adapter.rsplit('hci', 1)[1])
@@ -409,7 +427,7 @@ async def run(args):
             tcp_listener.listen(4)
             tcp_listener.setblocking(False)
 
-            async def accept_tcp(listener, port, decode_control):
+            async def accept_tcp(listener, port, decode_control, dmsdp_port=None):
                 sequence = 0
                 while True:
                     client, address = await loop.sock_accept(listener)
@@ -423,7 +441,8 @@ async def run(args):
                     log('tcp_connected', session=session, port=port)
                     negotiator = Negotiator(profile.control_summary, resource=profile.resource) if decode_control else None
                     task = asyncio.create_task(observe(client, session, args.capture_dir,
-                                                       negotiator=negotiator, decode_control=decode_control))
+                                                       negotiator=negotiator, decode_control=decode_control,
+                                                       dmsdp=DmsdpNegotiation(dmsdp_port) if dmsdp_port else None))
                     tcp_clients.add(task)
                     tcp_sockets.add(client)
 
@@ -440,8 +459,15 @@ async def run(args):
             data_listener.listen(4)
             data_listener.setblocking(False)
             profile.resource.data_port = args.network_offer.port + 1
+            control_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            control_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            control_listener.bind((args.network_offer.owner_ip, args.network_offer.port + 2))
+            control_listener.listen(4)
+            control_listener.setblocking(False)
             tcp_task = asyncio.create_task(accept_tcp(tcp_listener, args.network_offer.port, True))
-            data_task = asyncio.create_task(accept_tcp(data_listener, profile.resource.data_port, False))
+            data_task = asyncio.create_task(accept_tcp(data_listener, profile.resource.data_port, False,
+                                                       args.network_offer.port + 2))
+            control_task = asyncio.create_task(accept_tcp(control_listener, args.network_offer.port + 2, False))
             log('network_listener_ready', port=args.network_offer.port, frequency=args.network_offer.frequency)
         if args.allow_incoming:
             settings = mgmt_settings(controller_index)
@@ -516,16 +542,20 @@ async def run(args):
             tcp_task.cancel()
         if data_task:
             data_task.cancel()
+        if control_task:
+            control_task.cancel()
         for task in list(tcp_clients):
             task.cancel()
         for client in list(tcp_sockets):
             client.close()
-        await asyncio.gather(*(task for task in (tcp_task, data_task) if task),
+        await asyncio.gather(*(task for task in (tcp_task, data_task, control_task) if task),
                              *list(tcp_clients), return_exceptions=True)
         if tcp_listener:
             tcp_listener.close()
         if data_listener:
             data_listener.close()
+        if control_listener:
+            control_listener.close()
         if agent_registered:
             try:
                 await asyncio.wait_for(agent_manager.call_unregister_agent(ROOT + '/agent'), 3)
