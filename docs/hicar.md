@@ -67,6 +67,8 @@ AX900 驱动声明支持 P2P-client/GO/device。直接调用现有 supplicant �
 
 ## 下一阶段实现顺序
 
+本轮代码提交 `b9fa5f9` 的 [Actions 39942615426](https://github.com/Aki894/CarLink/actions/runs/39942615426) 已完整成功：48 项 Python 测试、原生正/误 PIN PAKE、ARMv7 交叉编译、完整 firmware job、`mode=current` 镜像结构/校验及上传均通过。原生库 ZIP 的下载 SHA-256 与 10 个清单成员逐项核对通过。镜像产物为 `carlink-h3-refreshed-image`，实验仍由 SSH 单独部署。
+
 1. 处理时间同步请求，解析模块 3 的设备/服务消息；目前手机等待后续业务约 30 秒后结束连接。
 2. 完成设备/服务能力交换和实际媒体端口协商，解析 H.264、音频与输入事件，再复用 CarLife 输出；尽量直接转发，减少 H3 上的软件解码/重编码。
 3. 将稳定协议迁入常驻接收端，完成真实 HU、可信重连及长时间运行测试后再加入生产固件。
@@ -77,6 +79,7 @@ AX900 驱动声明支持 P2P-client/GO/device。直接调用现有 supplicant �
 - `CryptoAbility=222` 是原生实现检查的协议值；发送 0 时手机不应答。接收端发出 OPTIONS 后，手机以 SET_PARAMETER 返回 `CryptoSwitch=222`，本端按手机 CSeq 应答。
 - AES-128-CTR 使用本轮认证产生的会话密钥前 16 字节；每帧为 16 字节随机 IV 加密文，外层标记 `0xAB`。调用系统 OpenSSL EVP，密钥只留在内存，关闭会话时释放本端可变密钥缓冲区。
 - `hicar-agent-31.log` 成功解密 GET_PARAMETER；`hicar-agent-32.log` 连续应答约 30 次加密保活，同时收到 TimeServerPort/TimeUsHigh/TimeUsLow，以及模块 3、类型 `0xffffffff`、394 字节业务消息。
+- `hicar-agent-33.log` 的私有解密捕获确认：394 字节业务以本协议变长整数 `101` 开头，其后是设备信息 JSON，字段包括 deviceType、网络端点、deviceId、properties。对应参考 `DMSDPDeviceManager.onDataReceived` 的 101 分支及 `PackageTool.packageDeviceData`；下一轮发送本端设备信息，继续服务协商。
 - DMSDP 的 CTR 记录没有独立认证标签；软件 AP 的 WPA2 和 HiChain 身份认证继续保留，解密内容受长度、格式和状态约束。
 - 显式启用私有捕获时，解密控制记录写入同目录 `.plain` 文件，0600，沿用接收大小上限。密钥不写入捕获文件；参考 APK、手机程序及所有捕获均留在忽略目录。
 
