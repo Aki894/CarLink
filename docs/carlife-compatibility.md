@@ -1,10 +1,48 @@
-# CarLife 80% / 0% 循环的代码排查
+# CarLife 与 Lexus 实车兼容性
 
-## 用户描述与排查方向
+截至 2026-10-23，Lexus 首轮实车连接仍需复验：进度 80% 失败、重试 0%，偶发车机应用退出。后续持久日志修复与接受通知顺序修复已经完成，并通过原生 ARM / 华为台架；构建版本见[验证记录](validation.md)。
 
-点火后打开 CarLife 等待，检测到开发板才开始连接，进度到 80% 停止，随后失败；点重新连接后停在 0%，可能发生车机应用退出；重新打开应用后过一段时间重新检测到设备。
+车型为 2020 Lexus ES200 卓越版，仅支持有线 CarLife。实车只有车机 USB 供电，中途手动断电一次，通电到失败约 30 秒。
 
-因此，将“开发板开机约 42 秒才完成台架连接”直接解释为原厂车机连接超时的依据不足。应分别记录设备识别、AOA 切换、协议首包和失败后的重连。此前没有保存下来的实车握手仍需在下一次测试采集。
+以下区分当时取证与后续代码分析。
+
+## 取证结果
+
+- 已通过有线 SSH 读取日志并归档到本地忽略目录，归档包含 CarLink 全部现存 journal、启动索引、最近四次启动的系统日志、当前内核日志和服务状态。
+- 该轮开发板应用为 `95d7147`，没有部署 30 帧实验版。
+- 最近四次历史启动的持久日志末尾分别约在开机 18.68、18.97、19.03、19.51 秒；其中没有 CarLink 服务消息。该次启动中 CarLink 于约 23.69 秒启动。
+- 查询 `systemd-journald` 记录及实际 Armbian ramlog 脚本，确认 ramlog 启动流程先执行 `journalctl --flush`，随后执行 `journalctl --relinquish-var`。后者把后续记录切回 `/run/log/journal`；断电会丢失这些内存日志。仅配置 `Storage=persistent` 和 `/var/log/journal` 链接没有覆盖这一后续操作。
+- 这次实车失败时的完整 USB/AOA 与 CarLife 握手记录未保留下来。现有记录用于确认日志保存缺陷，连接失败根因仍待复现取证。
+- 首轮取证时华为 USB 主机能够识别开发板初始设备 `18d1:4ee7`，尚未开始该次启动的 AOA 切换及 CarLife 握手。
+
+## 已应用的日志修复
+
+1. 先归档原始日志，再执行 `journalctl --flush`、`journalctl --sync`。确认活动 journal 已位于 SD 卡上的 `/var/log.hdd/journal`，内存活动 journal 已退出。
+2. 在 `carlink.service` 增加启动前的 flush/sync 步骤，运行在本地启动依赖就绪后，使 ramlog 的 relinquish 不再影响之后的投影日志。
+3. 固件启动配置中的日志同步间隔统一为 5 秒，与开发板现有配置一致。
+4. 开发板只添加日志启动配置并同步到盘；投影二进制、配对和无线参数保持本轮取证时的版本。
+
+本地启动配置测试 9 项通过。随后执行受控软件重启：`carlink.service` 自动启动，两个 `ExecStartPre` 均以状态 0 完成，`NRestarts=0`；直接从 `/var/log.hdd/journal` 成功读到本轮投影日志，未再使用内存活动 journal。后续实车复现继续验证突然断电时的记录保留。
+
+## 用户补充及台架对照
+
+回到台架后 Type-C 接华为 OTG。历史持久日志的 19 秒末尾源于日志切换。
+
+华为解锁并打开车机端后，捕获到一次 `UsbManager.openDevice` 异常：AOA 切换后仍访问先前 USB 设备路径，报 `device ... does not exist or is restricted`，随后 CarLife SDK `openAccessory` 出现 `NullPointerException`。重启华为车机端后，协议版本、设备信息、认证、功能和视频协商完成，画面恢复。此为台架接收端异常；实车同一异常待日志核对。
+
+保持华为车机端前台，再次受控重启开发板，使用本轮开机单调时钟记录：
+
+| 事件 | 开机后时间 |
+| --- | ---: |
+| 初始 USB 身份绑定 | 24.347 秒 |
+| iPhone 无线会话活跃 | 31.456 秒 |
+| 收到 AOA 身份请求 | 35.638 秒 |
+| accessory bulk session enabled | 36.406 秒 |
+| 收到 CarLife 协议版本 | 42.052 秒 |
+| 完成视频协商、等待视频源 | 42.074 秒 |
+
+华为随后恢复画面；本轮协议协商阶段约 22 ms。日志及手机接收端输出已归档到本地忽略目录。下一步优先验证冷启动等待和 USB 重枚举时序是否超过真实车机的连接窗口，连接失败阶段需下一次实车完整日志确认。
+
 
 ## 实际检查的材料
 
@@ -74,13 +112,3 @@ AOA 切换会产生 detach/attach 和新设备路径，因此旧权限回调可�
 4. 收到协议版本后卡住：检查具体版本、统计信息、0x1004b、挑战与回应、视频 INIT/START 的最后一条记录。
 5. 首次失败后 0%：比较 USB 是否仍 configured、是否再次发送协议版本、是否有设备 detach/attach、应用退出时是否出现读写错误。
 6. 当前没有取得原厂镜像或原厂 APK；版本信息拿到后再匹配对应软件，避免混用新版手机测试端的进度定义。
-
-## 验证记录
-
-修复提交 `2785fb3`。
-
-- [应用构建 39805684763](https://github.com/Aki894/CarLink/actions/runs/39805684763) 成功：CarLink Rust 测试 60 项通过，ARMv7 交叉编译成功；接收端、音频和桥接检查通过，应用及接收端产物上传成功。
-- 应用产物 SHA256 `efdceea8f6f18ed2571b05e1527dda59a1524526be71cdc0b9cb8c27140a9289`，下载后与板上暂存文件校验一致。
-- 在悟空派原生 ARM 环境启动独立的本地 TCP 协议实例，模拟 1.0 车机不发挑战的流程，验证接受通知、重复统计去重、视频 INIT/START 和正常关闭，全部通过。测试未改变当前 USB 服务。
-- 华为解锁后，仅替换 `/usr/local/bin/carlink`，保留已有 CarPlay 接收端。2026-10-22 23:46:11，USB AOA identity 切换为 `18d1:2d00`，bulk enabled，完成 4.1 协议版本、统计信息、接受车机通知、挑战回应、车机认证通过、800×480×30 视频协商及 START。新顺序明确记录为 StatisticReceived → UsbPeerAccepted → HuInfoReceived → AuthenticationResponded，确认本次修复实际执行。服务 active、NRestarts=0。此轮验证范围为 USB 与协议握手；iPhone 未恢复无线媒体连接，视频/声音转发未复测。
-- [完整固件构建 39807108167](https://github.com/Aki894/CarLink/actions/runs/39807108167) 的 firmware job `119923155732` 成功。日志确认 baseline/current 镜像结构检查、应用/内核/模块/固件和 CarPlay 运行时/源码/校验和检查通过，boot profile 校验 14 个文件；镜像产物 `carlink-h3-refreshed-image` 已上传，420,374,374 字节，artifact ID `12438338182`。驱动热部署包与 refresh evidence 产物同时上传成功。完整镜像包含当前仓库已编译的 30 fps CarPlay 配置；本次台架只更换 Rust CarLife 程序，未同步替换接收端。

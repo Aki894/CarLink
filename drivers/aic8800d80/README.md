@@ -7,8 +7,7 @@ the actual headers, kernel configuration and Module.symvers hashes.
 
 - `main`: source commit `5327c777d00a94ee3bea09525b3acc8e1b031993`.
 - `mcu1`: matched legacy loader/firmware commit
-  `a9683a456079131a0381ed75fb7a4f5514527b3c`; use if the loader reports
-  `chip_id=7, chip_mcu_id=1`. Do not mix firmware between profiles.
+  `a9683a456079131a0381ed75fb7a4f5514527b3c`; retained as a matched alternative. The observed board reports `chip_id=7, chip_mcu_id=1` and has passed with `main`; keep that tested selection rather than switching from the ID alone. Do not mix firmware between profiles.
 
 The workflow downloads that run's artifact, verifies its run succeeded,
 verifies the exact headers hashes, builds x86 host tools from the supplied

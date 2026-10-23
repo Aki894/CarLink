@@ -1,48 +1,27 @@
-# Linux bring-up roadmap
+# 后续路线
 
-1. Build a pinned Armbian/Orange Pi Zero compatible Debian 13 minimal image.
-   Apply the vendor's conservative H3 DRAM setting. Preserve Ethernet SSH, logs,
-   independent USB Host and peripheral-mode OTG.
-2. AX900/AIC8800D80 Wi-Fi, Bluetooth discovery, 5 GHz AP and reboot recovery
-   passed the [board acceptance](board-acceptance-2026-10-21.md). XR819 is disabled.
-   Memory stress and cold-start timing remain later tasks.
-3. Implement and independently test Linux CarLife MD transport. Exercise AOA
-   requests 51/52/53, re-enumeration, bulk transfers, fragmentation, disconnects.
-   First use generated H.264 and PCM, then validate the actual Lexus head unit.
-4. Integrate the wireless CarPlay receiver before vehicle tests while the car is
-   unavailable. Build pinned OpenXPlay Relay and Stream as independent ARMv7
-   processes. Validate iPhone pairing and reception with the bounded media probe.
-   The local DiPlay identity pair has been found and verified; keep it private.
-5. Integrate bounded media queues, timestamps, audio roles, H.264 recovery and
-   Remote Touch/HID. Validate navigation, reconnects, microphone/calls separately.
-6. Optimize cold startup only after both protocol endpoints work reliably.
+当前基线和构建见[验证记录](validation.md)，各主题见[文档目录](README.md)。继续 Linux 主线：Rust CarLife MD、独立 OpenXPlay 接收端、Python 媒体桥接；Android 4.4 暂不并行维护。
 
-Current code implements bounded wire framing, 4.1 base handshake, CarLife 2.0
-digest verification, loopback TCP lab and temporary FunctionFS AOA1 USB.
-Synthetic H.264/PCM playback passed on the real Android HU app; see the
-[media acceptance](carlife-media-2026-10-21.md). CarPlay video/audio reception has passed. The live bridge and boot profile are
-implemented for CI validation; see [receiver operation](../receiver/README.md) and the
-[hardware reception record](carplay-acceptance-2026-10-22.md). Resume Lexus acceptance
-after hardware bridge acceptance and vehicle access are available.
-See [live forwarding](live-forwarding.md) and [boot optimization](boot-optimization.md).
+## 优先级与验收
 
-Implementation choice: Rust for the headless application, Python for host-side
-test fixtures. Keep app deployment independent of kernel/image builds.
+1. **Lexus CarLife 复验**：保存从点火到连接、首次失败和一次重试的完整日志，定位 AOA、bulk、协议版本、STATISTIC_INFO、接受通知与 INIT/START。按阶段决定是否需要应用层握手超时恢复。
+2. **Remote Touch 实车**：记录原始相对位移和按键，校准焦点方向、步长、双击和机械确认去重。当前触屏和合成触控板用例已通过。
+3. **稳定性与启动**：三次冷启动、一小时音乐/导航、退出重连、断电日志保留、Wi-Fi/蓝牙共存、内存与 SD 稳定性；单独记录 bootloader、系统就绪、首帧和首音时间。
+4. **电话与麦克风**：独立完成 CarLife 语音角色/输入协商，再验证 Siri、通话及媒体恢复。
+5. **继续性能优化**：在现有 30 fps 基线上测量完整缓存和消费速度，再决定进程内音频解码或自适应负载方案；详细参考见[性能文档](performance.md)。
 
-Local reference snapshots (protocol facts and architecture, not bundled sources):
+## 本地参考版本
 
-- `Carlife_on_box` `d9397d90a1f32670f034eb07cdbe28d887a179d8`: native MD protocol and session handling.
-- `headswap` `99e888cf546ec5f040d4de377c59b478186afd5b`: protocol framing, version handshake and independent HU tools.
-- `catplay` `bc6edae49554f2d0160b18ed18fc7b7376353115`: Rust CarPlay receiver architecture; integration follows CarLife.
-- [AOA 1.0 specification](https://source.android.com/docs/core/interaction/accessories/aoa).
-- [Linux FunctionFS documentation](https://docs.kernel.org/usb/functionfs.html).
+| 项目 | 提交 | 用途 |
+| --- | --- | --- |
+| OpenXPlay Relay | `6a7cdab585113e29422f2306e90fdb5a789c318a` | 当前接收端；构建锁定以 sources.lock.json 为准 |
+| OpenXPlay Stream | `356a3f56c0e0b4e839b91387bf2b8cfa0b0a8537` | OXP 输出 |
+| DiPlay 用户分支 | `9b26935f36c32417811eb6319511c3050ba35252` | 媒体直通、音频和隐藏 OEM 入口 |
+| CarProjection | `4241e52361af09fe58a82bf54ddde4903c46b543` | 旧协议、Lexus Remote Touch |
+| HeadSwap | `99e888cf546ec5f040d4de377c59b478186afd5b` | 组帧、握手和输出负载 |
+| Carlife_on_box | `d9397d90a1f32670f034eb07cdbe28d887a179d8` | MD/HU 台架和状态处理 |
+| catplay | `bc6edae49554f2d0160b18ed18fc7b7376353115` | Linux 接收、时钟及音频架构 |
 
-Armbian support status and configuration:
+[AOA 1.0](https://source.android.com/docs/core/interaction/accessories/aoa)、[Linux FunctionFS](https://docs.kernel.org/usb/functionfs.html) 为 USB 实现依据。Armbian 框架与配置固定于 sources.lock.json；内核分支、APT 软件包的解析结果随当次构建记录保留。
 
-- [Orange Pi Zero community board](https://github.com/armbian/build/blob/5eda7293bab43a581de02f769139848b6e922328/config/boards/orangepizero.csc)
-- [ARM sunxi kernel/bootloader selection](https://github.com/armbian/build/blob/5eda7293bab43a581de02f769139848b6e922328/config/sources/families/include/sunxi_common.inc)
-- [Native driver and gadget config](https://github.com/armbian/build/blob/5eda7293bab43a581de02f769139848b6e922328/config/kernel/linux-sunxi-current.config)
-
-The framework commit is fixed, but source branch heads and apt repositories may
-advance. Preserve each build's resolved versions and logs. Do not describe the
-build as bit-for-bit reproducible without also pinning those inputs.
+参考仓库位于忽略的 research/repos/，厂商资料和原始媒体不进入公开仓库。

@@ -1,9 +1,8 @@
 # WuKongPi Hi-Zero H3 hardware baseline
 
 Target: the user's WuKongPi Hi-Zero / H3 Zero, 512 MiB, XR819 onboard Wi-Fi,
-RTL8821CU Wi-Fi/Bluetooth module on the board's USB-A connector, Ethernet
-connected directly to the development PC. Hardware operation is **not yet
-validated** by this firmware preparation.
+AX900/AIC8800D80 Wi-Fi/Bluetooth module on the board's USB-A connector, Ethernet
+connected directly to the development PC. Hardware, USB and phone bench checks are recorded in [validation](../docs/validation.md). XR819 was disabled after AIC Wi-Fi, Bluetooth and AP acceptance.
 
 ## Evidence and local documents
 
@@ -47,8 +46,7 @@ This project therefore does not duplicate that patch.
 The old vendor configuration also used `SYS_CLK_FREQ=480000000`; current
 H3 U-Boot defaults to 1008000000. Armbian's board patch selects the vendor's
 480 MHz bootloader CPU setting. Linux CPU frequency policy is separate.
-Actual 512 MiB detection, repeated cold boot, and memory stability remain
-required hardware checks before increasing the DRAM clock.
+The board reports MemTotal=501244 KiB, consistent with the 512 MiB model. Repeated cold boots and memory stress remain follow-up checks before any DRAM clock increase.
 
 Armbian is pinned to
 [`5eda7293bab43a581de02f769139848b6e922328`](https://github.com/armbian/build/tree/5eda7293bab43a581de02f769139848b6e922328).
@@ -66,17 +64,17 @@ gate runs during compilation.
 | Function | Schematic / vendor DTS | Baseline requirement |
 | --- | --- | --- |
 | USB Type-C | USB0 D+/D−; CC1/CC2 have 5.1 kOhm pull-downs; PG12/USB0-ID has a 10 kOhm pull-up | Keep USB0 in `peripheral` mode for the car-facing gadget; the vendor DTS already matches PG12 |
-| USB-A | USB1, 5 V VBUS from the board rail | Enable EHCI/OHCI1 for RTL8821CU independently of USB0 |
+| USB-A | USB1, 5 V VBUS from the board rail | Enable EHCI/OHCI1 for AX900/AIC8800D80 independently of USB0 |
 | Expansion USB | 13-pin pins 3/4 are USB2 D−/D+; pins 5/6 USB3 D−/D+; pins 1/2 are 5 V/GND | `usbhost2`/`usbhost3` overlays are only needed for these extra connectors |
 | Ethernet | H3 internal EPHY, magnetics and RJ45; no external PHY IC | `emac` enabled, `phy-mode="mii"`, `phy-handle=<&int_mii_phy>` |
 | SD | SD0, card detect PF6 | `mmc0` 4-bit with PF6 active-low card detect |
 | CPU supply | PL6 switches the regulator's voltage selection | Retain the existing 1.1/1.3 V CPU regulator mapping |
-| XR819 | SDIO1; PA20 power-enable and PL7 reset | Vendor mapping agrees with Orange Pi Zero; keep separate from RTL8821CU selection |
+| XR819 | SDIO1; PA20 power-enable and PL7 reset | Vendor mapping agrees with Orange Pi Zero; keep separate from AX900/AIC8800D80 selection |
 | Debug UART | UART0 on dedicated three-pin connector | 3.3 V TTL, 115200 8N1; never use RS-232 voltage levels |
 
 The vendor DTS and current Orange Pi Zero DTS both set USB0
 `dr_mode="peripheral"`; no speculative change to `otg` is necessary.
-USB Host1 can operate while USB0 is a device, so RTL8821CU does not consume
+USB Host1 can operate while USB0 is a device, so AX900/AIC8800D80 does not consume
 the car-facing gadget port. The Type-C VBUS and USB-A supply share the
 board's 5 V rail in the schematic: do not assume source isolation or
 backfeed protection when planning external power injection.
@@ -86,12 +84,6 @@ and must be disabled or explicitly unbound before the AOA implementation
 claims it. Network/SSH diagnostics remain available over the direct
 Ethernet connection; this does not require gadget Ethernet or a USB hub.
 
-## What remains unverified
+## Hardware follow-up
 
-No image has been booted as part of this inspection. Required acceptance:
-512 MiB detection, stable SD I/O and cold starts, Ethernet link and an
-address on the PC connection, USB-A RTL8821CU enumeration, Bluetooth
-firmware/controller availability, 5 GHz AP capability and stability,
-USB0 UDC enumeration, and simultaneous Host1 plus USB0 peripheral use.
-An existing image filename, a DTS path in `boot-validation.txt`, or a
-successful patch check establishes none of these hardware outcomes.
+Ethernet, simultaneous USB Host/Device, AOA, AIC Wi-Fi/Bluetooth/AP and software reboot recovery passed the recorded bench checks. Remaining work is repeated cold starts, memory/SD stress and Lexus vehicle acceptance; see [validation](../docs/validation.md).

@@ -14,7 +14,7 @@ process. Preserve the upstream notices and attribution when distributing it.
 Install the `carplay-armv7` artifact under `/usr/local/lib/carlink/carplay`, restore
 execute permissions on `bin/*`, `probe.py` and `run-carplay.sh`, and install
 `run-carplay.sh` as `/usr/local/bin/carlink-carplay`. The firmware build performs
-these steps automatically. Receiver startup is manual.
+these steps automatically. The combined carlink.service starts the receiver automatically when local identity files are present. Stop that service before running standalone probe/web commands.
 
 The local identity directory is `/var/lib/carlink/carplay/mfi`, containing
 `identity.pk8` and `certificate.p7b`. Keep directory mode 0700 and file mode 0600.

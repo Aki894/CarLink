@@ -1,7 +1,7 @@
 # CarLink native application
 
 Dependency-free Rust binary: **`carlink`**, targeting ARMv7 H3 boards.
-CarLife MD development comes first; CarPlay integration follows it.
+The CarLife MD process is connected to the independent CarPlay receiver; see the [runtime guide](../docs/live-forwarding.md).
 
 ## CarLife transport and synthetic media
 
@@ -17,8 +17,8 @@ CarLife 2.0 challenges are answered from the actual transmitted MD_INFO and HU
 nonce using the public digest profile. Explicit HU rejection stops the session;
 some HUs return acceptance while others proceed directly to video negotiation.
 legacy RSA challenges and encrypted media exit with a diagnostic error. The
-separate USB peer acceptance notice follows metadata exchange and a calculated
-challenge response, with no private identity material required.
+separate USB peer acceptance notice is sent once after STATISTIC_INFO, independently
+of HU_INFO and challenge response; no private identity material is required.
 
 ```sh
 # Generate assets on the development PC (FFmpeg required), then transfer the
@@ -36,7 +36,7 @@ test picture and tone, keeping video heartbeats. RESET restarts video from
 SPS/PPS+IDR with its mode preserved. HU music STOP remains latched through video
 pause/resume. USB media queues are bounded; obsolete queued media is discarded
 and dropped video recovers from a keyframe. Timestamps are relative monotonic
-milliseconds. These are development assets, pending a live CarPlay media source.
+milliseconds. These are opt-in development assets; production uses the live CarPlay source.
 
 ```sh
 # Requires pyusb + libusb-package; keep generated captures out of Git.
@@ -46,7 +46,7 @@ ffmpeg -v error -xerror -i .build/media-capture/received.h264 -f null -
 
 USB creates a temporary AOA1 FunctionFS gadget, handles requests 51/52/53 and
 re-enumerates as `18d1:2d00`. It only owns `carlink-md`, refuses a busy UDC and
-cleans up on completion. Use wired SSH during USB tests. No boot service is installed.
+cleans up on completion. Use wired SSH during USB tests. The CLI owns only this temporary gadget; normal automatic startup is managed by carlink.service.
 
 TCP is a loopback-only development transport carrying USB-style outer framing,
 not the CarLife wireless protocol. Use SSH forwarding for board tests.
@@ -63,9 +63,7 @@ used for independent HU fixtures. Sources and next steps: [roadmap](../docs/road
 ## Read-only inventory
 
 ```sh
-cargo test --locked --manifest-path app/Cargo.toml
-cargo build --release --locked --manifest-path app/Cargo.toml
-./app/target/release/carlink doctor --json
+carlink doctor --json
 ```
 
 CI builds `armv7-unknown-linux-gnueabihf` with Ubuntu 24.04's ARM cross linker,
