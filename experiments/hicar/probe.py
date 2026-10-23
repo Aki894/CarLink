@@ -140,7 +140,7 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                             log('authentication_reply', session=session, size=len(reply))
                 except AuthError as error:
                     log('auth_parse_stopped', session=session, reason=str(error))
-                    auth_stream = None
+                    return  # Close a failed authentication session; do not leave a live socket.
             if parsing:
                 try:
                     for frame in decoder.feed(data):
