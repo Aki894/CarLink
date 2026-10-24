@@ -46,6 +46,9 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(manifest['app_sha256'], hashlib.sha256((self.app / 'carlink').read_bytes()).hexdigest())
         self.assertTrue((self.image / 'usr/local/bin/carlink-carplay').is_file())
         self.assertEqual(list((self.image / 'var/lib/carlink/carplay/mfi').iterdir()), [])
+        if (self.app/'share').is_dir():
+            self.assertTrue(manifest['app_notices'])
+            self.assertTrue((self.image/'usr/local/lib/carlink/app/share/licenses/rust/SOURCE.json').is_file())
 
     def test_corrupt_receiver_rejected_before_install(self):
         (self.receiver / 'probe.py').write_bytes(b'changed')

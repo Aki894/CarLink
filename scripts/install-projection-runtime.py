@@ -95,6 +95,13 @@ def install(project, app, receiver, rootfs):
     for src, name in ((app / 'carlink', 'carlink'), (receiver / 'run-carplay.sh', 'carlink-carplay'), (receiver / 'run-carlink.sh', 'carlink-run')):
         shutil.copyfile(src, bindir / name)
         (bindir / name).chmod(0o755)
+    app_destination=(rootfs/'usr/local/lib/carlink/app').resolve()
+    if not app_destination.is_relative_to(rootfs):
+        raise ValueError('Application source destination escapes image root')
+    if app_destination.exists():
+        shutil.rmtree(app_destination)
+    if (app/'share').is_dir():
+        shutil.copytree(app,app_destination)
     for name in ('var/lib/carlink/carplay', 'var/lib/carlink/carplay/mfi'):
         directory = rootfs / name
         directory.mkdir(parents=True, exist_ok=True)
@@ -102,6 +109,7 @@ def install(project, app, receiver, rootfs):
     manifest.update(project_commit=os.environ['REFRESH_COMMIT'], sources=lock,
                     app_source_commit=os.environ['APP_COMMIT'], app_run_id=os.environ['APP_RUN_ID'],
                     app_sha256=hashlib.sha256((app / 'carlink').read_bytes()).hexdigest(),
+                    app_notices=(app/'share').is_dir(),
                     carplay_receiver=source, stage='CarLife MD and separate ARMv7 CarPlay receiver')
     (rootfs / 'etc/carlink-build.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print('CI application and CarPlay runtime installed after checksum, ARM ABI and source validation')

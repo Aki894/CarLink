@@ -51,6 +51,12 @@ jobs:
           cmake --build .build/hicar-native-host --parallel 4
           python3 experiments/hicar/native/test_library.py .build/hicar-native-host/libcarlink_hichain.so
           python3 experiments/hicar/native/test_pake.py .build/hicar-native-host/libcarlink_hichain.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hicar-auth-host-test
+          path: .build/hicar-native-host/libcarlink_hichain.so
+          if-no-files-found: error
+          retention-days: 14
       - name: Cross compile and package ARMv7 authentication library
         run: |
           cmake -S experiments/hicar/native -B .build/hicar-native-armhf -G Ninja \
@@ -61,12 +67,14 @@ jobs:
           cp .build/hicar-native-armhf/libcarlink_hichain.so dist/hicar-auth/
           cp -L /usr/lib/arm-linux-gnueabihf/libmbedcrypto.so.7 dist/hicar-auth/lib/
           cp -L /usr/lib/arm-linux-gnueabihf/libcjson.so.1 dist/hicar-auth/lib/
+          cp -L /usr/lib/arm-linux-gnueabihf/libcrypto.so.3 dist/hicar-auth/lib/
           cp experiments/hicar/native/sources.json dist/hicar-auth/
           for name in deviceauth huks securec; do
             cp ".build/hicar-native-deps/$name/LICENSE" "dist/hicar-auth/licenses/$name.txt"
           done
           cp /usr/share/doc/libmbedcrypto7/copyright dist/hicar-auth/licenses/mbedtls.txt
           cp /usr/share/doc/libcjson1/copyright dist/hicar-auth/licenses/cjson.txt
+          cp /usr/share/doc/libssl3/copyright dist/hicar-auth/licenses/openssl.txt
           arm-linux-gnueabihf-readelf -h dist/hicar-auth/libcarlink_hichain.so > dist/hicar-auth/elf-header.txt
           grep -q 'Machine:.*ARM' dist/hicar-auth/elf-header.txt
           (cd dist/hicar-auth && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
@@ -76,6 +84,24 @@ jobs:
           path: dist/hicar-auth/
           if-no-files-found: error
           retention-days: 14
+  rust-interop:
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install matching ARM runtime and host native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user gcc-arm-linux-gnueabihf libmbedcrypto7 libcjson1
+      - uses: actions/download-artifact@v4
+        with:
+          name: hicar-auth-armv7-experimental
+          path: dist/hicar-auth
+      - uses: actions/download-artifact@v4
+        with:
+          name: hicar-auth-host-test
+          path: .build/hicar-native-host
       - uses: actions/download-artifact@v4
         with:
           name: carlink-armv7
@@ -86,12 +112,12 @@ jobs:
         run: |
           (cd .build/hicar-rust-arm && sha256sum -c SHA256SUMS)
           chmod +x .build/hicar-rust-arm/carlink
-          export CARLINK_RUST_RUNNER="$(python3 -c 'import json,os; print(json.dumps(["qemu-arm","-L","/usr/arm-linux-gnueabihf","-E","LD_LIBRARY_PATH="+os.getcwd()+"/dist/hicar-auth/lib:/usr/lib/arm-linux-gnueabihf"]))')"
+          export CARLINK_RUST_RUNNER="$(python3 -c 'import json,os; print(json.dumps(["qemu-arm","-L","/usr/arm-linux-gnueabihf","-E","LD_LIBRARY_PATH="+os.getcwd()+"/dist/hicar-auth/lib:/usr/arm-linux-gnueabihf/lib"]))')"
           python3 scripts/test-hicar-rust.py .build/hicar-rust-arm/carlink
           python3 scripts/test-hicar-rust-auth.py .build/hicar-rust-arm/carlink \
             .build/hicar-native-host/libcarlink_hichain.so dist/hicar-auth/libcarlink_hichain.so
   firmware:
-    needs: native
+    needs: [native, rust-interop]
     uses: ./.github/workflows/refresh-image.yml
     with:
       base_run_id: '39459953269'

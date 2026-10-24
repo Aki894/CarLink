@@ -28,6 +28,8 @@ for name, value in required.items():
 shutil.copytree(root / "firmware/userpatches", builder / "userpatches", dirs_exist_ok=True)
 overlay = builder / "userpatches/overlay"
 shutil.copyfile(binary, overlay / "carlink")
+if (binary.parent/'share').is_dir():
+    shutil.copytree(binary.parent,overlay/'carlink-app',dirs_exist_ok=True)
 receiver = json.loads((carplay / "SOURCE.json").read_text())
 for key in ["rust", "target", "relay", "stream"]:
     if receiver[key] != lock["carplay"][key]:
@@ -51,6 +53,7 @@ manifest = {
     "project_commit": subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip(),
     "sources": lock,
     "app_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+    "app_notices": (binary.parent/'share').is_dir(),
     "carplay_receiver": receiver,
     "stage": "CarLife MD and separate ARMv7 CarPlay receiver; hardware acceptance in progress",
     "reproducibility": "Framework pinned; resolved kernel/bootloader revisions and package versions remain build-time inputs. See Armbian build logs.",

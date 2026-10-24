@@ -60,6 +60,12 @@ sudo udevadm settle
 sudo mount -o ro "${loop}p1" "$mountdir"
 test -f "$mountdir/boot/boot.scr"
 test -f "$mountdir/etc/carlink-build.json"
+if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("app_notices") else 1)' "$mountdir/etc/carlink-build.json"; then
+    test -s "$mountdir/usr/local/lib/carlink/app/share/licenses/rust/SOURCE.json"
+    test -s "$mountdir/usr/local/lib/carlink/app/share/source/rust/Cargo.lock"
+    (cd "$mountdir/usr/local/lib/carlink/app" && sha256sum -c SHA256SUMS)
+    cmp "$mountdir/usr/local/bin/carlink" "$mountdir/usr/local/lib/carlink/app/carlink"
+fi
 test -x "$mountdir/usr/local/bin/carlink"
 if [[ "$mode" == current ]]; then
 test -x "$mountdir/usr/local/bin/carlink-carplay"

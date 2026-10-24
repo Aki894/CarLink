@@ -2,6 +2,10 @@
 set -euo pipefail
 [[ "${3:-}" == orangepizero ]] || { echo 'Unexpected board' >&2; exit 1; }
 install -m 0755 /tmp/overlay/carlink /usr/local/bin/carlink
+if [[ -d /tmp/overlay/carlink-app ]]; then
+    mkdir -p /usr/local/lib/carlink/app
+    cp -a /tmp/overlay/carlink-app/. /usr/local/lib/carlink/app/
+fi
 install -m 0644 /tmp/overlay/carlink-build.json /etc/carlink-build.json
 mkdir -p /usr/local/lib/carlink/carplay
 cp -a /tmp/overlay/carplay/. /usr/local/lib/carlink/carplay/
