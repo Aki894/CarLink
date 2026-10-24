@@ -60,6 +60,14 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         old.emit(b'old', 1000)
         self.assertEqual(len(b.link.frames), 1)
 
+    async def test_same_speaker_ssrc_change_keeps_decoder(self):
+        frame = dict(stream=1003, rate=48000, channels=2, data=b'ADTS')
+        self.bridge.audio(frame, 1000, 1)
+        decoder = self.bridge.decoder
+        self.bridge.audio(dict(frame, stream=66539), 2000, 1)
+        self.assertIs(self.bridge.decoder, decoder)
+        self.assertEqual(len(decoder.frames), 2)
+
     async def test_input_focus_and_normalized_touch_encrypted(self):
         packets = []
         class Writer:

@@ -172,6 +172,15 @@ def packet(sequence, data=None, timestamp=100, stream=1):
 
 
 class AudioMediaTests(unittest.TestCase):
+    def test_usage_bits_do_not_split_one_rtp_sequence(self):
+        audio = Audio()
+        for sequence, raw_ssrc in enumerate((0x1003eb, 0x1103eb, 0x103eb, 0x3eb, 0x43eb)):
+            frames = audio.receive(packet(sequence, stream=raw_ssrc))
+            self.assertEqual(len(frames), 1)
+            self.assertEqual(frames[0]['stream'], 1003)
+        self.assertEqual(len(audio.streams), 1)
+        self.assertEqual((audio.frames, audio.lost), (5, 0))
+
     def test_adts_batch_and_rtp_timestamp_is_not_dedup_key(self):
         raw = aac_frame()
         self.assertEqual(adts_frames(raw+raw), [(raw,48000,2,1024)]*2)

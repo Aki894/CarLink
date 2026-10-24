@@ -105,7 +105,10 @@ class Bridge:
     def audio(self, frame, pts, generation):
         if self.closed:
             return
-        fmt = (generation, frame['stream'], frame['rate'], frame['channels'])
+        # One negotiated speaker service carries several RTP SSRC values.
+        # They are transport lanes, not a request to recreate the AAC player.
+        # Reset on a service generation or actual format change instead.
+        fmt = (generation, frame['rate'], frame['channels'])
         if fmt != self.audio_format or self.decoder and self.decoder.failed:
             self.audio_stop()
             epoch = self.audio_epoch

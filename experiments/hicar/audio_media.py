@@ -61,6 +61,10 @@ class Audio:
 
     def receive(self, packet):
         sequence, timestamp, stream, frames = rtp_audio(packet)
+        # DMSDP packs usage metadata into the upper SSRC bits. Its native
+        # OnRTPData masks with 0xfff before looking up the sequence/reorder
+        # state. Treating usage changes as new sources invents packet loss.
+        stream &= 0xfff
         if stream not in self.streams:
             if len(self.streams) >= 8:
                 raise ProtocolError('too many audio streams')
