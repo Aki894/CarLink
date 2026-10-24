@@ -12,6 +12,8 @@ R1 的 73 项 Rust 单测、1,700 项差分、混合认证和已有身份只读�
 
 板端接收端已热更新为 `9b14895`：蓝牙 Alias、5 GHz 热点 SSID、CarPlay 的 iAP2/AirPlay/mDNS 名称统一为 **CarLink**；HiCar 默认身份名、BLE LocalName、热点 SSID 与设备信息名也统一为 **CarLink**。热点位于 CN channel 149 / 5745 MHz，服务 active、NRestarts=0，有线 `end0` 管理保持可用。HiCar 新广播在 H3 上成功注册并正常退出，三份已有身份改名后 PIN 和硬件种子一致。
 
+用户随后在 iPhone 上连接改名后的 CarLink，确认 CarPlay 画面和声音正常。
+
 生产 CarLife 二进制继续使用下表的已验证版本；R1 新二进制在独立临时路径通过板端测试。接收端回滚目录为 `/var/backups/carlink/receiver-20261024T192132Z/runtime`，部署收据为 `/etc/carlink-receiver-deploy.json`。静态主机名 `carlink-h3` 保持作为内部管理标识，用户可见的 pretty hostname 为 CarLink；协议认证用的 MAC、model ID、USB/AOA 标识保持原值。
 
 
