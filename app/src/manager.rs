@@ -48,7 +48,7 @@ fn save(path:&Path,store:&Store)->Result<()>{
 }
 #[derive(Clone,Serialize)]
 struct Status{schema:u32,generation:u64,protocol:Option<Protocol>,target:Option<Device>,active:bool,pairing:bool,paused:bool,
-    carlife_pid:Option<u32>,backend_pid:Option<u32>,last_error:Option<String>}
+    carlife_pid:Option<u32>,backend_pid:Option<u32>,usb_connected:bool,last_error:Option<String>}
 fn event(name:&str){println!("{}",json!({"event":name}));}
 struct Process{child:Child,pgid:i32,events:Receiver<Value>,generation:u64}
 fn spawn(args:&[String],generation:u64)->Result<Process>{
@@ -62,7 +62,8 @@ fn spawn(args:&[String],generation:u64)->Result<Process>{
         loop{let mut line=vec![];let read=std::io::Read::by_ref(&mut reader).take(16385).read_until(b'\n',&mut line);
             if !matches!(read,Ok(n) if n>0){break;}if line.len()>16384{break;}
             if let Ok(v)=serde_json::from_slice::<Value>(&line){
-                if matches!(v["event"].as_str(),Some("stage"|"retry"|"forward_latency"|"bridge_stats"|"hisight_closed"|"target_selected"|"ready"|"session_error")){
+                if matches!(v["event"].as_str(),Some("stage"|"retry"|"forward_latency"|"bridge_stats"|"hisight_closed"|"target_selected"|"ready"|"session_error"))
+                    ||v["event"]=="carlife_state"&&v["detail"]=="AwaitingVideoSource"{
                     let _=tx.try_send(v);
                 }
             }
@@ -102,7 +103,7 @@ impl Owner{
         for d in &config.devices{if !store.devices.iter().any(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address)){store.devices.push(d.clone());}}
         if store.devices.len()>8{return Err("too many configured devices".into());}
         let paused=store.paused;
-        Ok(Self{config,store,status:Status{schema:1,generation:0,protocol:None,target:None,active:false,pairing:false,paused,carlife_pid:None,backend_pid:None,last_error:None},
+        Ok(Self{config,store,status:Status{schema:1,generation:0,protocol:None,target:None,active:false,pairing:false,paused,carlife_pid:None,backend_pid:None,usb_connected:false,last_error:None},
             life:None,backend:None,choice:None,started:Instant::now(),ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0})
     }
     fn automatic(&self)->Option<Choice>{
@@ -172,11 +173,11 @@ impl Owner{
         }
         let ready=match self.status.protocol{
             Some(Protocol::Carplay)=>name=="stage"&&v["stage"]=="WirelessActive",
-            Some(Protocol::Hicar)=>name=="bridge_stats"&&v["active"]==true&&v["connected"]==true&&v["video_frames"].as_u64().unwrap_or(0)>0,
+            Some(Protocol::Hicar)=>name=="bridge_stats"&&v["active"]==true&&v["video_frames"].as_u64().unwrap_or(0)>0,
             None=>false,
         };
         if ready {if self.ready.is_none(){self.ready=Some(Instant::now());}self.status.active=true;}
-        if name=="forward_latency"&&v["sent"].as_u64().unwrap_or(0)>0||name=="bridge_stats"&&v["video_frames"].as_u64().unwrap_or(0)>0{self.seen_media=true;}
+        if name=="forward_latency"&&v["sent"].as_u64().unwrap_or(0)>0||name=="bridge_stats"&&v["connected"]==true&&v["video_frames"].as_u64().unwrap_or(0)>0{self.seen_media=true;}
         if name=="stage"&&v["stage"]=="ConnectingBluetooth"{
             if let Some(address)=v["address"].as_str().filter(|s|mac(s)){
                 if self.status.pairing {self.status.target=Some(Device{protocol:Protocol::Carplay,address:address.to_uppercase(),name:"iPhone".into(),auto:true,last_used:0});}
@@ -209,11 +210,12 @@ impl Owner{
         }Ok(json!({"ok":true,"status":self.status}))
     }
     fn tick(&mut self)->Result<()>{
-        if let Some(life)=self.life.as_mut(){for v in life.events.try_iter().take(16){if v["event"]=="session_error"{
+        if let Some(life)=self.life.as_mut(){for v in life.events.try_iter().take(16){if v["event"]=="carlife_state"{self.status.usb_connected=true;}if v["event"]=="session_error"{
+            self.status.usb_connected=false;
             self.status.last_error=Some(v["detail"].as_str().unwrap_or("CarLife output failed").chars().take(256).collect());event("manager_carlife_error");
         }}}
         if self.life.as_mut().is_some_and(|p|p.child.try_wait().ok().flatten().is_some()){
-            self.life=None;self.status.carlife_pid=None;self.retry_at=Instant::now()+Duration::from_millis(500);event("manager_carlife_restart");
+            self.life=None;self.status.carlife_pid=None;self.status.usb_connected=false;self.retry_at=Instant::now()+Duration::from_millis(500);event("manager_carlife_restart");
             if fs::symlink_metadata(&self.config.live_socket).is_ok_and(|m|m.file_type().is_socket()){
                 fs::remove_file(&self.config.live_socket).map_err(|_|"cannot clear terminated CarLife endpoint")?;
             }

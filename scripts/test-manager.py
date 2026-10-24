@@ -36,7 +36,7 @@ try:
     elif role=='carplay':
         args=sys.argv[3:];address=args[args.index('--iphone')+1] if '--iphone' in args else '02:00:00:00:00:01'
         for v in [dict(event='stage',stage='ConnectingBluetooth',address=address),dict(event='stage',stage='WirelessActive'),dict(event='forward_latency',sent=30)]:print(json.dumps(v),flush=True)
-    elif role=='hicar':print(json.dumps(dict(event='bridge_stats',active=True,connected=True,video_frames=20)),flush=True)
+    elif role=='hicar':print(json.dumps(dict(event='bridge_stats',active=True,connected=scenario!='no-hu',video_frames=20)),flush=True)
     while not stopping:time.sleep(.02)
 finally:
     record('stop')
@@ -102,6 +102,12 @@ def check(binary):
             (root/'duplicate.json').write_text(json.dumps(duplicate));(root/'duplicate.json').chmod(0o600)
             other=subprocess.run([*runner,binary,'manager','run','--config',str(root/'duplicate.json')],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
             assert other.returncode!=0, 'second runtime acquired the same radio'
+            (root/'scenario').write_text('no-hu')
+            ctl(op='connect',protocol='hicar',address=hc['address'])
+            no_hu=until(lambda s:s['protocol']=='hicar' and s['active'])
+            time.sleep(2.5)
+            assert ctl(op='status')['status']['backend_pid']==no_hu['backend_pid'], 'missing HU stole the wireless source'
+            (root/'scenario').write_text('')
             for _ in range(3):
                 for protocol,device in [('hicar',hc),('carplay',cp)]:
                     ctl(op='connect',protocol=protocol,address=device['address'])
