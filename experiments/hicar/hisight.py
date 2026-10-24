@@ -38,6 +38,17 @@ class Session:
         self.setup_sequence = None
         self.sequence = 2
         self.on_plaintext = None
+        self.peer_teardown = False
+        self.teardown_sequence = None
+        self.teardown_acknowledged = False
+
+    def teardown(self):
+        if (not self.encrypted or not self.media_endpoint or self.peer_teardown
+                or self.teardown_sequence is not None):
+            return None
+        self.sequence += 1
+        self.teardown_sequence = self.sequence
+        return self.pack(message('TEARDOWN ' + self.target + ' RTSP/1.0', self.sequence))
 
     def request(self, method, headers=None):
         self.sequence += 1
@@ -138,6 +149,13 @@ class Session:
                     if parameters.get('his_trigger_method') == 'SETUP':
                         self.setup_sequence = self.request('SETUP', {
                             'Transport': 'RTP/AVP/UDP;unicast;client_port=0'})
+                    elif parameters.get('his_trigger_method') == 'TEARDOWN':
+                        self.peer_teardown = True
+                elif method == 'TEARDOWN':
+                    self.pending.append(self.pack(message('RTSP/1.0 200 OK', seq)))
+                    self.peer_teardown = True
+                elif method == 'RTSP/1.0' and seq == str(self.teardown_sequence):
+                    self.teardown_acknowledged = m.start.startswith('RTSP/1.0 200 ')
                 elif method == 'RTSP/1.0' and self.setup_sequence is not None and seq == str(self.setup_sequence):
                     if not m.start.startswith('RTSP/1.0 200 '):
                         raise ProtocolError('HiSight setup refused')
@@ -150,6 +168,32 @@ class Session:
                         self.input_endpoint = int(remote[1])
                     events.append(dict(media_port=self.media_endpoint))
         return events, plaintexts
+
+
+async def graceful_close(sock, session, log, timeout=1.0):
+    """Finish RTSP while the authenticated transport and media are still alive."""
+    record = session.teardown()
+    if record is None:
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        async with asyncio.timeout(timeout):
+            await loop.sock_sendall(sock, record)
+            log('hisight_teardown_sent')
+            received = 0
+            while not session.teardown_acknowledged and not session.peer_teardown and received < 65004:
+                data = await loop.sock_recv(sock, min(4096, 65004 - received))
+                if not data:
+                    break
+                received += len(data)
+                session.receive(data)
+                for reply in session.pending:
+                    await loop.sock_sendall(sock, reply)
+                session.pending.clear()
+            log('hisight_teardown_done', acknowledged=session.teardown_acknowledged,
+                peer_teardown=session.peer_teardown)
+    except (OSError, ProtocolError, UnicodeError, ValueError, asyncio.TimeoutError) as error:
+        log('hisight_teardown_stopped', error=type(error).__name__)
 
 
 async def receive(sock, key, capture_dir, log):
@@ -198,9 +242,12 @@ async def receive(sock, key, capture_dir, log):
             for reply in session.pending:
                 await asyncio.wait_for(loop.sock_sendall(sock, reply), 2)
             session.pending.clear()
+            if session.peer_teardown:
+                break
     except ProtocolError as error:
         log('hisight_parse_stopped', reason=str(error))
     finally:
+        await graceful_close(sock, session, log)
         if input_task:
             input_task.cancel()
             await asyncio.gather(input_task, return_exceptions=True)
@@ -209,10 +256,16 @@ async def receive(sock, key, capture_dir, log):
             await asyncio.gather(media_task, return_exceptions=True)
         if media_writer:
             media_writer.close()
-            await media_writer.wait_closed()
+            try:
+                await asyncio.wait_for(media_writer.wait_closed(), 1)
+            except (OSError, asyncio.TimeoutError):
+                pass
         if input_writer:
             input_writer.close()
-            await input_writer.wait_closed()
+            try:
+                await asyncio.wait_for(input_writer.wait_closed(), 1)
+            except (OSError, asyncio.TimeoutError):
+                pass
         session.cipher.close()
         for stream in (raw, plain):
             if stream:

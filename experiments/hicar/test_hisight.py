@@ -1,8 +1,10 @@
 import json
+import asyncio
+import socket
 import unittest
 from cipher import Cipher
 from control_wire import Decoder, Messages, Session as ControlSession, pack_frame
-from hisight import Session, message
+from hisight import Session, message, graceful_close
 from hisight_media import Depacketizer
 from hisight_input import Input
 from nearby_wire import ProtocolError, pack_uint, read_uint
@@ -129,3 +131,81 @@ class HiSightTests(unittest.TestCase):
             b'TimeServerPort: 49001\r\nTimeUsHigh: 1\r\nTimeUsLow: -1\r\n\r\n'))
         self.assertEqual(session.clock[0], (1 << 32) | 0xffffffff)
         self.assertEqual(len(session.take_pending()), 1)
+
+
+class HiSightCloseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_encrypted_teardown_ack_and_keepalive(self):
+        receiver, peer = socket.socketpair()
+        receiver.setblocking(False); peer.setblocking(False)
+        session = Session(bytes(range(16)))
+        session.encrypted = True; session.media_endpoint = 49000
+        cipher = Cipher(bytes(range(16)), 65001)
+        events = []
+        loop = asyncio.get_running_loop()
+        task = asyncio.create_task(graceful_close(receiver, session,
+            lambda event, **fields: events.append((event, fields)), timeout=1))
+        try:
+            wire = await asyncio.wait_for(loop.sock_recv(peer, 4096), 1)
+            self.assertEqual(int.from_bytes(wire[:4], 'big'), len(wire) - 4)
+            request = Messages('RTSP').feed(cipher.decrypt(wire[4:]))[0]
+            self.assertTrue(request.start.startswith('TEARDOWN '))
+            replies = b''
+            for text in (message('GET_PARAMETER * RTSP/1.0', 20),
+                         message('RTSP/1.0 200 OK', request.headers['cseq'])):
+                data = cipher.encrypt(text)
+                replies += len(data).to_bytes(4, 'big') + data
+            await loop.sock_sendall(peer, replies)
+            await task
+            self.assertTrue(session.teardown_acknowledged)
+            self.assertIn(('hisight_teardown_done', {'acknowledged': True, 'peer_teardown': False}), events)
+            self.assertIsNone(session.teardown())
+        finally:
+            task.cancel(); await asyncio.gather(task, return_exceptions=True)
+            receiver.close(); peer.close(); session.cipher.close(); cipher.close()
+
+    async def test_unresponsive_peer_does_not_block_cleanup(self):
+        receiver, peer = socket.socketpair()
+        receiver.setblocking(False)
+        session = Session(bytes(16))
+        session.encrypted = True; session.media_endpoint = 49000
+        events = []
+        try:
+            await asyncio.wait_for(graceful_close(receiver, session,
+                lambda event, **fields: events.append(event), timeout=0.02), 1)
+            self.assertIn('hisight_teardown_stopped', events)
+            self.assertFalse(session.teardown_acknowledged)
+        finally:
+            receiver.close(); peer.close(); session.cipher.close()
+
+    async def test_source_can_finish_with_its_own_teardown_trigger(self):
+        receiver, peer = socket.socketpair()
+        receiver.setblocking(False); peer.setblocking(False)
+        session = Session(bytes(16)); cipher = Cipher(bytes(16), 65001)
+        session.encrypted = True; session.media_endpoint = 49000
+        loop = asyncio.get_running_loop()
+        task = asyncio.create_task(graceful_close(receiver, session, lambda *a, **kw: None))
+        try:
+            await asyncio.wait_for(loop.sock_recv(peer, 4096), 1)
+            payload = cipher.encrypt(message('SET_PARAMETER * RTSP/1.0', 30,
+                                             b'his_trigger_method: TEARDOWN\r\n'))
+            await loop.sock_sendall(peer, len(payload).to_bytes(4, 'big') + payload)
+            await asyncio.wait_for(task, 1)
+            self.assertTrue(session.peer_teardown)
+            wire = await asyncio.wait_for(loop.sock_recv(peer, 4096), 1)
+            self.assertTrue(cipher.decrypt(wire[4:]).startswith(b'RTSP/1.0 200'))
+        finally:
+            task.cancel(); await asyncio.gather(task, return_exceptions=True)
+            receiver.close(); peer.close(); session.cipher.close(); cipher.close()
+
+    async def test_peer_teardown_is_acknowledged_without_echo(self):
+        session = Session(bytes(16)); cipher = Cipher(bytes(16), 65001)
+        session.encrypted = True; session.media_endpoint = 49000
+        try:
+            data = cipher.encrypt(message('SET_PARAMETER * RTSP/1.0', 9,
+                                          b'his_trigger_method: TEARDOWN\r\n'))
+            session.receive(len(data).to_bytes(4, 'big') + data)
+            self.assertTrue(session.peer_teardown)
+            self.assertTrue(cipher.decrypt(session.pending[0][4:]).startswith(b'RTSP/1.0 200'))
+            self.assertIsNone(session.teardown())
+        finally:
+            session.cipher.close(); cipher.close()

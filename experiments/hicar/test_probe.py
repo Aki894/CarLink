@@ -5,7 +5,7 @@ import socket
 import unittest
 import xml.etree.ElementTree as ET
 
-from probe import Advertisement, FE35, PeerAgent, Profile, beacon, observe, service_record
+from probe import Advertisement, FE35, PeerAgent, Profile, beacon, observe, service_record, close_tcp_streams
 from dbus_next import DBusError
 
 
@@ -52,6 +52,26 @@ class BeaconTests(unittest.TestCase):
 
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_media_finishes_before_underlying_transport_closes(self):
+        events = []
+        async def control():
+            try:
+                await asyncio.Future()
+            finally:
+                events.append('teardown-start')
+                await asyncio.sleep(0)
+                self.assertNotIn('transport-closed', events)
+                events.append('teardown-finished')
+        async def transport():
+            try:
+                await asyncio.Future()
+            finally:
+                events.append('transport-closed')
+        first, second = asyncio.create_task(control()), asyncio.create_task(transport())
+        await asyncio.sleep(0)
+        await asyncio.wait_for(close_tcp_streams({first}, {first, second}, set()), 1)
+        self.assertEqual(events, ['teardown-start', 'teardown-finished', 'transport-closed'])
+
     async def test_fragmented_stream_and_eof(self):
         receiver, sender = socket.socketpair()
         with contextlib.redirect_stdout(io.StringIO()) as output:

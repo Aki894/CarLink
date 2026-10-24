@@ -414,6 +414,21 @@ class Profile(ServiceInterface):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+async def close_tcp_streams(controls, clients, sockets):
+    # Control observers own the HiSight tasks. Let those send TEARDOWN before
+    # closing Nearby TCP, RFCOMM authentication, or the temporary hotspot.
+    first = list(controls)
+    for task in first:
+        task.cancel()
+    await asyncio.gather(*first, return_exceptions=True)
+    rest = [task for task in list(clients) if task not in first]
+    for task in rest:
+        task.cancel()
+    await asyncio.gather(*rest, return_exceptions=True)
+    for client in list(sockets):
+        client.close()
+
+
 async def run(args):
     payload = beacon(args.model, args.sequence)
     stop = asyncio.Event()
@@ -458,6 +473,7 @@ async def run(args):
     data_listener = data_task = None
     control_listener = control_task = None
     tcp_clients = set()
+    tcp_controls = set()
     tcp_sockets = set()
     controller_index = int(args.adapter.rsplit('hci', 1)[1])
     try:
@@ -512,10 +528,13 @@ async def run(args):
                                                                             '5014': False}))
                                                        if control else None))
                     tcp_clients.add(task)
+                    if control:
+                        tcp_controls.add(task)
                     tcp_sockets.add(client)
 
                     def completed(task, client=client):
                         tcp_clients.discard(task)
+                        tcp_controls.discard(task)
                         tcp_sockets.discard(client)
                         client.close()
                         if not task.cancelled() and task.exception():
@@ -594,6 +613,14 @@ async def run(args):
             await asyncio.gather(waiter, disconnected, return_exceptions=True)
     finally:
         stop.set()
+        for task in (tcp_task, data_task, control_task):
+            if task:
+                task.cancel()
+        await asyncio.gather(*(task for task in (tcp_task, data_task, control_task) if task),
+                             return_exceptions=True)
+        await close_tcp_streams(tcp_controls, tcp_clients, tcp_sockets)
+        await profile.close()
+        await business_profile.close()
         # Disconnecting the bus also removes all owned BlueZ registrations.
         for registered, manager, member, path in (
             (advertisement_registered, am, 'call_unregister_advertisement', ROOT + '/advertisement'),
@@ -605,20 +632,6 @@ async def run(args):
                     await asyncio.wait_for(getattr(manager, member)(path), 3)
                 except Exception as error:
                     log('unregister_error', error=type(error).__name__)
-        await profile.close()
-        await business_profile.close()
-        if tcp_task:
-            tcp_task.cancel()
-        if data_task:
-            data_task.cancel()
-        if control_task:
-            control_task.cancel()
-        for task in list(tcp_clients):
-            task.cancel()
-        for client in list(tcp_sockets):
-            client.close()
-        await asyncio.gather(*(task for task in (tcp_task, data_task, control_task) if task),
-                             *list(tcp_clients), return_exceptions=True)
         if tcp_listener:
             tcp_listener.close()
         if data_listener:
