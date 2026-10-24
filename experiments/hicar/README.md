@@ -60,7 +60,7 @@ PYTHONPATH=/var/tmp/hicar-python python3 probe.py --model "$HICAR_MODEL" \
   --tx-power 11 --sequence 3 --duration 300
 ```
 
-每个进程只初始化一个 HUKS 存储。设备身份、HUKS 文件与会话密钥均留在私有目录/内存中。原生回调先入队，再由业务通道发送；认证失败即关闭连接，避免双方错误包互相循环。实验已实现认证后的热点/TCP、DMSDP 控制端口协商、AES 控制与保活；时间同步、服务与媒体协商继续开发。实验不随生产镜像安装或自启。
+每个进程只初始化一个 HUKS 存储。设备身份、HUKS 文件与会话密钥均留在私有目录/内存中。原生回调先入队，再由业务通道发送；认证失败即关闭连接，避免双方错误包互相循环。实验已实现认证后的热点/TCP、DMSDP AES 控制、周期时钟、显示/扬声器服务和音视频接收。实验不随生产镜像安装或自启。
 
 ## 无线建链测试窗口
 
@@ -74,7 +74,11 @@ PYTHONPATH=/var/tmp/hicar-python python3 probe.py --model "$HICAR_MODEL" \
 
 `network_wire.py` 实现 kind 4 资源协商、kind 33 地址/参数交换和业务 20 的真实 TCP 端点。`dmsdp_wire.py` 分别实现无 flags TLV 的模块帧和 16 字节控制端口协商，包含长度、CRC、拆包及粘包检查。
 
-增加 `--dmsdp-options` 后，`control_wire.py` 主动发出 OPTIONS、核对 SET_PARAMETER 并按 CSeq 应答，随后处理加密控制帧与 GET_PARAMETER 保活。`cipher.py` 通过系统 OpenSSL EVP 实现逐帧 AES-128-CTR，使用认证会话密钥前 16 字节及每帧独立 IV。没有认证密钥时不提供 AES。普通服务参数和二进制业务目前只观察，时间同步、服务能力与媒体接收继续实现。
+增加 `--dmsdp-options` 后，`control_wire.py` 完成 AES 控制协商；双方各自每秒发送 GET_PARAMETER 心跳，收到心跳不回 200。所有控制写操作串行发送。`cipher.py` 通过系统 OpenSSL EVP 实现逐帧 AES-128-CTR，使用认证会话密钥前 16 字节及每帧独立 IV。收到时钟端口后自动进行加密 UDP 四时间戳采样，每 30 秒更新一次时钟映射。
+
+附加 `--audio` 启用实验 `speaker1` 服务。HarmonyOS 4.2 的 Simple 模式直接使用包含加密协商的 SETUP，RTP 端口开放、RTCP 端口设为 `-1`。`audio_wire.py` 校验服务握手与 AAC 参数，`audio_transport.py` 接收并解密 UDP，`audio_media.py` 提取 RTP 中的完整 ADTS 帧，按独立 SSRC 维护有界重排。相同 RTP 时间戳可以包含多个有效 AAC 帧，按样本偏移保留。
+
+指定私有 `--capture-dir` 时保存有界原始 UDP、解密记录、分流 `.aac` 和时间戳 `.jsonl`，文件权限为 0600；不指定时仅解析并统计。现有板载 `carlink-audio` 可通过管道解码 AAC 并转为 44.1 kHz 双声道 S16LE。实时送入 CarLife、导航/媒体混音和实际播放同步在下一阶段接入；麦克风与通话服务尚未声明。
 
 显式指定 `--capture-dir` 时，解密控制记录另存为原捕获路径加 `.plain`，每条为两字节大端长度与明文，权限 0600，受相同接收上限约束。该文件可能包含设备身份和应用信息，与原始捕获一样留在私有目录，不提交。正常日志仅输出方法、字段名称、公共数字能力和消息长度。
 
