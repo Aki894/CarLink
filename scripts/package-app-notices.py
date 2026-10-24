@@ -6,12 +6,14 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tomllib
 
 project=Path(__file__).resolve().parents[1]
 destination=Path(sys.argv[1]).resolve()
 version=os.environ['RUST_VERSION']
 metadata=json.loads(subprocess.check_output(['cargo','+'+version,'metadata','--locked','--format-version','1',
                     '--manifest-path',str(project/'app/Cargo.toml')],text=True))
+locked={(p['name'],p['version']):p for p in tomllib.loads((project/'app/Cargo.lock').read_text())['package']}
 notices=destination/'share/licenses/rust'
 source=destination/'share/source/rust'
 (source/'crates').mkdir(parents=True,exist_ok=True)
@@ -24,7 +26,7 @@ for package in metadata['packages']:
     manifest=Path(package['manifest_path'])
     name=package['name'];release=package['version'];identifier=name+'-'+release
     archive=manifest.parents[3]/'cache'/manifest.parents[1].name/(identifier+'.crate')
-    expected=json.loads((manifest.parent/'.cargo-checksum.json').read_text())['package']
+    expected=locked[(name,release)]['checksum']
     if hashlib.sha256(archive.read_bytes()).hexdigest()!=expected:
         raise ValueError('Rust source checksum differs from registry lock: '+name)
     shutil.copyfile(archive,source/'crates'/archive.name)
