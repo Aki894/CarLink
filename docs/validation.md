@@ -4,6 +4,11 @@
 
 下表保留正式部署的 CarPlay/CarLife 基线。最新 HiCar 实验已接入 CarLife 视频、AAC/PCM 和 UIBC，79 项测试通过；[完整构建 40105347479](https://github.com/Aki894/CarLink/actions/runs/40105347479)成功，镜像已下载并校验 ZIP 与压缩镜像清单。实测和产物摘要见 [HiCar 构建与实测](hicar.md)。下一阶段按 [Rust 迁移计划](hicar-rust.md)推进；HiCar 当前仍手动实验运行。
 
+## 2026-10-25：Rust R2 连接状态接入实机
+
+[应用构建 40127257815](https://github.com/Aki894/CarLink/actions/runs/40127257815)与[完整构建 40127675093](https://github.com/Aki894/CarLink/actions/runs/40127675093)成功。76 项 Rust 单测、1,700 项基础对照、184 组连接协商、3 组损坏 IPC 及跨实现认证通过；镜像已下载校验。Rust 真实既有配对认证、HiCar 桌面与输入已通过台架，连续 AAC/PCM 已建立，用户确认固定 CarLife 前台时一分钟稳定。详细计数、输出进程重拉记录和后续稳定性回归见 [R2 记录](hicar-rust.md)。正式开机服务仍保持原部署。
+
+
 ## 2026-10-25：Rust R1 与连接名称更新
 
 R1 的 73 项 Rust 单测、1,700 项差分、混合认证和已有身份只读验证见 [Rust 迁移记录](hicar-rust.md)。[改名版应用构建 40124305351](https://github.com/Aki894/CarLink/actions/runs/40124305351)成功，接收端 artifact `12572404057` 的 63 个成员、应用 artifact `12572199134` 的 68 个成员均已下载并校验。

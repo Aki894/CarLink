@@ -54,3 +54,28 @@ R1 已完成，源码位于 `app/src/hicar/`：有界增量帧解析、严格 JS
 - 实际已有身份文件已由 Rust 只读加载，硬件种子和派生身份与 Python 一致，文件校验值保持不变。
 
 R2 接入真实 BlueZ、Wi-Fi/TCP 会话和媒体桥接；R3 再统一双协议连接管理。当前 HiCar 无线会话继续由 Python 实验接收器运行，R1 二进制用于协议与认证验证。
+
+## R2 第一段：真实连接状态迁移（2026-10-25）
+
+新增 `app/src/hicar/session.rs`，将 Nearby 通道协商、FE36 端点响应、ResourceManager、热点凭据协商、业务身份握手及 HiChain 会话接入 Rust。`hicar session-worker FD` 通过继承的私有 Unix socket 与过渡适配器通信，读取既有身份文件及 HUKS 库；使用原持久化硬件种子初始化 HUKS，再按 model/MAC 派生签名身份。认证完成前不发送热点凭据，认证失败撤销授权，过期会话代次不影响新会话。
+
+临时适配器为 `experiments/hicar/rust_session.py`，由探针的 `--rust-session-binary` 显式启用。BlueZ 注册、socket 读写与帧边界、DMSDP/HiSight 控制及媒体目前仍在 Python；会话密钥只通过私有 IPC 交给现有媒体适配器，不进入 argv、stdout 或普通日志。正式开机服务保持原部署。
+
+实机修正了一处 R1 测试样本盲点：鸿蒙 4.2 请求中的 `version` 是手机版本 `14.2.0.400`，且省略 `discover_type`；设备响应才使用 `A_0`/`discover_type=1`。Rust 现在区分两者，并增加相同字段形状的合成回归。
+
+验证记录：
+
+- [应用构建 40127257815](https://github.com/Aki894/CarLink/actions/runs/40127257815)：76 项 Rust 单测、1,700 项基础协议对照、184 组连接状态对照及 3 组损坏 IPC 测试通过。
+- H3 与 CI QEMU 均通过私有 IPC 下的 Rust/Python 首配、持久化后 STS 重连、密钥一致、重复身份拒绝、认证前凭据隔离及过期代次检查；合成身份文件保持不变。
+- 最终版本实机使用原配对完成操作 17/18 的 STS 认证，随后建立 TCP 4005/4006/4007、HiSight 视频和输入通道。用户确认 HiCar 桌面显示、画面操作正常。
+- [完整构建 40127675093](https://github.com/Aki894/CarLink/actions/runs/40127675093)的 native、rust-interop、firmware 均成功，镜像校验与上传完成；artifact `12573769397` 已下载，ZIP SHA256 `7c8b6779482e0b56aed9d9c451ef39343c4bd40568744fd55834e04eb7484eb6`，包内镜像 SHA256 `e8c27a72f03d2a140fc8a44d2a5089cb2c1993ca817c1eba9ddf193f6c96c211`。
+
+R2 后续先迁移 DMSDP/HiSight 控制与媒体数据通路、AAC/PCM 和输入，再移除过渡适配器的 BlueZ 与网络管理。新增真实首配、重复重连与独立 HU 音频验收；R3 继续负责双协议统一仲裁与开机集成。
+
+### 最终台架采样与稳定性边界
+
+第 127 轮使用最终 `01bd418` 应用同时承担 Rust 认证后端和 CarLife USB 输出，未使用临时首包规范化代码。约 115 秒媒体采样记录 2,179 个视频单元、4,558 帧 AAC、4,861 个 PCM 块（571 个含非零数据）和 442 次输入，音频丢包/重复/拒绝计数均为 0。用户确认保持 CarLife 前台时新版一分钟内稳定。日志中无 USB 写错误，记录一次退出码 0 的 CarLife 输出进程退出及自动拉起；长时间和多次重连回归继续保留。
+
+此前第 125 轮在手机 App 切换过程中出现多次 USB bulk `ESHUTDOWN`；换旧输出做对照后，再用新版固定前台，连接恢复稳定。今后台架固定让 CarLife HU 留在前台，通过投屏界面或媒体会话操作源播放器。此次连续 AAC 与 PCM 建立已验证，同手机兼任 HiCar 源和 CarLife HU 的扬声器路由继续采用既有独立 HU 验收安排。
+
+本轮测试后已恢复正式 `carlink` 服务，NRestarts=0、`end0` 管理可用，临时 Rust worker 已退出，手机亮屏超时设置已恢复。正式 USB 输出和开机路径继续保留原部署。
