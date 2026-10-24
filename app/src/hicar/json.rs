@@ -67,7 +67,9 @@ pub fn envelope(data:&[u8],identity_seen:bool)->Result<(u64,Value)> {
     if !matches!(operation,1|3)||operation==3&&!identity_seen{return Err("invalid auth sequence".into());}
     let inner=parse(map.get("data").and_then(Value::as_str).ok_or("auth data must be JSON text")?.as_bytes())?;
     if !inner.is_object(){return Err("auth body must be object".into());}
-    if operation==1 {let id=inner.get("deviceId").and_then(Value::as_str).ok_or("peer identity absent")?;
+    if operation==1 {
+        if identity_seen||inner.get("usb_connection").is_some_and(|v|v!=&Value::Bool(false)){return Err("invalid wireless identity handshake".into());}
+        let id=inner.get("deviceId").and_then(Value::as_str).ok_or("peer identity absent")?;
         if id.is_empty()||id.len()>64{return Err("peer identity outside limit".into());}}
     Ok((operation,inner))
 }

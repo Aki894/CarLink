@@ -51,6 +51,7 @@ jobs:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
         run: |
           cargo +"$RUST_VERSION" test --locked --manifest-path app/Cargo.toml
+          python3 scripts/test-hicar-rust.py app/target/debug/carlink
           cargo +"$RUST_VERSION" run --quiet --locked --manifest-path app/Cargo.toml -- doctor --json > /tmp/carlink-doctor.json
           python3 -c 'import json; d=json.load(open("/tmp/carlink-doctor.json")); assert d["schema_version"] == 1; assert d["aoa"]["status"] == "not_tested"'
           cargo +"$RUST_VERSION" build --release --locked --manifest-path app/Cargo.toml --target "$TARGET"
