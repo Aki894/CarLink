@@ -37,10 +37,12 @@ class HiSightTests(unittest.TestCase):
         def deliver(payload):
             data = peer.encrypt(payload)
             return session.receive(len(data).to_bytes(4, 'big') + data)[0]
-        deliver(message('GET_PARAMETER * RTSP/1.0', 2, b'his_video_formats\r\nhis_vtp\r\n'))
+        deliver(message('GET_PARAMETER * RTSP/1.0', 2,
+                        b'his_video_formats\r\nhis_vtp\r\nhis_uibc_capability\r\n'))
         reply = Messages('RTSP').feed(peer.decrypt(session.pending.pop()[4:]))[0]
         self.assertIn(b'width 800;height 480', reply.body)
         self.assertNotIn(b'his_vtp', reply.body)
+        self.assertIn(b'input_category_list=GENERIC;', reply.body)
         deliver(message('SET_PARAMETER * RTSP/1.0', 3,
             b'his_presentation_url: rtsp://192.168.49.2/hisight/streamid=0 none\r\n'
             b'his_trigger_method: SETUP\r\n'))
