@@ -69,9 +69,10 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.bridge._enqueue(dict(type='key-press', code=3))
         self.bridge._enqueue(dict(type='touch', contacts=[dict(x=.5, y=.5, down=True)]))
+        self.bridge._enqueue(dict(type='touch', contacts=[dict(x=.6, y=.5, down=True)]))
         self.bridge._enqueue(dict(type='touch', contacts=[dict(x=.5, y=.5, down=False)]))
         for _ in range(200):
-            if len(packets) == 4: break
+            if len(packets) == 5: break
             await asyncio.sleep(.001)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -80,7 +81,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             plain = [decoder.decrypt(p[4:])[6:] for p in packets]
         finally:
             decoder.close()
-        self.assertEqual([p[0] for p in plain], [3, 4, 0, 1])
+        self.assertEqual([p[0] for p in plain], [3, 4, 0, 2, 1])
         self.assertEqual(int.from_bytes(plain[0][4:6], 'big'), 21)
         self.assertEqual(plain[2][5:9], bytes.fromhex('019000f0'))
 

@@ -127,7 +127,7 @@ class Session:
                         'his_audio_codecs': '1',
                         'his_device_type': 'device_type 4;subtype 0;',
                         'his_uibc_capability': ('input_category_list=GENERIC;generic_cap_list='
-                            'left_point_down, left_point_up, left_key_down, left_key_up;'),
+                            'left_point_down, left_point_up, left_move, left_key_down, left_key_up;'),
                     }
                     body = ''.join(k + ': ' + v + '\r\n' for k, v in capabilities.items()
                                    if k in requested).encode('ascii')

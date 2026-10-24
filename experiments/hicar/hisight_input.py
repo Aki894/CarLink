@@ -31,13 +31,13 @@ class Input:
         return self.pack(struct.pack('>BHBHHI', 3 if down else 4, 9, 0,
                                      KEYS[name], 0, 0))
 
-    def touch(self, x, y, down):
+    def touch(self, x, y, down, move=False):
         if type(x) is not int or type(y) is not int or not 0 <= x < 800 or not 0 <= y < 480:
             raise ProtocolError('input coordinate outside negotiated display')
-        if type(down) is not bool:
+        if type(down) is not bool or type(move) is not bool or move and not down:
             raise ProtocolError('invalid touch action')
         elapsed = int((time.monotonic() - self.start) * 1000) & 0xffffffff
-        return self.pack(struct.pack('>BHBBHHIB', 0 if down else 1, 11, 1,
+        return self.pack(struct.pack('>BHBBHHIB', 2 if move else 0 if down else 1, 11, 1,
                                      0, x, y, elapsed, 0))
 
 

@@ -43,6 +43,7 @@ class Bridge:
         self.parameters = {}
         self.video_frames = self.audio_frames = self.input_events = 0
         self.key_frames = 0
+        self.pcm_blocks = self.pcm_nonzero = 0
         self.last_report = time.monotonic()
         self.link = (link_factory or TRANSPORT.LiveLink)(path, self.feedback)
         self.link.configure(800, 480, 30)
@@ -110,10 +111,14 @@ class Bridge:
             epoch = self.audio_epoch
             def emit(pcm, timestamp):
                 if not self.closed and self.audio_epoch == epoch:
+                    self.pcm_blocks += 1
+                    self.pcm_nonzero += int(any(pcm))
                     self.link.media(3, pcm, timestamp, 0)
             self.decoder = self.decoder_factory(self.audio_binary,
                 dict(codec='AAC_ADTS', sampleRate=frame['rate'], channels=frame['channels']), emit)
             self.audio_format = fmt
+            self.log('bridge_audio_format', rate=frame['rate'], channels=frame['channels'],
+                     generation=generation)
             self.link.audio_state(0, True)
         if not self.decoder.feed(frame['data'], pts):
             self.audio_stop()
@@ -127,6 +132,7 @@ class Bridge:
             self.log('bridge_stats', video_frames=self.video_frames,
                      audio_frames=self.audio_frames, input_events=self.input_events,
                      key_frames=self.key_frames, parameters=sorted(self.parameters),
+                     pcm_blocks=self.pcm_blocks, pcm_nonzero=self.pcm_nonzero,
                      active=self.link.active, connected=self.link.connected,
                      waiting_key=self.link.wait_key)
             self.last_report = time.monotonic()
@@ -162,11 +168,7 @@ class Bridge:
                                 or not 0 <= x <= 1 or not 0 <= y <= 1 or type(down) is not bool):
                             continue
                         xy = (min(799, int(x * 800)), min(479, int(y * 480)))
-                        if down and contact:
-                            # The negotiated generic channel supports point
-                            # down/up, not repeated Android MOVE-as-DOWN.
-                            continue
-                        packets = [encoder.touch(*xy, down)]
+                        packets = [encoder.touch(*xy, down, move=down and contact is not None)]
                         contact = xy if down else None
                 for packet in packets:
                     writer.write(packet)
@@ -174,7 +176,7 @@ class Bridge:
                         await writer.drain()
                     # Match the proven UIBC test sender: give the peer time to
                     # consume each edge and generate distinct touch timestamps.
-                    await asyncio.sleep(.04)
+                    await asyncio.sleep(.02 if item.get('type') == 'touch' and contact else .04)
                 if packets:
                     self.input_events += 1
                     self.log('bridge_input_sent', kind=item['type'],
