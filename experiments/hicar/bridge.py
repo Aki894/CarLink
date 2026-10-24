@@ -1,10 +1,12 @@
 """Experimental HiCar source adapter for the existing bounded CarLife link."""
 import asyncio
 import importlib.util
+import json
 import math
 from pathlib import Path
 import re
 import subprocess
+import threading
 import time
 
 from hisight_input import Input
@@ -160,15 +162,23 @@ class Bridge:
                                 or not 0 <= x <= 1 or not 0 <= y <= 1 or type(down) is not bool):
                             continue
                         xy = (min(799, int(x * 800)), min(479, int(y * 480)))
+                        if down and contact:
+                            # The negotiated generic channel supports point
+                            # down/up, not repeated Android MOVE-as-DOWN.
+                            continue
                         packets = [encoder.touch(*xy, down)]
                         contact = xy if down else None
                 for packet in packets:
                     writer.write(packet)
                     async with asyncio.timeout(1):
                         await writer.drain()
+                    # Match the proven UIBC test sender: give the peer time to
+                    # consume each edge and generate distinct touch timestamps.
+                    await asyncio.sleep(.04)
                 if packets:
                     self.input_events += 1
-                    self.log('bridge_input_sent', kind=item['type'])
+                    self.log('bridge_input_sent', kind=item['type'],
+                             pressed=contact is not None)
         except (OSError, TimeoutError, ProtocolError) as error:
             self.log('bridge_input_stopped', error=type(error).__name__)
         finally:
@@ -195,6 +205,37 @@ class CarLife:
     """Temporary output process, started after the experiment owns the radio."""
     def __init__(self, executable, path):
         self.executable, self.path = executable, path
+        self.stopping = threading.Event()
+        self.lock = threading.Lock()
+
+    def spawn(self):
+        self.process = subprocess.Popen([self.executable, 'carlife', 'usb',
+            '--duration', '0', '--live-socket', self.path])
+
+    def supervise(self):
+        attempts = 0
+        started = time.monotonic()
+        while not self.stopping.wait(.2):
+            if self.process.poll() is None:
+                continue
+            if time.monotonic() - started >= 30:
+                attempts = 0
+            attempts += 1
+            print(json.dumps(dict(event='carlife_output_exited', code=self.process.returncode,
+                                  attempt=attempts)), flush=True)
+            if attempts > 6 or self.stopping.wait(min(30, 2 ** attempts)):
+                return
+            with self.lock:
+                if self.stopping.is_set():
+                    return
+                # Rust owns cleanup of its endpoint. Refuse a stale/replaced
+                # socket rather than deleting an unknown live owner's path.
+                if Path(self.path).exists() or Path(self.path).is_symlink():
+                    print(json.dumps(dict(event='carlife_output_restart_refused',
+                                          reason='socket_still_owned')), flush=True)
+                    return
+                self.spawn()
+                started = time.monotonic()
 
     def __enter__(self):
         path = Path(self.path)
@@ -203,15 +244,19 @@ class CarLife:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if path.parent.stat().st_mode & 0o077:
             raise ValueError('live socket parent must be private')
-        self.process = subprocess.Popen([self.executable, 'carlife', 'usb',
-            '--duration', '0', '--live-socket', self.path])
+        self.spawn()
+        self.thread = threading.Thread(target=self.supervise, daemon=True)
+        self.thread.start()
         return self
 
     def __exit__(self, *_):
-        self.process.terminate()
+        self.stopping.set()
+        with self.lock:
+            if self.process.poll() is None:
+                self.process.terminate()
         try:
             self.process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait(timeout=2)
-        Path(self.path).unlink(missing_ok=True)
+        self.thread.join(1)

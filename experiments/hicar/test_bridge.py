@@ -69,8 +69,8 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.bridge._enqueue(dict(type='key-press', code=3))
         self.bridge._enqueue(dict(type='touch', contacts=[dict(x=.5, y=.5, down=True)]))
-        self.bridge._enqueue(dict(type='touch', contacts=[]))
-        for _ in range(30):
+        self.bridge._enqueue(dict(type='touch', contacts=[dict(x=.5, y=.5, down=False)]))
+        for _ in range(200):
             if len(packets) == 4: break
             await asyncio.sleep(.001)
         task.cancel()
