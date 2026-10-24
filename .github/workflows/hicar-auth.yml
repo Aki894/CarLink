@@ -1,6 +1,11 @@
 name: Experimental Linux HiCar authentication
 on:
   workflow_dispatch:
+    inputs:
+      app_run_id:
+        description: Successful app run used for the matching firmware refresh
+        type: string
+        default: '39818918089'
 permissions:
   contents: read
   actions: read
@@ -24,6 +29,20 @@ jobs:
           python3 -m venv .build/hicar-test-python
           .build/hicar-test-python/bin/pip install --require-hashes -r experiments/hicar/requirements.txt
           .build/hicar-test-python/bin/python -m unittest discover -s experiments/hicar -p 'test_*.py'
+          .build/hicar-test-python/bin/python -m unittest discover -s receiver -p 'test_*.py'
+      - name: Package public experimental receiver sources
+        run: |
+          mkdir -p dist/hicar-source/experiments/hicar dist/hicar-source/receiver
+          cp experiments/hicar/*.py experiments/hicar/requirements.txt dist/hicar-source/experiments/hicar/
+          cp receiver/forward.py receiver/probe.py receiver/test_forward.py dist/hicar-source/receiver/
+          printf '%s\n' "$GITHUB_SHA" > dist/hicar-source/COMMIT
+          (cd dist/hicar-source && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hicar-source-experimental
+          path: dist/hicar-source/
+          if-no-files-found: error
+          retention-days: 14
       - name: Fetch pinned public sources and build native host library
         run: |
           python3 experiments/hicar/native/fetch.py "$PWD/.build/hicar-native-deps"
@@ -62,7 +81,7 @@ jobs:
     uses: ./.github/workflows/refresh-image.yml
     with:
       base_run_id: '39459953269'
-      app_run_id: '39818918089'
+      app_run_id: ${{ inputs.app_run_id }}
       driver_run_id: '39670639717'
       variant: main
       disable_onboard_wifi: true

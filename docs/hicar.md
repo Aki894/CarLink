@@ -83,7 +83,7 @@ AX900 驱动声明支持 P2P-client/GO/device。直接调用现有 supplicant �
 
 软件 AP 作为当前鸿蒙 4.2 已验证的主路径；暂不投入真正 Wi-Fi Direct GO。Python 负责协议与状态迭代，原生 C/系统 OpenSSL 负责认证与密码运算，接入媒体后以测量结果决定是否迁移高频路径。
 
-华为手机改作 HiCar 信源后，后续输出验证需要第二台 CarLife HU 或实车；当前先用电脑媒体接收器完成首帧、格式和流量检查。
+2026-10-24 更新：先尝试同台华为通过无线提供 HiCar、通过 OTG 运行 CarLife HU，验证完整转发回路；同时检查音频焦点及前后台共存。独立 HU 和实车随后验收，接线与步骤见[连接管理设计](connection-management.md)。
 
 本轮代码提交 `b9fa5f9` 的 [Actions 39942615426](https://github.com/Aki894/CarLink/actions/runs/39942615426) 已完整成功：48 项 Python 测试、原生正/误 PIN PAKE、ARMv7 交叉编译、完整 firmware job、`mode=current` 镜像结构/校验及上传均通过。原生库 ZIP 的下载 SHA-256 与 10 个清单成员逐项核对通过。镜像产物为 `carlink-h3-refreshed-image`，实验仍由 SSH 单独部署。
 
@@ -101,7 +101,7 @@ AX900 驱动声明支持 P2P-client/GO/device。直接调用现有 supplicant �
 - DMSDP 的 CTR 记录没有独立认证标签；软件 AP 的 WPA2 和 HiChain 身份认证继续保留，解密内容受长度、格式和状态约束。
 - 显式启用私有捕获时，解密控制记录写入同目录 `.plain` 文件，0600，沿用接收大小上限。密钥不写入捕获文件；参考 APK、手机程序及所有捕获均留在忽略目录。
 
-无线 HiCar 阶段不需要手机连接开发板 OTG；开发板现已由独立 USB 电源供电，手机可独立充电。CarLife 桥接阶段再接第二个 HU 测试端或实车。
+单独调试无线 HiCar 时使用独立 USB 电源，手机可独立充电。CarLife 桥接阶段可按[单手机台架计划](connection-management.md#单台华为同时作为-hicar-信源和-carlife-测试端)接回手机 OTG；统一切换单路供电后再测试，AX900 和有线管理通道保持连接。
 
 ## 参考定位
 

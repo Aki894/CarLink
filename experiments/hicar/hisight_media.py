@@ -56,7 +56,7 @@ class Depacketizer:
         return kind, timestamp, self.cipher.decrypt(pes[offset:])
 
 
-async def receive(reader, key, capture_dir, log):
+async def receive(reader, key, capture_dir, log, sink=None):
     decoder = Depacketizer(key)
     raw = video = None
     total = frames = 0
@@ -78,6 +78,8 @@ async def receive(reader, key, capture_dir, log):
             if frame:
                 kind, timestamp, data = frame
                 frames += 1
+                if sink:
+                    sink.video(kind, timestamp, data)
                 if video and kind == 96 and total < 64 * 1024 * 1024:
                     video.write(data); video.flush()
                 if frames <= 3 or frames % 60 == 0:

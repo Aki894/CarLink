@@ -15,8 +15,6 @@ import subprocess
 import threading
 import time
 
-import probe
-
 LIVE = struct.Struct('<BBHQ')
 MAX_VIDEO = 512 * 1024
 MAX_QUEUE = 1024 * 1024
@@ -259,7 +257,7 @@ class AudioDecoder:
         self.codec = fmt['codec']
         if self.rate not in (8000, 16000, 24000, 32000, 44100, 48000) or self.channels not in (1, 2):
             raise ValueError('unsupported source audio format')
-        if self.codec == 'AAC_LC':
+        if self.codec in ('AAC_LC', 'AAC_ADTS'):
             inputs = ['-f', 'aac']
         elif self.codec == 'PCM_S16LE':
             inputs = ['-f', 's16le', '-ar', str(self.rate), '-ac', str(self.channels)]
@@ -370,6 +368,7 @@ class AudioDecoder:
 
 
 def run(args):
+    import probe
     server = probe.listener(args.unix)
     link = None
     decoders, formats, retry_due = {}, {}, {}

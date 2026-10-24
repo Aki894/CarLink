@@ -196,7 +196,7 @@ async def graceful_close(sock, session, log, timeout=1.0):
         log('hisight_teardown_stopped', error=type(error).__name__)
 
 
-async def receive(sock, key, capture_dir, log):
+async def receive(sock, key, capture_dir, log, sink=None):
     session = Session(key)
     raw = plain = None
     loop = asyncio.get_running_loop()
@@ -231,12 +231,14 @@ async def receive(sock, key, capture_dir, log):
                 reader, media_writer = await asyncio.wait_for(asyncio.open_connection(
                     peer, session.media_endpoint, local_addr=(sock.getsockname()[0], 0)), 5)
                 log('hisight_media_connected', port=session.media_endpoint)
-                media_task = asyncio.create_task(receive_media(reader, key, capture_dir, log))
+                media_task = asyncio.create_task(receive_media(reader, key, capture_dir, log, sink))
                 if session.input_endpoint:
                     _, input_writer = await asyncio.wait_for(asyncio.open_connection(
                         peer, session.input_endpoint, local_addr=(sock.getsockname()[0], 0)), 5)
                     log('hisight_input_connected', port=session.input_endpoint)
-                    if capture_dir:
+                    if sink:
+                        input_task = asyncio.create_task(sink.input(input_writer, key))
+                    elif capture_dir:
                         input_task = asyncio.create_task(serve_input(input_writer, key, capture_dir, log))
                 session.request('PLAY', {'Transport': 'RTP/AVP/UDP;unicast;client_port=0'})
             for reply in session.pending:

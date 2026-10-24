@@ -110,7 +110,8 @@ def log(event, **fields):
 
 
 async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
-                  decode_control=True, auth_session=None, resource=None, dmsdp=None, control=None):
+                  decode_control=True, auth_session=None, resource=None, dmsdp=None, control=None,
+                  live_socket=None, audio_binary=None):
     """Observe a byte stream without treating recv boundaries as protocol frames."""
     total = 0
     digest = hashlib.sha256()
@@ -121,6 +122,7 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
     audio_receiver = None
     audio_tasks = []
     heartbeat_task = None
+    sink = None
     control_lock = asyncio.Lock()
 
     async def send_control(records):
@@ -147,10 +149,13 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                 control.on_plaintext = save_plaintext
         sock.setblocking(False)
         loop = asyncio.get_running_loop()
+        if control and live_socket:
+            from bridge import Bridge
+            sink = Bridge(live_socket, audio_binary, log)
         if control and control.speaker:
             audio_receiver = AudioReceiver(control.device_info['localIp'],
                                            control.device_info['remoteIp'],
-                                           bytes(control.cipher.key), capture_dir, log)
+                                           bytes(control.cipher.key), capture_dir, log, sink)
             control.speaker.ports = audio_receiver.ports
             audio_tasks = [asyncio.create_task(audio_receiver.receive(0))]
         if control:
@@ -177,6 +182,8 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                                 audio_receiver.active = True
                             elif event.get('audio_stopped'):
                                 audio_receiver.active = False
+                                if sink:
+                                    sink.audio_stop()
                     await send_control(control.take_pending())
                     if control.negotiated and heartbeat_task is None:
                         async def heartbeat():
@@ -205,7 +212,7 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                                 await asyncio.wait_for(loop.sock_connect(media,
                                     (control.device_info['remoteIp'], control.media_port)), 5)
                                 log('hisight_connected', port=control.media_port)
-                                await receive_hisight(media, bytes(control.cipher.key), capture_dir, log)
+                                await receive_hisight(media, bytes(control.cipher.key), capture_dir, log, sink)
                             except (OSError, asyncio.TimeoutError) as error:
                                 log('hisight_error', error=type(error).__name__)
                             finally:
@@ -285,6 +292,8 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
         await asyncio.gather(*(t for t in [clock_task, *audio_tasks] if t), return_exceptions=True)
         if audio_receiver:
             audio_receiver.close()
+        if sink:
+            sink.close()
         if plaintext_capture:
             plaintext_capture.close()
         if control:
@@ -582,7 +591,9 @@ async def run(args):
                                                                 remoteIp=args.network_offer.client_ip, port=0,
                                                                 properties={'2003': args.model, '5004': True,
                                                                             '5014': False}), audio=args.audio)
-                                                       if control else None))
+                                                       if control else None,
+                                                       live_socket=args.live_socket,
+                                                       audio_binary=args.audio_binary))
                     tcp_clients.add(task)
                     if control:
                         tcp_controls.add(task)
@@ -731,8 +742,13 @@ def main():
     parser.add_argument('--dmsdp-options', action='store_true',
                         help='negotiate DMSDP AES control, symmetric heartbeats and clock sync')
     parser.add_argument('--audio', action='store_true', help='enable experimental speaker service')
+    parser.add_argument('--live-socket', help='experimental CarLife output socket (private absolute path)')
+    parser.add_argument('--carlife-binary', default='/usr/local/bin/carlink')
+    parser.add_argument('--audio-binary', default='/usr/local/lib/carlink/carplay/bin/carlink-audio')
     parser.add_argument('--capture-dir', help='optional private directory for raw streams')
     args = parser.parse_args()
+    if args.live_socket and not (args.audio and args.network_interface and args.dmsdp_options):
+        parser.error('--live-socket requires --audio, --network-interface and --dmsdp-options')
     if not 1 <= args.duration <= 900:
         parser.error('duration must be between 1 and 900 seconds')
     if not (args.adapter.startswith('/org/bluez/hci')
@@ -782,7 +798,13 @@ def main():
         else:
             context = nullcontext(None)
         with context as args.network_offer:
-            asyncio.run(asyncio.wait_for(run(args), timeout=args.duration + 30))
+            if args.live_socket:
+                from bridge import CarLife
+                output = CarLife(args.carlife_binary, args.live_socket)
+            else:
+                output = nullcontext()
+            with output:
+                asyncio.run(asyncio.wait_for(run(args), timeout=args.duration + 30))
     finally:
         lock.close()
 

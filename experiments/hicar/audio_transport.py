@@ -85,8 +85,9 @@ async def synchronize(local_ip, remote_ip, port, key, log, clock=None):
 
 
 class Receiver:
-    def __init__(self, local_ip, remote_ip, key, capture_dir, log):
+    def __init__(self, local_ip, remote_ip, key, capture_dir, log, sink=None):
         self.remote_ip, self.capture_dir, self.log = remote_ip, capture_dir, log
+        self.sink = sink
         self.cipher = Cipher(key, 65536)
         self.audio = Audio()
         self.clock = Clock()
@@ -110,6 +111,8 @@ class Receiver:
         self.active = False
         self.generation += 1
         self.audio.streams.clear()
+        if self.sink:
+            self.sink.audio_stop()
 
     async def receive(self, index):
         sock = self.sockets[index]
@@ -142,6 +145,8 @@ class Receiver:
                         self.log('audio_plaintext', size=len(plain), version=plain[0] >> 6,
                                  payload_type=plain[1] & 127 if len(plain)>1 else -1)
                     for frame in frames:
+                        if self.sink:
+                            self.sink.audio(frame, time.monotonic_ns() // 1000, self.generation)
                         if self.audio.frames <= 3:
                             self.log('audio_format', codec='aac-adts', rate=frame['rate'],
                                      channels=frame['channels'])
