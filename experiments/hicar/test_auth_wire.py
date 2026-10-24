@@ -11,6 +11,16 @@ def hello(**changes):
 
 
 class AuthWireTests(unittest.TestCase):
+    def test_radio_identity_is_used_for_native_and_business_handshake(self):
+        identity = Identity('a' * 64, '000042').for_adapter('00040A00', '02:11:22:33:44:55')
+        seen = []
+        session = AuthSession(identity, '00040A00',
+                              lambda own, peer, pin: seen.append((own, peer, pin)))
+        reply, metadata = session.receive(hello())
+        details = json.loads(json.loads(reply)['data'])
+        self.assertEqual(details['deviceId'], identity.device_id)
+        self.assertEqual(seen, [(identity.device_id, 'a' * 64, '000042')])
+
     def test_utf8_splits_escapes_and_combined_objects(self):
         obj = dict(text='华为 { " \\ }', nested=[dict(a=1)])
         wire = (json.dumps(obj, ensure_ascii=False) + '\n' + json.dumps(hello())).encode('utf-8')

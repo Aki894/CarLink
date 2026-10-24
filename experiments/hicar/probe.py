@@ -474,6 +474,11 @@ async def run(args):
             own_bluetooth_address = address
             seed = args.model.upper() + address.replace(':', '').upper()
             profile.control_summary = hashlib.sha256(seed.encode('ascii')).hexdigest().upper().encode('ascii')
+            if args.reply_identity:
+                business_profile.auth_identity = business_profile.auth_identity.for_adapter(args.model, address)
+                # Discovery summary, business identity and native signing IDs
+                # must agree. The Runtime above keeps its persistent HUKS seed.
+                assert business_profile.auth_identity.device_id.encode('ascii') == profile.control_summary
         if args.network_offer:
             tcp_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             tcp_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

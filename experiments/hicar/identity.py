@@ -1,5 +1,6 @@
 """Persistent per-device HiCar identity and fixed six-digit PIN, kept outside Git."""
 import argparse
+import hashlib
 from dataclasses import dataclass, field
 import json
 import os
@@ -20,13 +21,27 @@ class Identity:
     name: str = 'CarLink HiCar'
 
     def validate(self):
-        if not isinstance(self.device_id, str) or not re.fullmatch(r'[0-9a-f]{64}', self.device_id):
+        if not isinstance(self.device_id, str) or not re.fullmatch(r'[0-9A-Fa-f]{64}', self.device_id):
             raise ValueError('invalid local device identity')
         if not isinstance(self.pin, str) or not re.fullmatch(r'[0-9]{6}', self.pin):
             raise ValueError('PIN must be exactly six ASCII digits')
         if not isinstance(self.name, str) or not 1 <= len(self.name) <= 64:
             raise ValueError('invalid local device name')
         return self
+
+    def for_adapter(self, model, address):
+        """Use the same car auth ID as Harmony's model + BR-MAC lookup.
+
+        The stored random ID remains the HUKS hardware seed; deriving a wire
+        identity must not rewrite it or rotate the user's fixed PIN.
+        """
+        if not isinstance(model, str) or not re.fullmatch(r'[0-9A-Fa-f]{8}', model):
+            raise ValueError('invalid HiCar model ID')
+        if not isinstance(address, str) or not re.fullmatch(r'(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}', address):
+            raise ValueError('invalid Bluetooth adapter address')
+        seed = model.upper() + address.replace(':', '').upper()
+        device_id = hashlib.sha256(seed.encode('ascii')).hexdigest().upper()
+        return Identity(device_id, self.pin, self.name).validate()
 
     def encoded(self):
         self.validate()

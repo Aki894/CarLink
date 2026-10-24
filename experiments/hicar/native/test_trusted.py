@@ -10,7 +10,7 @@ from hichain import Runtime, Session
 
 
 def worker(library, store, role, connection):
-    own, peer = ('11' * 32, '22' * 32) if role == 1 else ('22' * 32, '11' * 32)
+    own, peer = ('AB' * 32, 'CD' * 32) if role == 1 else ('CD' * 32, 'AB' * 32)
     runtime = Runtime(library, store, own)
     session = None
     try:
