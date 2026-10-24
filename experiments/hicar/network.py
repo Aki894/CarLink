@@ -50,7 +50,7 @@ class Offer:
 
 
 class Hotspot:
-    def __init__(self, interface):
+    def __init__(self, interface, manage_service=True):
         if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,15}', interface):
             raise ValueError('invalid wireless interface')
         self.interface = interface
@@ -58,6 +58,7 @@ class Hotspot:
         self.previous = None
         self.active = False
         self.created = False
+        self.manage_service = manage_service
 
     def __enter__(self):
         route = json.loads(command('ip', '-j', 'route', 'get', '192.168.77.1'))
@@ -72,7 +73,8 @@ class Hotspot:
         connections = command('nmcli', '-t', '-f', 'UUID,DEVICE', 'connection', 'show', '--active')
         self.previous = next((line.split(':')[0] for line in connections.splitlines()
                               if line.endswith(':' + self.interface)), None)
-        self.active = command('systemctl', 'is-active', 'carlink', optional=True) == 'active'
+        self.active = (self.manage_service and
+                       command('systemctl', 'is-active', 'carlink', optional=True) == 'active')
         try:
             if self.active:
                 command('systemctl', 'stop', 'carlink')
@@ -102,7 +104,7 @@ class Hotspot:
         try:
             if self.created:
                 command('nmcli', 'connection', 'delete', self.name, optional=True)
-            if self.previous:
+            if self.previous and self.manage_service:
                 command('nmcli', 'connection', 'up', 'uuid', self.previous,
                         'ifname', self.interface, optional=True)
         finally:

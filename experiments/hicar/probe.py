@@ -701,7 +701,7 @@ async def run(args):
         waiter = asyncio.create_task(stop.wait())
         disconnected = asyncio.create_task(bus.wait_for_disconnect())
         try:
-            done, _ = await asyncio.wait([waiter, disconnected], timeout=args.duration,
+            done, _ = await asyncio.wait([waiter, disconnected], timeout=args.duration or None,
                                          return_when=asyncio.FIRST_COMPLETED)
             if disconnected in done:
                 raise RuntimeError('system bus disconnected')
@@ -771,6 +771,7 @@ def main():
     parser.add_argument('--identity', default=DEFAULT_PATH, help='private persistent identity/PIN file')
     parser.add_argument('--auth-library', help='optional pinned Linux HiChain shared library')
     parser.add_argument('--rust-session-binary', help='experimental Rust connection worker; BlueZ/media stay in this adapter')
+    parser.add_argument('--managed', action='store_true', help='manager owns the persistent CarLife output and radio lifecycle')
     parser.add_argument('--auth-store', default='/var/lib/carlink/hicar/keys',
                         help='private persistent HUKS directory')
     parser.add_argument('--network-interface', help='temporarily replace CarPlay hotspot with a HiCar AP')
@@ -786,8 +787,10 @@ def main():
         parser.error('--rust-session-binary requires the authenticated network test configuration')
     if args.live_socket and not (args.audio and args.network_interface and args.dmsdp_options):
         parser.error('--live-socket requires --audio, --network-interface and --dmsdp-options')
-    if not 1 <= args.duration <= 900:
-        parser.error('duration must be between 1 and 900 seconds')
+    if not (1 <= args.duration <= 900 or args.managed and args.duration == 0):
+        parser.error('duration must be 1..900 seconds, or 0 with --managed')
+    if args.managed and not (args.live_socket and args.rust_session_binary):
+        parser.error('--managed requires the shared live socket and Rust connection worker')
     if not (args.adapter.startswith('/org/bluez/hci')
             and args.adapter[len('/org/bluez/hci'):].isdigit()):
         parser.error('adapter must be /org/bluez/hci followed by its numeric index')
@@ -831,17 +834,20 @@ def main():
     try:
         if args.network_interface:
             from network import Hotspot
-            context = Hotspot(args.network_interface)
+            context = Hotspot(args.network_interface, manage_service=not args.managed)
         else:
             context = nullcontext(None)
         with context as args.network_offer:
-            if args.live_socket:
+            if args.live_socket and not args.managed:
                 from bridge import CarLife
                 output = CarLife(args.carlife_binary, args.live_socket)
             else:
                 output = nullcontext()
             with output:
-                asyncio.run(asyncio.wait_for(run(args), timeout=args.duration + 30))
+                if args.managed and args.duration == 0:
+                    asyncio.run(run(args))
+                else:
+                    asyncio.run(asyncio.wait_for(run(args), timeout=args.duration + 30))
     finally:
         lock.close()
 

@@ -118,6 +118,7 @@ jobs:
             .build/hicar-native-host/libcarlink_hichain.so dist/hicar-auth/libcarlink_hichain.so
           python3 scripts/test-hicar-rust-session.py .build/hicar-rust-arm/carlink \
             .build/hicar-native-host/libcarlink_hichain.so dist/hicar-auth/libcarlink_hichain.so
+          python3 scripts/test-manager.py .build/hicar-rust-arm/carlink
   firmware:
     needs: [native, rust-interop]
     uses: ./.github/workflows/refresh-image.yml

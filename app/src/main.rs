@@ -7,6 +7,7 @@ mod live;
 mod input;
 mod auth;
 mod hicar;
+mod manager;
 #[cfg(target_os = "linux")]
 mod usb_aio;
 use std::env;
@@ -238,6 +239,10 @@ fn main() {
     }
     if args.first().map(String::as_str) == Some("hicar") {
         if let Err(error)=hicar::run(&args[1..]) {runtime::log("hicar_error",&error);std::process::exit(1);}
+        return;
+    }
+    if args.first().map(String::as_str) == Some("manager") {
+        if let Err(error)=manager::run(&args[1..]) {runtime::log("manager_error",&error);std::process::exit(1);}
         return;
     }
     if args.first().map(String::as_str) == Some("carlife") {
