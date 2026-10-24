@@ -1,8 +1,19 @@
 # 验证与部署记录
 
-状态截至 2026-10-24。这里汇总已完成的检查，日常运行见[运行说明](live-forwarding.md)。
+状态截至 2026-10-25。这里汇总已完成的检查，日常运行见[运行说明](live-forwarding.md)。
 
 下表保留正式部署的 CarPlay/CarLife 基线。最新 HiCar 实验已接入 CarLife 视频、AAC/PCM 和 UIBC，79 项测试通过；[完整构建 40105347479](https://github.com/Aki894/CarLink/actions/runs/40105347479)成功，镜像已下载并校验 ZIP 与压缩镜像清单。实测和产物摘要见 [HiCar 构建与实测](hicar.md)。下一阶段按 [Rust 迁移计划](hicar-rust.md)推进；HiCar 当前仍手动实验运行。
+
+## 2026-10-25：Rust R1 与连接名称更新
+
+R1 的 73 项 Rust 单测、1,700 项差分、混合认证和已有身份只读验证见 [Rust 迁移记录](hicar-rust.md)。[改名版应用构建 40124305351](https://github.com/Aki894/CarLink/actions/runs/40124305351)成功，接收端 artifact `12572404057` 的 63 个成员、应用 artifact `12572199134` 的 68 个成员均已下载并校验。
+
+[完整构建 40124788949](https://github.com/Aki894/CarLink/actions/runs/40124788949)的 native、rust-interop、firmware 全部成功，镜像结构、应用/接收端清单、依赖源码和许可证检查通过，产物上传完成；镜像 artifact 为 `12572024913`，已下载复核 ZIP SHA256 `e24388c9a28a22e201ebe1468a07c0e81b2eb8ced5a0936048b1632653d40970` 和包内镜像 SHA256 `365d0de00bfe7ee6a43b5e9478514e4273dda27a1e719041df2ba67565278c24`。
+
+板端接收端已热更新为 `9b14895`：蓝牙 Alias、5 GHz 热点 SSID、CarPlay 的 iAP2/AirPlay/mDNS 名称统一为 **CarLink**；HiCar 默认身份名、BLE LocalName、热点 SSID 与设备信息名也统一为 **CarLink**。热点位于 CN channel 149 / 5745 MHz，服务 active、NRestarts=0，有线 `end0` 管理保持可用。HiCar 新广播在 H3 上成功注册并正常退出，三份已有身份改名后 PIN 和硬件种子一致。
+
+生产 CarLife 二进制继续使用下表的已验证版本；R1 新二进制在独立临时路径通过板端测试。接收端回滚目录为 `/var/backups/carlink/receiver-20261024T192132Z/runtime`，部署收据为 `/etc/carlink-receiver-deploy.json`。静态主机名 `carlink-h3` 保持作为内部管理标识，用户可见的 pretty hostname 为 CarLink；协议认证用的 MAC、model ID、USB/AOA 标识保持原值。
+
 
 ## 当前基线
 
