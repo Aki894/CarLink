@@ -26,6 +26,7 @@ from audio_transport import Clock
 from cipher import Cipher
 from hisight_media import Depacketizer
 from hisight_input import Input
+from identity import Identity
 
 
 class Process:
@@ -126,6 +127,10 @@ def check_codec(binary):
                         bad=bytearray(data);bad[rng.randrange(len(bad))]^=1
                         check('corrupt '+fmt,dict(op='decode',format=fmt,chunks=[bad.hex()]),
                               lambda:framed(fmt,bad,[bad]))
+        for model,address in [('00040a00','02:00:00:00:00:01'),('00112233','12:ab:cd:ef:01:23'),('bad','02:00:00:00:00:01'),('00112233','bad')]:
+            identity=Identity('ab'*32,'012345','CarLink synthetic')
+            check('persistent identity derivation',dict(op='identity',record=identity.encoded().decode(),model=model,address=address),
+                  lambda:dict(wire_id=identity.for_adapter(model,address).device_id))
         for data in (b'{}{}', '{"unicode":"中文\\\"}"}{"list":[1,true,null]}'.encode(),
                      b'{"a":1,"a":2}',b'{"a":{"b":1,"b":2}}',b'{"x":NaN}',
                      b'{"x":\xff}',b'{"x":"\xff"}',b'{"a":',b'{"x":'+b'['*33+b'0'+b']'*33+b'}'):

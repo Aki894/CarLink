@@ -3,6 +3,7 @@ pub mod wire;
 pub mod json;
 pub mod media;
 pub mod crypto;
+pub mod identity;
 #[cfg(unix)]
 pub mod native;
 mod cli;

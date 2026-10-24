@@ -41,6 +41,8 @@ fn codec(v:&Value)->Result<Value>{
         "touch"=>{let x=number(v,"x")?.try_into().map_err(|_|"x outside u16")?;let y=number(v,"y")?.try_into().map_err(|_|"y outside u16")?;
             let action=number(v,"action")?.try_into().map_err(|_|"action outside u8")?;Ok(value!({"hex":hex(&media::touch(x,y,action,bounded_u32(v,"elapsed")?)?)}))},
         "key"=>Ok(value!({"hex":hex(&media::key(string(v,"name")?,v["down"].as_bool().ok_or("invalid key action")?)?)})),
+        "identity"=>{let id=super::identity::Identity::parse(string(v,"record")?.as_bytes())?;
+            Ok(value!({"wire_id":id.wire_id(string(v,"model")?,string(v,"address")?,&Crypto::load()?)?}))},
         "cipher"=>Ok(value!({"hex":hex(&Crypto::load()?.transform(&bytes(v,"key")?,&bytes(v,"iv")?,&bytes(v,"data")?)?)})),
         "video"=>{
             let mut d=media::Video::new();let crypto=Crypto::load()?;let key=bytes(v,"key")?;let mut out=Vec::new();
@@ -66,6 +68,14 @@ pub fn run(args:&[String])->Result<()>{
         Some("codec") if args.len()==1=>{while let Some(v)=line(&mut input)?{send(&match codec(&v){Ok(v)=>value!({"ok":true,"result":v}),Err(e)=>value!({"ok":false,"error":e})})?;}Ok(())},
         #[cfg(unix)]
         Some("auth-worker") if args.len()==1=>auth_worker(&mut input),
+        #[cfg(unix)]
+        Some("identity-check") if args.len()==1=>{
+            let config=line(&mut input)?.ok_or("missing identity check configuration")?;
+            let id=super::identity::Identity::load(std::path::Path::new(string(&config,"path")?))?;
+            let crypto=Crypto::load()?;let wire=id.wire_id(string(&config,"model")?,string(&config,"address")?,&crypto)?;
+            send(&value!({"schema":1,"wire_identity_sha256":hex(&crypto.sha256(wire.as_bytes())?),
+                "hardware_seed_sha256":hex(&crypto.sha256(id.device_id.as_bytes())?),"name_length":id.name.chars().count()}))
+        },
         _=>Err("Usage: carlink hicar codec | auth-worker (bounded development tools; no radio access)".into()),
     }
 }
