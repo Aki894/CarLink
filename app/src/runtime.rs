@@ -189,6 +189,21 @@ impl Endpoint {
         if let Some(live)=self.live.as_mut(){
             live.poll_io()?;
             live.clock_floor(now.as_millis() as u32);
+        }
+        // Video liveness has its own deadline. Continuous PCM must not keep
+        // returning before the heartbeat when the picture is static or waiting
+        // for a recovery IDR.
+        if (self.live.is_some() || self.media.is_some()) && self.session.video_config().is_some()
+            && now.saturating_sub(self.last_video)>=Duration::from_secs(1) {
+            self.last_video=now;
+            let timestamp=self.live.as_mut().map_or(now.as_millis() as u32,
+                |live|live.heartbeat(now.as_millis() as u32));
+            log("video_heartbeat", "independent video deadline");
+            return Message{channel:crate::carlife::Channel::Video,id:0x20002,
+                timestamp_ms:Some(timestamp),reserved:0,payload:Vec::new()}
+                .encode().map(Some).map_err(|e|e.to_string());
+        }
+        if let Some(live)=self.live.as_mut(){
             let message=live.next(self.audio_allowed && !self.hu_muted && self.transport_ready);
             self.sync_live_epoch();
             if let Some(message)=message {
@@ -198,24 +213,12 @@ impl Endpoint {
                 if let Some(on)=state {self.audio_on=on;wire.extend(self.music_status()?);}
                 return Ok(Some(wire));
             }
-            if self.session.video_config().is_some() && now.saturating_sub(self.last_video)>=Duration::from_secs(1) {
-                self.last_video=now;
-                let timestamp=self.live.as_mut().unwrap().heartbeat(now.as_millis() as u32);
-                return Message{channel:crate::carlife::Channel::Video,id:0x20002,timestamp_ms:Some(timestamp),reserved:0,payload:Vec::new()}
-                    .encode().map(Some).map_err(|e|e.to_string());
-            }
             return Ok(None);
         }
         if let Some(media) = self.media.as_mut() {
             if let Some(message) = media.next(now)? {
                 if message.channel == crate::carlife::Channel::Video { self.last_video = now; }
                 return message.encode().map(Some).map_err(|e| e.to_string());
-            }
-            if self.session.video_config().is_some() && now.saturating_sub(self.last_video) >= Duration::from_secs(1) {
-                self.last_video = now;
-                return Message { channel: crate::carlife::Channel::Video, id: 0x20002,
-                    timestamp_ms: Some(now.as_millis() as u32), reserved: 0, payload: Vec::new() }
-                    .encode().map(Some).map_err(|e| e.to_string());
             }
         }
         Ok(None)
@@ -290,6 +293,35 @@ pub fn tcp(address: SocketAddr, duration: Duration, media: Option<TestMedia>, li
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn continuous_audio_cannot_starve_video_heartbeat() {
+        let path=std::env::temp_dir().join(format!("carlink-heartbeat-{}",std::process::id()));
+        let mut endpoint=Endpoint::with_source(None,Some(path.clone())).unwrap();
+        for (id,payload) in [
+            (ids::HU_PROTOCOL_VERSION,vec![8,4,16,1]),
+            (ids::VIDEO_INIT,vec![8,0xa0,6,16,0xe0,3,24,30]),
+            (ids::VIDEO_START,vec![]),
+        ] {endpoint.receive(&Message::command(id,payload).unwrap().encode().unwrap()).unwrap();}
+        let mut producer=std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let frame=|kind:u8,flags:u8,payload:&[u8]| {
+            let mut wire=((12+payload.len()) as u32).to_le_bytes().to_vec();
+            wire.extend([kind,flags,0,0]);wire.extend(0u64.to_le_bytes());wire.extend(payload);wire
+        };
+        let mut config=Vec::new();for n in [800u32,480,30]{config.extend(n.to_le_bytes());}
+        producer.write_all(&frame(4,1,&[])).unwrap();
+        producer.write_all(&frame(1,0,&config)).unwrap();
+        endpoint.poll_media().unwrap();
+        for _ in 0..4 {producer.write_all(&frame(3,0,&[0;3528])).unwrap();}
+        endpoint.clock=Instant::now()-Duration::from_secs(2);
+        let heartbeat=endpoint.poll_media().unwrap().unwrap();
+        let messages=Decoder::new(Limits::default()).feed(&heartbeat).unwrap();
+        assert_eq!(messages[0].id,0x20002);
+        assert!(messages[0].payload.is_empty());
+        let audio=endpoint.poll_media().unwrap().unwrap();
+        let messages=Decoder::new(Limits::default()).feed(&audio).unwrap();
+        assert_eq!(messages[0].channel,crate::carlife::Channel::Media);
+        assert_eq!(endpoint.last_video.as_secs(),2);
+    }
     #[test]
     fn invalid_touch_does_not_terminate_live_session() {
         let path=std::env::temp_dir().join(format!("carlink-touch-{}",std::process::id()));

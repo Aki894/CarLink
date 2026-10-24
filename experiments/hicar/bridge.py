@@ -40,6 +40,7 @@ class Bridge:
         self.audio_epoch = 0
         self.parameters = {}
         self.video_frames = self.audio_frames = self.input_events = 0
+        self.key_frames = 0
         self.last_report = time.monotonic()
         self.link = (link_factory or TRANSPORT.LiveLink)(path, self.feedback)
         self.link.configure(800, 480, 30)
@@ -79,6 +80,7 @@ class Bridge:
                 self.parameters[unit[0] & 31] = b'\0\0\0\1' + unit
         key = any(unit[0] & 31 == 5 for unit in units)
         if key:
+            self.key_frames += 1
             if set(self.parameters) != {7, 8}:
                 return
             data = self.parameters[7] + self.parameters[8] + data
@@ -121,7 +123,10 @@ class Bridge:
         if time.monotonic() - self.last_report >= 5:
             self.link.report()
             self.log('bridge_stats', video_frames=self.video_frames,
-                     audio_frames=self.audio_frames, input_events=self.input_events)
+                     audio_frames=self.audio_frames, input_events=self.input_events,
+                     key_frames=self.key_frames, parameters=sorted(self.parameters),
+                     active=self.link.active, connected=self.link.connected,
+                     waiting_key=self.link.wait_key)
             self.last_report = time.monotonic()
 
     async def input(self, writer, key):
