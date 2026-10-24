@@ -17,7 +17,7 @@ carlink 主程序
 
 HiCar 原生接入主程序；CarPlay 保留独立 OpenXPlay，由统一后端接口管理。认证库通过 Rust FFI 复用既有 C ABI，检查结构大小、回调线程与对象生命周期。先保留现有音频子进程，优先去掉 Python 热路径和进程间媒体复制。
 
-当前 `app/Cargo.toml` 无第三方依赖，MSRV 为 Rust 1.74。新增 D-Bus、事件调度和加密依赖先核对工具链与 ARMv7 hard-float 支持，再通过 Actions 固定版本构建。保留 H.264 直通和有界音频解码，避免 H3 软件视频转码。
+当前应用工具链与声明版本均为 Rust 1.90。R1 固定引入 serde、serde_json、libloading 和 Unix libc；Cargo.lock、依赖源码归档、许可证及 SHA256 清单随应用打包。加密通过按需加载的 OpenSSL EVP 和既有 HiChain/HUKS C ABI 调用。保留 H.264 直通和有界音频解码。
 
 ## 三个实施批次
 
@@ -43,3 +43,14 @@ R1 交付可独立验证的协议模块与 FFI 测试；R2 替换实验接收链
 单台华为同时作为 HiCar 信源和 CarLife HU 已反馈桌面显示、点击和左右滑动。AudioFlinger 显示 CarLife 的 44.1 kHz 播放轨进入 `AUDIO_DEVICE_OUT_PROXY`；实际扬声器出声由独立 HU 或实车验证。
 
 继续跟进：无人操作发现/重连、测试应用退出恢复、长时稳定性、独立 HU 音画同步、麦克风/通话，以及 Lexus USB 兼容性和真实触控板输入。按[连接管理设计](connection-management.md)统一收敛。
+
+## R1 完成记录（2026-10-25）
+
+R1 已完成，源码位于 `app/src/hicar/`：有界增量帧解析、严格 JSON、Nearby/TLV/CRC、DMSDP/HiSight、RTP/ADTS、时钟、UIBC、AES-CTR 与 HiChain/HUKS FFI。认证回调限定在线程内；私有文件拒绝符号链接并检查权限，密钥只输出长度和哈希。新增命令为 `carlink hicar codec`、`auth-worker`、`identity-check`，正常 CarLife 启动不会加载认证库。
+
+- 提交 `d047e42` 的 [应用构建](https://github.com/Aki894/CarLink/actions/runs/40110088101)通过 73 项 Rust 单测和 1,700 项 Python/Rust 对照。
+- [完整构建](https://github.com/Aki894/CarLink/actions/runs/40110351064)的 native、rust-interop、firmware 全部成功，镜像验证与产物上传完成。
+- H3 上重复通过 1,700 项对照和 Rust/Python 双向混合绑定、持久化后认证、Rust 自互通与错误 PIN 拒绝。使用临时密钥目录，不覆盖真实配对。
+- 实际已有身份文件已由 Rust 只读加载，硬件种子和派生身份与 Python 一致，文件校验值保持不变。
+
+R2 接入真实 BlueZ、Wi-Fi/TCP 会话和媒体桥接；R3 再统一双协议连接管理。当前 HiCar 无线会话继续由 Python 实验接收器运行，R1 二进制用于协议与认证验证。

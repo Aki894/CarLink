@@ -29,7 +29,7 @@ class BeaconTests(unittest.TestCase):
         self.assertEqual(method.in_signature, 'oha{sv}')
         advertisement = Advertisement(beacon('00112233'), stop).introspect()
         self.assertEqual({p.name for p in advertisement.properties},
-                         {'Type', 'Discoverable', 'TxPower', 'Instance', 'ServiceData'})
+                         {'Type', 'Discoverable', 'LocalName', 'TxPower', 'Instance', 'ServiceData'})
 
     def test_sdp_matches_channel_and_service(self):
         record = ET.fromstring(service_record(23))

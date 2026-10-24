@@ -339,6 +339,10 @@ class Advertisement(ServiceInterface):
     def Discoverable(self) -> 'b':
         return True
 
+    @dbus_property(access=PropertyAccess.READ)
+    def LocalName(self) -> 's':
+        return 'CarLink'
+
     @dbus_property()
     def TxPower(self) -> 'n':
         # Supported by the tested AIC8800 adapter (-9..11 dBm).
