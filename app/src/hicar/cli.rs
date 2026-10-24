@@ -16,6 +16,7 @@ fn frame(v:&Value)->Result<Frame>{Ok(Frame{kind:bounded_u32(v,"kind")?,flags:v.g
 fn codec(v:&Value)->Result<Value>{
     match string(v,"op")? {
         "uint"=>Ok(value!({"hex":hex(&super::wire::uint(bounded_u32(v,"value")?)?)})),
+        "nearby-session"=>super::session::differential(v),
         "crc"=>Ok(value!({"crc":super::wire::crc16(&bytes(v,"data")?)})),
         "tlv"=>Ok(value!({"hex":hex(&super::wire::tlv(bounded_u32(v,"tag")?,&bytes(v,"data")?)?)})),
         "tlvs"=>Ok(value!({"values":super::wire::tlvs(&bytes(v,"data")?)?.iter().map(|(t,p)|value!([t,hex(p)])).collect::<Vec<_>>()})),
@@ -68,6 +69,8 @@ pub fn run(args:&[String])->Result<()>{
         Some("codec") if args.len()==1=>{while let Some(v)=line(&mut input)?{send(&match codec(&v){Ok(v)=>value!({"ok":true,"result":v}),Err(e)=>value!({"ok":false,"error":e})})?;}Ok(())},
         #[cfg(unix)]
         Some("auth-worker") if args.len()==1=>auth_worker(&mut input),
+        #[cfg(unix)]
+        Some("session-worker") if args.len()==2=>super::session::worker::run(args[1].parse().map_err(|_|"invalid private socket fd")?),
         #[cfg(unix)]
         Some("identity-check") if args.len()==1=>{
             let config=line(&mut input)?.ok_or("missing identity check configuration")?;

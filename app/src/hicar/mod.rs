@@ -4,6 +4,7 @@ pub mod json;
 pub mod media;
 pub mod crypto;
 pub mod identity;
+pub mod session;
 #[cfg(unix)]
 pub mod native;
 mod cli;

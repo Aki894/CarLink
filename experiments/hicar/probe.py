@@ -308,6 +308,11 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                 resource.authenticated = False
                 resource.session_key = None
             auth_session.close()
+        if negotiator and hasattr(negotiator, 'close'):
+            try:
+                negotiator.close()
+            except (ValueError, OSError, RuntimeError):
+                log('rust_channel_cleanup_stopped')
         if auth_stream:
             try:
                 auth_stream.finish()
@@ -427,6 +432,7 @@ class Profile(ServiceInterface):
         self.auth_identity = None
         self.auth_model = None
         self.resource = None
+        self.rust_worker = None
 
     @method()
     def Release(self):
@@ -446,10 +452,20 @@ class Profile(ServiceInterface):
             raise
         self.sequence += 1
         session = self.sequence
-        negotiator = Negotiator(self.control_summary, self.business_channel,
-                                 self.resource) if self.control_summary else None
-        auth_session = AuthSession(self.auth_identity, self.auth_model,
-                                   getattr(self, 'backend_factory', None)) if self.auth_identity else None
+        try:
+            if self.rust_worker:
+                from rust_session import Negotiator as RustNegotiator, AuthSession as RustAuthSession
+                negotiator = (RustNegotiator(self.rust_worker, self.resource, self.business_channel is not None)
+                              if self.decode_control else None)
+                auth_session = RustAuthSession(self.rust_worker) if self.auth_identity else None
+            else:
+                negotiator = Negotiator(self.control_summary, self.business_channel,
+                                         self.resource) if self.control_summary else None
+                auth_session = AuthSession(self.auth_identity, self.auth_model,
+                                           getattr(self, 'backend_factory', None)) if self.auth_identity else None
+        except BaseException:
+            sock.close()
+            raise
         task = asyncio.create_task(observe(sock, session, self.capture_dir,
                                            negotiator=negotiator, decode_control=self.decode_control,
                                            auth_session=auth_session, resource=self.resource))
@@ -501,6 +517,7 @@ async def close_tcp_streams(controls, clients, sockets):
 async def run(args):
     payload = beacon(args.model, args.sequence)
     stop = asyncio.Event()
+    rust_worker = None
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
@@ -523,7 +540,7 @@ async def run(args):
     if args.reply_identity:
         business_profile.auth_identity = load_or_create(args.identity)
         business_profile.auth_model = args.model.upper()
-        if args.auth_library:
+        if args.auth_library and not args.rust_session_binary:
             from hichain import Runtime, Session
             runtime = Runtime(args.auth_library, args.auth_store,
                               business_profile.auth_identity.device_id)
@@ -564,6 +581,13 @@ async def run(args):
                 # Discovery summary, business identity and native signing IDs
                 # must agree. The Runtime above keeps its persistent HUKS seed.
                 assert business_profile.auth_identity.device_id.encode('ascii') == profile.control_summary
+        if args.rust_session_binary:
+            from rust_session import Worker
+            rust_worker = Worker(args.rust_session_binary, args.identity, args.model, address,
+                                 args.auth_library, args.auth_store, args.network_offer,
+                                 profile.control_summary, args.channel + 1)
+            profile.rust_worker = business_profile.rust_worker = rust_worker
+            log('rust_connection_worker_ready')
         if args.network_offer:
             tcp_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             tcp_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -583,7 +607,11 @@ async def run(args):
                     sequence += 1
                     session = f'tcp-{port}-{sequence}'
                     log('tcp_connected', session=session, port=port)
-                    negotiator = Negotiator(profile.control_summary, resource=profile.resource) if decode_control else None
+                    if decode_control and rust_worker:
+                        from rust_session import Negotiator as RustNegotiator
+                        negotiator = RustNegotiator(rust_worker, profile.resource)
+                    else:
+                        negotiator = Negotiator(profile.control_summary, resource=profile.resource) if decode_control else None
                     task = asyncio.create_task(observe(client, session, args.capture_dir,
                                                        negotiator=negotiator, decode_control=decode_control,
                                                        dmsdp=DmsdpNegotiation(dmsdp_port) if dmsdp_port else None,
@@ -714,6 +742,8 @@ async def run(args):
                 await asyncio.wait_for(agent_manager.call_unregister_agent(ROOT + '/agent'), 3)
             except Exception as error:
                 log('agent_unregister_error', error=type(error).__name__)
+        if rust_worker:
+            rust_worker.close()
         bus.disconnect()
         try:
             if restore_bondable:
@@ -740,6 +770,7 @@ def main():
     parser.add_argument('--reply-identity', action='store_true', help='reply to the HiCar identity handshake')
     parser.add_argument('--identity', default=DEFAULT_PATH, help='private persistent identity/PIN file')
     parser.add_argument('--auth-library', help='optional pinned Linux HiChain shared library')
+    parser.add_argument('--rust-session-binary', help='experimental Rust connection worker; BlueZ/media stay in this adapter')
     parser.add_argument('--auth-store', default='/var/lib/carlink/hicar/keys',
                         help='private persistent HUKS directory')
     parser.add_argument('--network-interface', help='temporarily replace CarPlay hotspot with a HiCar AP')
@@ -751,6 +782,8 @@ def main():
     parser.add_argument('--audio-binary', default='/usr/local/lib/carlink/carplay/bin/carlink-audio')
     parser.add_argument('--capture-dir', help='optional private directory for raw streams')
     args = parser.parse_args()
+    if args.rust_session_binary and not (args.auth_library and args.network_interface and args.reply_control and args.reply_identity):
+        parser.error('--rust-session-binary requires the authenticated network test configuration')
     if args.live_socket and not (args.audio and args.network_interface and args.dmsdp_options):
         parser.error('--live-socket requires --audio, --network-interface and --dmsdp-options')
     if not 1 <= args.duration <= 900:

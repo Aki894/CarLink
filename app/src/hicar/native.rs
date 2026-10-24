@@ -183,6 +183,10 @@ impl<'a> Session<'a>{
         let _scope=Scope::enter(&mut *self.state);let code=unsafe{(self.runtime.receive)(self.handle,&buffer)};wipe(&mut raw);self.take(code)
     }
     pub fn results(&self)->&[i32]{&self.state.results}
+    /// Only the bounded private runtime IPC may export a key to the old media adapter.
+    pub(super) fn key_for_bridge(&self)->Option<Vec<u8>>{
+        if matches!(self.state.key.len(),16|32)&&self.state.results.contains(&0)&&!self.state.results.contains(&1){Some(self.state.key.clone())}else{None}
+    }
     pub fn key_summary(&self)->Result<Option<(String,usize)>>{
         if self.state.key.is_empty(){Ok(None)}else{Ok(Some((super::hex(&self.runtime.crypto.sha256(&self.state.key)?),self.state.key.len())))}
     }

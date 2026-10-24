@@ -1,0 +1,198 @@
+//! R2 connection state: Nearby/ResourceManager and authenticated business envelopes.
+//! The temporary BlueZ adapter exchanges secrets only over an inherited Unix socket.
+use super::{Result,wire::{self,Frame},json,hex,unhex};
+use serde_json::{Value,json as value};
+use std::collections::BTreeMap;
+
+fn text<'a>(v:&'a Value,k:&str)->Result<&'a str>{v.get(k).and_then(Value::as_str).ok_or_else(||format!("missing {k}"))}
+fn number(v:&Value,k:&str)->Result<u32>{v.get(k).and_then(Value::as_u64).and_then(|v|v.try_into().ok()).ok_or_else(||format!("invalid {k}"))}
+fn uint(data:&[u8],p:&mut usize)->Result<u32>{wire::read_uint(data,p)?.ok_or("truncated resource integer".into())}
+fn append(out:&mut Vec<u8>,tag:u32,data:&[u8])->Result<()>{out.extend(wire::tlv(tag,data)?);Ok(())}
+
+pub struct Offer {ssid:String,bssid:String,password:String,owner:String,client:String,pub port:u32}
+impl Offer {
+    pub fn parse(v:&Value)->Result<Self>{
+        let out=Self{ssid:text(v,"ssid")?.into(),bssid:text(v,"bssid")?.into(),password:text(v,"password")?.into(),
+            owner:text(v,"owner_ip")?.into(),client:text(v,"client_ip")?.into(),port:number(v,"port")?};
+        if !(1..=32).contains(&out.ssid.len())||!(8..=63).contains(&out.password.len())||!(1024..=65532).contains(&out.port)
+            ||!valid_mac(&out.bssid)||number(v,"frequency")?!=5745{return Err("invalid network offer".into());}
+        for s in [&out.ssid,&out.password]{if !s.is_ascii()||s.bytes().any(|b|matches!(b,0|b'\n'|b'\r'|b'#')){return Err("invalid network text".into());}}
+        let owner=out.owner.parse::<std::net::Ipv4Addr>().map_err(|_|"invalid owner address")?;
+        let client=out.client.parse::<std::net::Ipv4Addr>().map_err(|_|"invalid client address")?;
+        if owner==client||owner.octets()[..3]!=[192,168,49]||client.octets()[..3]!=[192,168,49]{return Err("invalid private network".into());}Ok(out)
+    }
+    fn credentials(&self)->Vec<u8>{format!("{}##{}\n{}\n{}\n5745\n1##version:3##{}##2##hicarApIp:{}",self.client,self.ssid,self.bssid,self.password,self.port,self.owner).into_bytes()}
+}
+impl Drop for Offer{fn drop(&mut self){unsafe{super::crypto::wipe(self.password.as_mut_vec());}}}
+fn valid_mac(s:&str)->bool{let p=s.split(':').collect::<Vec<_>>();p.len()==6&&p.iter().all(|v|v.len()==2&&u8::from_str_radix(v,16).is_ok())}
+
+pub struct Resource {offer:Offer,pub authenticated:bool,negotiated:bool,pub credentials_sent:bool,pub data_port:Option<u32>,pending:Vec<(u32,Vec<u8>)>}
+impl Resource {
+    pub fn new(offer:Offer)->Self{Self{offer,authenticated:false,negotiated:false,credentials_sent:false,data_port:None,pending:vec![]}}
+    pub fn reset(&mut self){self.authenticated=false;self.negotiated=false;self.credentials_sent=false;self.pending.clear();}
+    fn respond(&mut self,frame:&Frame)->Result<Option<Vec<u8>>>{
+        if !self.authenticated||frame.flags&1!=0{return Ok(None);}let mut replies=vec![];
+        for (tag,v) in wire::tlvs(&frame.payload)? {
+            let mut p=0;
+            match (frame.kind,tag){
+                (4,1)=>{
+                    if uint(&v,&mut p)?!=3{return Err("unsupported resource channel".into());}
+                    let detailed=wire::tlvs(&v[p..])?;if detailed.len()!=1||detailed[0].0!=3{return Err("unsupported capability".into());}
+                    let data=&detailed[0].1;if data.len()>256{return Err("capability exceeds limit".into());}
+                    let mut caps=BTreeMap::new();p=0;while p<data.len(){let k=uint(data,&mut p)?;let n=uint(data,&mut p)?;
+                        if caps.len()>=32||caps.insert(k,n).is_some(){return Err("duplicate/excess capability".into());}}
+                    let accepted=caps.get(&2)==Some(&1)&&caps.get(&4)==Some(&1)&&caps.get(&5).is_some_and(|n|n&16!=0);
+                    let mut result=wire::uint(3)?;result.extend(wire::uint(if accepted{1}else{255})?);
+                    if accepted{let mut role=vec![1];role.extend(wire::uint(5745)?);append(&mut result,3,&role)?;}
+                    append(&mut replies,2,&result)?;self.negotiated=accepted;
+                },
+                (4,3)=>{
+                    if !self.negotiated{return Err("network not negotiated".into());}
+                    let port=self.data_port.ok_or("DMSDP not listening")?;request(&v,3,20,1)?;
+                    let mut result=wire::uint(0)?;result.extend(wire::uint(port)?);result.extend(&v);append(&mut replies,4,&result)?;
+                },
+                (4,7)=>{
+                    let channel=uint(&v,&mut p)?;let status=uint(&v,&mut p)?;let selected=wire::tlvs(&v[p..])?;
+                    if !self.negotiated||channel!=3||status!=1||selected.len()!=1||selected[0].0!=3{return Err("invalid network selection".into());}
+                    let role=&selected[0].1;p=1;if role.first()!=Some(&2)||uint(role,&mut p)?!=5745||p!=role.len(){return Err("unsupported client role".into());}
+                    if self.pending.len()>=4{return Err("too many network commands".into());}self.pending.push((33,wire::tlv(1,&[])?));
+                },
+                (33,1|2|4)=>{
+                    if !self.negotiated{return Err("network command before negotiation".into());}
+                    if tag==1{append(&mut replies,2,b"busy")?;}else{
+                        if !std::str::from_utf8(&v).is_ok_and(valid_mac){return Err("invalid client MAC".into());}
+                        append(&mut replies,3,&self.offer.credentials())?;self.credentials_sent=true;
+                    }
+                },
+                (33,5)=>append(&mut replies,6,&[])?,_=>{},
+            }
+        }Ok((!replies.is_empty()).then_some(replies))
+    }
+    pub fn pending(&mut self)->Vec<(u32,Vec<u8>)>{std::mem::take(&mut self.pending)}
+}
+fn request(v:&[u8],channel:u32,business:u32,protocol:u32)->Result<()>{
+    let mut p=0;if uint(v,&mut p)?!=channel||uint(v,&mut p)?!=business{return Err("unsupported business request".into());}
+    let len=uint(v,&mut p)? as usize;
+    if len>128||len>v.len()-p{return Err("invalid business tag length".into());}
+    std::str::from_utf8(&v[p..p+len]).map_err(|_|"invalid business tag")?;p+=len;
+    if uint(v,&mut p)?!=protocol||p!=v.len(){return Err("unsupported business transport".into());}Ok(())
+}
+pub struct Negotiator {summary:Vec<u8>,business:Option<u32>,seen:u8}
+impl Negotiator {
+    pub fn new(summary:Vec<u8>,business:Option<u32>)->Result<Self>{
+        if !(1..=256).contains(&summary.len())||business.is_some_and(|n|!(1..=30).contains(&n)){return Err("invalid channel identity".into());}
+        Ok(Self{summary,business,seen:0})
+    }
+    pub fn complete(&self)->bool{self.seen==7}
+    pub fn respond(&mut self,f:&Frame,resource:&mut Resource)->Result<Option<Vec<u8>>>{
+        if f.flags&1!=0{return Ok(None);}
+        if matches!(f.kind,4|33)&&self.complete(){return resource.respond(f);}
+        let mut out=vec![];
+        if f.kind==2&&self.complete(){if let Some(channel)=self.business{for (tag,v) in wire::tlvs(&f.payload)?{if tag==3{
+            request(&v,2,19,0)?;let mut response=wire::uint(0)?;response.extend(wire::uint(channel)?);response.extend(v);response.extend(wire::uint(16)?);
+            response.extend([0,0,0xfe,0x36,0,0,0x10,0,0x80,0,0,0x80,0x5f,0x9b,0x34,0xfb]);append(&mut out,4,&response)?;
+        }}}}
+        else if f.kind==0 {let mut seen=self.seen;for (tag,v) in wire::tlvs(&f.payload)?{match tag{
+            1=>{if v.len()!=1||v[0]<2{return Err("unsupported CCMP version".into());}append(&mut out,2,&[2])?;seen|=1;},
+            3=>{if !(1..=256).contains(&v.len()){return Err("invalid summary length".into());}append(&mut out,4,&self.summary)?;seen|=2;},
+            5=>{if v.len()!=1||v[0]>2{return Err("invalid encryption preference".into());}append(&mut out,6,&[0])?;seen|=4;},_=>{},
+        }}self.seen=seen;}
+        Ok((!out.is_empty()).then_some(out))
+    }
+}
+fn frame(v:&Value)->Result<Frame>{Ok(Frame{kind:number(v,"kind")?,flags:number(v,"flags")?,options:vec![],payload:unhex(text(v,"payload")?)?})}
+pub fn differential(v:&Value)->Result<Value>{
+    let mut r=Resource::new(Offer::parse(&v["offer"])?);r.authenticated=v["authenticated"]==true;r.data_port=Some(r.offer.port+1);
+    let mut n=Negotiator::new(unhex(text(v,"summary")?)?,v.get("business").and_then(Value::as_u64).map(|n|n as u32))?;
+    let frames=v["frames"].as_array().ok_or("missing transcript")?;if frames.len()>128{return Err("transcript exceeds limit".into());}
+    let mut out=vec![];for f in frames {let reply=n.respond(&frame(f)?,&mut r)?;out.push(value!({"reply":reply.map(|v|hex(&v)),"complete":n.complete(),
+        "pending":r.pending().iter().map(|(k,v)|value!([k,hex(v)])).collect::<Vec<_>>(),"credentials_sent":r.credentials_sent}));}Ok(value!({"steps":out}))
+}
+
+#[cfg(unix)]pub mod worker {
+    use super::*;
+    use super::super::{native::{Runtime,Session},identity::Identity,crypto::{Crypto,wipe}};
+    use std::{io::{Read,Write},os::unix::{io::FromRawFd,net::UnixStream},path::Path};
+    const LIMIT:usize=256*1024;
+    fn read(s:&mut UnixStream)->Result<Option<Value>>{
+        let mut size=[0;4];match s.read(&mut size[..1]){Ok(0)=>return Ok(None),Ok(_)=>{},Err(_)=>return Err("private IPC read failed".into())};
+        s.read_exact(&mut size[1..]).map_err(|_|"truncated IPC header")?;let n=u32::from_be_bytes(size) as usize;
+        if n==0||n>LIMIT{return Err("invalid IPC length".into());}let mut bytes=vec![0;n];s.read_exact(&mut bytes).map_err(|_|"truncated IPC message")?;
+        // IPC is bounded separately from individual 64 KiB wireless envelopes.
+        let v=serde_json::from_slice(&bytes).map_err(|_|"invalid IPC JSON".into());wipe(&mut bytes);v
+    }
+    fn send(s:&mut UnixStream,v:&Value)->Result<()>{let mut data=serde_json::to_vec(v).map_err(|_|"IPC serialization failed")?;
+        if data.len()>LIMIT{return Err("IPC response exceeds limit".into());}
+        let result=s.write_all(&(data.len() as u32).to_be_bytes()).and_then(|_|s.write_all(&data)).map_err(|_|"private IPC write failed".into());wipe(&mut data);result
+    }
+    struct Business<'a>{native:Option<Session<'a>>,generation:u32}
+    impl Business<'_>{fn close(&mut self,r:&mut Resource){self.native=None;r.reset();}}
+    pub fn run(fd:i32)->Result<()>{
+        if fd<3{return Err("session worker requires a private socket fd".into());}
+        let mut socket=unsafe{UnixStream::from_raw_fd(fd)};socket.peer_addr().map_err(|_|"IPC fd is not a connected Unix socket")?;
+        let config=read(&mut socket)?.ok_or("missing private worker configuration")?;
+        let identity=Identity::load(Path::new(text(&config,"identity")?))?;let crypto=Crypto::load()?;
+        let model=text(&config,"model")?;let own=identity.wire_id(model,text(&config,"address")?,&crypto)?;
+        // The old Python runtime initializes HUKS with the persisted random ID,
+        // before deriving the Bluetooth signing identity. Keep that exact seed.
+        let runtime=Runtime::open(Path::new(text(&config,"library")?),Path::new(text(&config,"store")?),&identity.device_id)?;
+        let mut resource=Resource::new(Offer::parse(&config["offer"])?);resource.data_port=Some(resource.offer.port+1);
+        let mut channels:BTreeMap<u32,Negotiator>=BTreeMap::new();let mut next=0u32;
+        let mut business=Business{native:None,generation:0};let mut auth_open=false;let mut peer_seen=false;
+        send(&mut socket,&value!({"ok":true,"ready":true,"wire_identity_sha256":hex(&crypto.sha256(own.as_bytes())?)}))?;
+        while let Some(command)=read(&mut socket)?{
+            let op=text(&command,"op")?;let result:Result<Value>=(||{match op {
+                "open"=>{if channels.len()>=8{return Err("channel limit".into());}next=next.checked_add(1).ok_or("channel generation exhausted")?;
+                    let channel=if command["business"]==true{Some(number(&config,"business_channel")?)}else{None};
+                    channels.insert(next,Negotiator::new(own.as_bytes().to_vec(),channel)?);Ok(value!({"channel":next}))},
+                "nearby"=>{let n=channels.get_mut(&number(&command,"channel")?).ok_or("stale channel")?;
+                    let reply=n.respond(&frame(&command)?,&mut resource)?;Ok(value!({"reply":reply.map(|v|hex(&v)),"complete":n.complete(),
+                        "pending":resource.pending().iter().map(|(k,v)|value!([k,hex(v)])).collect::<Vec<_>>(),"credentials_sent":resource.credentials_sent}))},
+                "close-channel"=>{channels.remove(&number(&command,"channel")?);Ok(value!({}))},
+                "auth-open"=>{if auth_open{return Err("business authentication already active".into());}
+                    business.generation=business.generation.checked_add(1).ok_or("auth generation exhausted")?;business.close(&mut resource);peer_seen=false;auth_open=true;
+                    Ok(value!({"generation":business.generation}))},
+                "auth"=>{
+                    if !auth_open||number(&command,"generation")?!=business.generation{return Err("stale authentication session".into());}
+                    let envelope=text(&command,"envelope")?;let (operation,inner)=json::envelope(envelope.as_bytes(),peer_seen)?;
+                    if operation==1{let peer=text(&inner,"deviceId")?;business.native=Some(Session::new(&runtime,&own,peer,&identity.pin,2)?);peer_seen=true;
+                        let details=value!({"deviceId":own,"devicename":identity.name,"has_pin":true,"usb_connection":false,"CONNECT_ABILITY_KEY":"1","CAR_MODE_ID":model});
+                        let reply=value!({"version":"A_0","discover_type":1,"oper_type":1,"data":details.to_string(),"usb_connection":false});
+                        return Ok(value!({"reply":hex(reply.to_string().as_bytes()),"metadata":{"operation":1,"peer_id_bytes":peer.len(),"pin_required":true}}));}
+                    let session=business.native.as_mut().ok_or("authentication before identity")?;
+                    let (code,packets)=session.receive(inner.to_string().as_bytes())?;
+                    if session.results().contains(&1){return Err("HiChain authentication failed".into());}
+                    let mut replies=vec![];for packet in packets {let parsed=json::parse(&packet)?;if !parsed.is_object(){return Err("invalid native response".into());}
+                        let p=std::str::from_utf8(&packet).map_err(|_|"invalid native text")?;
+                        replies.extend(value!({"version":"A_0","discover_type":1,"oper_type":3,"data":p,"usb_connection":false}).to_string().as_bytes());}
+                    let mut key=session.key_for_bridge();resource.authenticated=session.results().contains(&0)&&key.is_some();
+                    let key_hex=if resource.authenticated{key.as_ref().map(|k|hex(k))}else{None};
+                    if let Some(k)=key.as_mut(){wipe(k);}
+                    Ok(value!({"reply":if replies.is_empty(){None}else{Some(hex(&replies))},"key":key_hex,
+                        "metadata":{"operation":3,"message":inner.get("message").and_then(Value::as_u64),"backend":"hichain","native_code":code,
+                        "replies":if replies.is_empty(){0}else{1},"results":session.results(),"key_ready":resource.authenticated}}))
+                },
+                "auth-close"=>{if command["generation"].as_u64()==Some(business.generation as u64){business.close(&mut resource);auth_open=false;peer_seen=false;}Ok(value!({}))},
+                "close"=>Ok(value!({"closed":true})),_=>Err("unknown session command".into()),
+            }})();
+            match result{Ok(mut v)=>{v["ok"]=true.into();send(&mut socket,&v)?;if op=="close"{break;}},Err(_)=>{
+                // Protocol errors revoke authorization before any later network command.
+                if op=="auth"&&command["generation"].as_u64()==Some(business.generation as u64){business.close(&mut resource);auth_open=false;peer_seen=false;}
+                send(&mut socket,&value!({"ok":false,"error":"Rust session command rejected"}))?;
+            }}
+        }
+        business.close(&mut resource);Ok(())
+    }
+}
+
+#[cfg(test)]mod tests{
+    use super::*;
+    fn offer()->Offer{Offer::parse(&value!({"ssid":"CarLink","bssid":"02:00:00:00:00:01","password":"12345678","owner_ip":"192.168.49.1","client_ip":"192.168.49.2","frequency":5745,"port":4005})).unwrap()}
+    #[test]fn authentication_gates_credentials_and_generation_reset(){
+        let mut r=Resource::new(offer());let f=Frame{kind:33,flags:0,options:vec![],payload:wire::tlv(2,b"02:11:22:33:44:55").unwrap()};
+        assert!(r.respond(&f).unwrap().is_none());r.authenticated=true;assert!(r.respond(&f).is_err());r.negotiated=true;
+        assert!(r.respond(&f).unwrap().is_some());assert!(r.credentials_sent);r.reset();assert!(!r.credentials_sent&&!r.authenticated);
+    }
+    #[test]fn negotiation_is_atomic_on_malformed_tlv(){let mut n=Negotiator::new(vec![65;64],Some(24)).unwrap();let mut r=Resource::new(offer());
+        let mut payload=wire::tlv(1,&[2]).unwrap();payload.extend(wire::tlv(3,&[]).unwrap());assert!(n.respond(&Frame{kind:0,flags:0,options:vec![],payload},&mut r).is_err());assert_eq!(n.seen,0);}
+}
