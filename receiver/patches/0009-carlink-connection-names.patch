@@ -62,7 +62,7 @@
      Ok(credentials)
  }
  /// How often the Wi-Fi device's NetworkManager state is read while it is not yet usable.
-@@ -835,17 +837,13 @@
+@@ -835,32 +837,29 @@
      use super::*;
      use std::os::unix::fs::{MetadataExt, PermissionsExt};
      #[test]
@@ -82,7 +82,11 @@
          assert_eq!(password.len(), 10);
          assert!(password
              .bytes()
-@@ -856,11 +854,12 @@
+             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
+         let path = dir.join("hotspot.credentials");
+-        let legacy = b"Old-Hotspot-12345678\nlong-legacy-password-1234567890\n";
++        let legacy = b"OpenXPlay-Linux-OLD1\nlong-legacy-password-1234567890\n";
+         std::fs::write(&path, legacy).unwrap();
          assert_eq!(
              hotspot_credentials(&dir).unwrap(),
              (
