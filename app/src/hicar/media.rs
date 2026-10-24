@@ -3,7 +3,7 @@ use super::Result;
 use std::collections::BTreeMap;
 
 const RATES:[u32;13]=[96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350];
-#[derive(Clone,Debug)]
+#[derive(Clone)]
 pub struct Aac {pub data:Vec<u8>,pub rate:u32,pub channels:u8,pub samples:u32}
 pub fn adts(data:&[u8])->Result<Vec<Aac>>{
     let mut offset=0;let mut out=Vec::new();

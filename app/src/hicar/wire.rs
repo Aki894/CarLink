@@ -42,8 +42,12 @@ pub fn tlvs(data:&[u8])->Result<Vec<(u32,Vec<u8>)>> {
 
 #[derive(Clone,Copy)]
 pub enum Format { Nearby, Module, Control, HiSight }
-#[derive(Debug,PartialEq,Eq)]
+#[derive(PartialEq,Eq)]
 pub struct Frame {pub kind:u32,pub flags:u32,pub options:Vec<u8>,pub payload:Vec<u8>}
+impl std::fmt::Debug for Frame{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{
+    f.debug_struct("Frame").field("kind",&self.kind).field("flags",&self.flags)
+        .field("option_bytes",&self.options.len()).field("payload_bytes",&self.payload.len()).finish()
+}}
 impl Frame {
     pub fn encode(&self,format:Format)->Result<Vec<u8>> {
         let size=self.payload.len();
@@ -125,8 +129,12 @@ impl Decoder {
     pub fn finish(&self)->Result<()> {if self.failed||!self.buffer.is_empty(){Err("incomplete or failed stream".into())}else{Ok(())}}
 }
 
-#[derive(Debug,PartialEq,Eq)]
+#[derive(PartialEq,Eq)]
 pub struct Message {pub start:String,pub headers:BTreeMap<String,String>,pub body:Vec<u8>}
+impl std::fmt::Debug for Message{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{
+    f.debug_struct("Message").field("method",&self.start.split(' ').next().unwrap_or(""))
+        .field("header_names",&self.headers.keys().collect::<Vec<_>>()).field("body_bytes",&self.body.len()).finish()
+}}
 pub struct Messages {protocol:&'static str,buffer:Vec<u8>,failed:bool}
 fn header_name(s:&str)->bool {
     !s.is_empty() && s.len()<=64 && s.as_bytes()[0].is_ascii_alphabetic()

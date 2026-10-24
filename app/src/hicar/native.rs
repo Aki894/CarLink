@@ -198,4 +198,22 @@ impl Drop for Session<'_>{fn drop(&mut self){let _scope=Scope::enter(&mut *self.
         assert_eq!(unsafe{confirm(std::ptr::null(),1)},0);assert_eq!(unsafe{confirm(std::ptr::null(),99)},-1);
         assert_eq!(unsafe{read_file(std::ptr::null(),0,std::ptr::null_mut(),0)},-1);
     }
+    #[test]fn private_store_callbacks_reject_links_permissions_and_overflow(){
+        use std::{ffi::CString,os::unix::fs::symlink};
+        let root=std::env::temp_dir().join(format!("carlink-huks-{}-{}",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        *STORE.lock().unwrap()=Some(Store{directory:File::open(&root).unwrap(),udid:[1;32]});
+        let name=CString::new("info1.data").unwrap();let mut data=[0u8;8];
+        assert_eq!(unsafe{write_file(name.as_ptr(),0,b"abc".as_ptr(),3)},0);
+        assert_eq!(unsafe{read_file(name.as_ptr(),0,data.as_mut_ptr(),8)},3);
+        assert_eq!(&data[..3],b"abc");assert_eq!(unsafe{file_size(name.as_ptr())},3);
+        assert_eq!(unsafe{write_file(name.as_ptr(),u32::MAX,b"a".as_ptr(),1)},-1);
+        fs::set_permissions(root.join("info1.data"),fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(unsafe{read_file(name.as_ptr(),0,data.as_mut_ptr(),8)},-1);
+        symlink(root.join("info1.data"),root.join("info2.data")).unwrap();
+        let link=CString::new("info2.data").unwrap();assert_eq!(unsafe{file_size(link.as_ptr())},-1);
+        let traversal=CString::new("../info1.data").unwrap();assert_eq!(unsafe{file_size(traversal.as_ptr())},-1);
+        *STORE.lock().unwrap()=None;fs::remove_dir_all(root).unwrap();
+    }
 }
