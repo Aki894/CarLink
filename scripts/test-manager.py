@@ -29,8 +29,8 @@ try:
         except BlockingIOError:record('overlap');raise SystemExit(2)
     record('start',args=sys.argv[3:])
     scenario=(root/'scenario').read_text() if (root/'scenario').exists() else ''
-    if role=='carplay' and scenario in ('auth','refused','offline'):
-        reason={'auth':'org.bluez.Error.AuthenticationFailed','refused':'Connection refused (os error 111)','offline':'Host is down'}[scenario]
+    if role=='carplay' and scenario in ('auth','refused','offline','unpaired'):
+        reason={'auth':'org.bluez.Error.AuthenticationFailed','refused':'Connection refused (os error 111)','offline':'Host is down','unpaired':'The configured iPhone is no longer paired'}[scenario]
         for _ in range(3 if scenario=='refused' else 1):
             print(json.dumps(dict(event='stage',stage='WaitingForPairedIphone',reason=reason)),flush=True);time.sleep(.05)
     elif role=='carplay':
@@ -60,7 +60,7 @@ def check(binary):
             "os.write(fd,(json.dumps(dict(event=('remove' if 'remove' in sys.argv else 'setting'),args=sys.argv[1:]))+" + repr(chr(10)) + ").encode());os.close(fd)\n" +
             "if 'remove' in sys.argv:(root/'scenario').write_text('')\n")
         bt.chmod(0o700)
-        config = dict(schema=1, socket=str(root / 'control.sock'), live_socket=str(root / 'live.sock'), state=str(root / 'devices.json'),
+        config = dict(schema=1, socket=str(root / 'control.sock'), live_socket=str(root / 'live.sock'), state=str(root / 'devices.json'), radio_lock=str(root/'radio-owner.lock'),
             carlife=[sys.executable, str(mock), str(root), 'carlife'],
             carplay=[sys.executable, str(mock), str(root), 'carplay'], hicar=[sys.executable, str(mock), str(root), 'hicar'],
             devices=[cp, hc], initial='carplay', bluetoothctl=str(bt), connect_seconds=2, stable_seconds=1, pair_seconds=5)
@@ -98,6 +98,10 @@ def check(binary):
             p=subprocess.Popen([*runner,binary,'manager','run','--config',str(root/'config.json')],stdout=log,stderr=log)
             s=until(lambda s:s['protocol']=='carplay' and s['active'])
             first_life=s['carlife_pid']
+            duplicate=dict(config,socket=str(root/'second/control.sock'),live_socket=str(root/'second/live.sock'),state=str(root/'second/state.json'))
+            (root/'duplicate.json').write_text(json.dumps(duplicate));(root/'duplicate.json').chmod(0o600)
+            other=subprocess.run([*runner,binary,'manager','run','--config',str(root/'duplicate.json')],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
+            assert other.returncode!=0, 'second runtime acquired the same radio'
             for _ in range(3):
                 for protocol,device in [('hicar',hc),('carplay',cp)]:
                     ctl(op='connect',protocol=protocol,address=device['address'])
@@ -118,6 +122,10 @@ def check(binary):
             ctl(op='connect',protocol='carplay',address=cp['address'])
             s=until(lambda s:s['protocol']=='hicar' and s['active'])
             assert not any(e['event']=='remove' for e in events()), 'ordinary offline erased pairing'
+            (root/'scenario').write_text('unpaired')
+            ctl(op='connect',protocol='carplay',address=cp['address'])
+            until(lambda s:s['protocol']=='carplay' and s['pairing'])
+            assert not any(e['event']=='remove' for e in events()), 'missing pairing was unnecessarily removed'
             (root/'scenario').write_text('auth')
             ctl(op='connect',protocol='carplay',address=cp['address'])
             s=until(lambda s:s['protocol']=='carplay' and s['active'] and s['pairing'])

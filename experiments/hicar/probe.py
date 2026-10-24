@@ -826,6 +826,15 @@ def main():
     if args.capture_dir:
         Path(args.capture_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
     import fcntl  # Linux-only runtime; pure helpers can be tested on Windows.
+    radio_lock = None
+    if not args.managed:
+        descriptor = os.open('/run/lock/carlink-radio.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        radio_lock = os.fdopen(descriptor, 'a')
+        try:
+            fcntl.flock(radio_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            radio_lock.close()
+            parser.error('the connection manager owns the radio; stop it before a standalone probe')
     lock = open('/run/lock/carlink-hicar-probe.lock', 'a')
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -850,6 +859,8 @@ def main():
                     asyncio.run(asyncio.wait_for(run(args), timeout=args.duration + 30))
     finally:
         lock.close()
+        if radio_lock:
+            radio_lock.close()
 
 
 if __name__ == '__main__':

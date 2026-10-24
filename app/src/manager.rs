@@ -21,6 +21,7 @@ impl Device{fn validate(&self)->Result<()>{if !mac(&self.address)||self.name.is_
 #[derive(Deserialize)]
 struct Config{schema:u32,socket:PathBuf,live_socket:PathBuf,state:PathBuf,carlife:Vec<String>,carplay:Vec<String>,hicar:Vec<String>,
     #[serde(default)]devices:Vec<Device>,#[serde(default)]initial:Option<Protocol>,#[serde(default)]bluetoothctl:Option<String>,
+    #[serde(default)]radio_lock:Option<PathBuf>,
     #[serde(default="connect_seconds")]connect_seconds:u64,#[serde(default="stable_seconds")]stable_seconds:u64,#[serde(default="pair_seconds")]pair_seconds:u64}
 fn connect_seconds()->u64{30}fn stable_seconds()->u64{10}fn pair_seconds()->u64{120}
 #[derive(Default,Deserialize,Serialize)]
@@ -256,6 +257,12 @@ fn exchange(stream:&mut UnixStream)->Result<Value>{
 fn serve(config:&Path)->Result<()>{
     let config:Config=serde_json::from_slice(&private_read(config)?).map_err(|_|"invalid manager configuration")?;
     let mut owner=Owner::new(config)?;let parent=owner.config.socket.parent().ok_or("control parent missing")?;private_dir(parent)?;
+    let radio_path=owner.config.radio_lock.as_deref().unwrap_or(Path::new("/run/lock/carlink-radio.lock"));
+    if !radio_path.is_absolute(){return Err("radio lock path must be absolute".into());}
+    let radio=OpenOptions::new().read(true).write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(radio_path).map_err(|_|"cannot open radio ownership lock")?;
+    if !radio.metadata().map_err(|_|"cannot stat radio lock")?.is_file()||unsafe{libc::flock(radio.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0{
+        return Err("another process owns the wireless radio".into());
+    }
     let lock=OpenOptions::new().read(true).write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(parent.join("owner.lock")).map_err(|_|"cannot acquire manager lock")?;
     if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0{return Err("another connection manager owns this runtime".into());}
     if owner.config.socket.exists(){return Err("control socket already exists; inspect its owner".into());}
@@ -288,7 +295,7 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
 #[cfg(test)]mod tests{use super::*;
     #[test]fn ordinary_offline_does_not_erase_pairing(){for s in ["Host is down","Connection timed out","No route to host","AirPlay session ended"]{assert!(!auth_mismatch(s));}assert!(auth_mismatch("org.bluez.Error.AuthenticationFailed"));}
     #[test]fn stale_generation_cannot_steal_active_backend(){
-        let c=Config{schema:1,socket:"/tmp/cm/control".into(),live_socket:"/tmp/cm/live".into(),state:"/tmp/cm/missing-state".into(),carlife:vec![],carplay:vec![],hicar:vec![],devices:vec![],initial:None,bluetoothctl:None,connect_seconds:30,stable_seconds:10,pair_seconds:120};
+        let c=Config{schema:1,socket:"/tmp/cm/control".into(),live_socket:"/tmp/cm/live".into(),state:"/tmp/cm/missing-state".into(),carlife:vec![],carplay:vec![],hicar:vec![],devices:vec![],initial:None,bluetoothctl:None,radio_lock:None,connect_seconds:30,stable_seconds:10,pair_seconds:120};
         let mut owner=Owner::new(c).unwrap();owner.status.generation=3;owner.status.protocol=Some(Protocol::Carplay);
         owner.ingest(2,json!({"event":"stage","stage":"WirelessActive"})).unwrap();assert!(!owner.status.active);
     }
