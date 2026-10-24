@@ -84,4 +84,15 @@ pub fn envelope(data:&[u8],identity_seen:bool)->Result<(u64,Value)> {
         for input in [b"{\"x\":1,\"x\":2}".as_slice(),b"{\"x\":{\"a\":1,\"a\":2}}",b"{\"x\":NaN}"]{assert!(parse(input).is_err());}
         let mut s=Stream::new();assert!(s.feed(&[b'{';33]).is_err());assert!(s.feed(b"{}").is_err());
     }
+    #[test]fn wireless_envelope_sequence_and_peer_limits(){
+        let request=|operation:u64,inner:Value|serde_json::to_vec(&serde_json::json!({
+            "version":"A_0","discover_type":1,"oper_type":operation,"data":inner.to_string(),"usb_connection":false})).unwrap();
+        let identity=request(1,serde_json::json!({"deviceId":"AB".repeat(32)}));
+        assert_eq!(envelope(&identity,false).unwrap().0,1);
+        assert!(envelope(&identity,true).is_err());
+        assert!(envelope(&request(1,serde_json::json!({"deviceId":"X".repeat(65)})),false).is_err());
+        assert!(envelope(&request(1,serde_json::json!({"deviceId":"peer","usb_connection":true})),false).is_err());
+        let auth=request(3,serde_json::json!({"message":17}));
+        assert!(envelope(&auth,false).is_err());assert_eq!(envelope(&auth,true).unwrap().0,3);
+    }
 }

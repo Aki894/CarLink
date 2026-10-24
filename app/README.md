@@ -1,7 +1,32 @@
 # CarLink native application
 
-Dependency-free Rust binary: **`carlink`**, targeting ARMv7 H3 boards.
+Rust binary: **`carlink`**, targeting ARMv7 H3 boards, built with the pinned 1.90 toolchain.
 The CarLife MD process is connected to the independent CarPlay receiver; see the [runtime guide](../docs/live-forwarding.md).
+
+## HiCar Rust foundation (R1)
+
+The native application now includes bounded Nearby/DMSDP/HiSight framing,
+strict business JSON, RTP/ADTS and reorder tracking, clock conversion, UIBC,
+system OpenSSL loading, and a thread-confined HiChain/HUKS FFI adapter.
+The diagnostic modes below do not acquire Bluetooth, Wi-Fi, or USB:
+
+```sh
+printf '%s\n' '{"op":"uint","value":128}' | carlink hicar codec
+python3 scripts/test-hicar-rust.py /path/to/carlink
+python3 scripts/test-hicar-rust-auth.py /path/to/carlink /path/to/libcarlink_hichain.so
+```
+
+`hicar auth-worker` reads private configuration and protocol messages from
+stdin and returns replies over stdout. It is for isolated synthetic tests;
+the harness uses temporary stores, logs metadata only, tests both correct and
+wrong PINs, and restarts processes to check persisted Rust/Python STS trust.
+The C library is loaded on demand; normal CarLife startup does not initialize HUKS.
+The production wireless HiCar session remains in Python until R2/R3 acceptance.
+See the [migration plan](../docs/hicar-rust.md).
+
+Dependencies are pinned in Cargo.lock. CI packages their source archives and
+license notices under `share/source/rust` and `share/licenses/rust`, and includes
+them in the firmware checksum checks.
 
 ## CarLife transport and synthetic media
 
