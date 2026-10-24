@@ -1,4 +1,4 @@
-//! R1 protocol/native foundation. No radio or production service ownership.
+//! HiCar protocol/native foundation and the R2 private connection worker.
 pub mod wire;
 pub mod json;
 pub mod media;

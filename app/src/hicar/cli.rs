@@ -79,7 +79,7 @@ pub fn run(args:&[String])->Result<()>{
             send(&value!({"schema":1,"wire_identity_sha256":hex(&crypto.sha256(wire.as_bytes())?),
                 "hardware_seed_sha256":hex(&crypto.sha256(id.device_id.as_bytes())?),"name_length":id.name.chars().count()}))
         },
-        _=>Err("Usage: carlink hicar codec | auth-worker (bounded development tools; no radio access)".into()),
+        _=>Err("Usage: carlink hicar codec | auth-worker | identity-check | session-worker FD (private adapter IPC)".into()),
     }
 }
 #[cfg(unix)]fn auth_worker(input:&mut impl BufRead)->Result<()>{

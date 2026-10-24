@@ -24,6 +24,17 @@ The C library is loaded on demand; normal CarLife startup does not initialize HU
 The production wireless HiCar session remains in Python until R2/R3 acceptance.
 See the [migration plan](../docs/hicar-rust.md).
 
+R2 adds `hicar session-worker FD`, an experimental connection backend used by
+`experiments/hicar/probe.py --rust-session-binary /path/to/carlink`. FD must be an
+inherited connected Unix socket above stderr. The worker reads the existing
+private identity itself and owns Nearby/resource negotiation and native HiChain
+authentication. Secret replies and the temporary Python media adapter's session
+key travel only through that socket. BlueZ registration and media still run in
+the adapter during this migration step; production startup is unchanged.
+
+`scripts/test-hicar-rust-session.py` compares connection transcripts, malformed
+IPC, first binding and persisted trusted authentication against Python.
+
 Dependencies are pinned in Cargo.lock. CI packages their source archives and
 license notices under `share/source/rust` and `share/licenses/rust`, and includes
 them in the firmware checksum checks.

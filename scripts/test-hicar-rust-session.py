@@ -6,6 +6,9 @@ import json
 import os
 from pathlib import Path
 import random
+import socket
+import struct
+import subprocess
 import sys
 import tempfile
 
@@ -174,9 +177,32 @@ def authentication(binary, library, rust_library):
                           identity_unchanged=True, raw_credentials_logged=False)))
 
 
+def broken_ipc(binary):
+    runner = json.loads(os.environ.get('CARLINK_RUST_RUNNER', '[]'))
+    for header in [struct.pack('!I', 0), struct.pack('!I', 256 * 1024 + 1), b'\x00\x01']:
+        parent, child = socket.socketpair()
+        process = None
+        try:
+            process = subprocess.Popen([*runner, binary, 'hicar', 'session-worker', str(child.fileno())],
+                pass_fds=(child.fileno(),), stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            child.close()
+            parent.sendall(header)
+            parent.shutdown(socket.SHUT_WR)
+            assert process.wait(timeout=5) != 0, 'invalid private IPC accepted'
+        finally:
+            parent.close()
+            child.close()
+            if process and process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+    print(json.dumps(dict(rust_invalid_ipc='passed', cases=3)))
+
+
 if __name__ == '__main__':
     binary = str(Path(sys.argv[1]).resolve())
     transcript(binary)
+    broken_ipc(binary)
     if len(sys.argv) > 2:
         authentication(binary, str(Path(sys.argv[2]).resolve()),
                        str(Path(sys.argv[3] if len(sys.argv) > 3 else sys.argv[2]).resolve()))
