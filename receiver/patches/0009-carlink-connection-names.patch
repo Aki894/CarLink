@@ -1,0 +1,115 @@
+--- a/rust/direlay-linux/src/branding.rs
++++ b/rust/direlay-linux/src/branding.rs
+@@ -1,24 +1,22 @@
+ // SPDX-FileCopyrightText: 2026 OpenXPlay.org
+ // SPDX-License-Identifier: AGPL-3.0-only
+ // Created by riko chen on 2026-10-15
+-//! Names and the car-button icon the Linux relay shows to iPhones, head units and browsers. Every
+-//! name says "Linux" so a Linux relay is never mistaken for the Android app; the car-button tile is
+-//! the same on both relays.
++//! CarLink connection names; upstream copyright and license notices are retained.
+ 
+ /// Bluetooth alias and SDP service name, iAP2 and AirPlay device name, mDNS instance and admin title.
+-pub const DEVICE_NAME: &str = "OpenXPlay Linux";
++pub const DEVICE_NAME: &str = "CarLink";
+ /// Product the device reports as its model.
+-pub const MODEL: &str = "OpenXPlay Relay Linux";
++pub const MODEL: &str = "CarLink";
+ /// Manufacturer reported over iAP2 and AirPlay.
+-pub const MANUFACTURER: &str = "OpenXPlay";
++pub const MANUFACTURER: &str = "CarLink";
+ /// Label the iPhone shows with the car-button (OEM) icon on its "back to the car" tile.
+-pub const OEM_ICON_LABEL: &str = "OpenXPlay";
++pub const OEM_ICON_LABEL: &str = "CarLink";
+ /// Side of the car-button icon in pixels, the size of the icon the Android relay sends.
+ pub const OEM_ICON_PIXELS: u32 = 192;
+ /// Opaque square PNG of the car-button icon, rendered from the launcher icon by
+ /// android/tools/carplay_oem_icon.py.
+ pub const OEM_ICON_PNG: &[u8] = include_bytes!("../assets/oem-icon.png");
+-/// Open provisioning hotspot, followed by the last two Wi-Fi MAC octets.
+-pub const SETUP_SSID_PREFIX: &str = "OpenXPlay-Linux-Setup-";
+-/// CarPlay hotspot ("this device's hotspot" mode), followed by four random uppercase letters/digits.
+-pub const HOTSPOT_SSID_PREFIX: &str = "OpenXPlay-Linux-";
++/// Open provisioning hotspot name.
++pub const SETUP_SSID: &str = "CarLink";
++/// CarPlay hotspot name; passwords and device identities remain unique.
++pub const HOTSPOT_SSID: &str = "CarLink";
+--- a/rust/direlay-linux/src/linux_hotspot.rs
++++ b/rust/direlay-linux/src/linux_hotspot.rs
+@@ -259,11 +259,7 @@
+     let s = match std::fs::read_to_string(&p) {
+         Ok(s) => s,
+         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+-            let ssid = format!(
+-                "{}{}",
+-                crate::branding::HOTSPOT_SSID_PREFIX,
+-                random_characters(4, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")?
+-            );
++            let ssid = crate::branding::HOTSPOT_SSID.to_owned();
+             let password = random_characters(10, b"abcdefghijklmnopqrstuvwxyz0123456789")?;
+             let s = format!("{ssid}\n{password}\n");
+             private_state_file(&p, s.as_bytes())?;
+@@ -280,6 +276,12 @@
+         }
+     })?;
+     validate_hotspot_credentials(&credentials.0, &credentials.1).map_err(std::io::Error::other)?;
++    // Rename existing devices without rotating their hotspot password or identity.
++    if credentials.0.starts_with("OpenXPlay-Linux-") {
++        let credentials = (crate::branding::HOTSPOT_SSID.to_owned(), credentials.1);
++        private_state_file(&p, &serde_json::to_vec(&credentials)?)?;
++        return Ok(credentials);
++    }
+     Ok(credentials)
+ }
+ /// How often the Wi-Fi device's NetworkManager state is read while it is not yet usable.
+@@ -835,17 +837,13 @@
+     use super::*;
+     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+     #[test]
+-    fn fresh_credentials_are_short_and_existing_files_are_unchanged() {
++    fn carlink_credentials_keep_existing_passwords() {
+         let dir = std::env::temp_dir().join(format!(
+             "hotspot-{}",
+             crate::admin::auth::random_hex(8).unwrap()
+         ));
+         let (ssid, password) = hotspot_credentials(&dir).unwrap();
+-        let suffix = ssid.strip_prefix("OpenXPlay-Linux-").unwrap();
+-        assert_eq!(suffix.len(), 4);
+-        assert!(suffix
+-            .bytes()
+-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()));
++        assert_eq!(ssid, "CarLink");
+         assert_eq!(password.len(), 10);
+         assert!(password
+             .bytes()
+@@ -856,11 +854,12 @@
+         assert_eq!(
+             hotspot_credentials(&dir).unwrap(),
+             (
+-                "Old-Hotspot-12345678".into(),
++                "CarLink".into(),
+                 "long-legacy-password-1234567890".into()
+             )
+         );
+-        assert_eq!(std::fs::read(&path).unwrap(), legacy);
++        let persisted: (String, String) = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
++        assert_eq!(persisted, ("CarLink".into(), "long-legacy-password-1234567890".into()));
+         std::fs::remove_dir_all(dir).unwrap();
+     }
+     #[test]
+--- a/rust/direlay-linux/src/provision.rs
++++ b/rust/direlay-linux/src/provision.rs
+@@ -237,12 +237,7 @@
+             carlink_held: false,
+             cli,
+             interface,
+-            setup_ssid: format!(
+-                "{}{}{}",
+-                crate::branding::SETUP_SSID_PREFIX,
+-                octets[4].to_uppercase(),
+-                octets[5].to_uppercase()
+-            ),
++            setup_ssid: crate::branding::SETUP_SSID.into(),
+             state_file,
+             owned,
+             status: WifiClient::default(),

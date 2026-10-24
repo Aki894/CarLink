@@ -2,10 +2,23 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from identity import Identity, load, load_or_create, set_pin
+from identity import Identity, load, load_or_create, set_pin, set_name
 
 
 class IdentityTests(unittest.TestCase):
+    def test_rename_retains_pin_and_hardware_seed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'identity.json'
+            original = load_or_create(path)
+            renamed = set_name(path, 'CarLink')
+            self.assertEqual(renamed.device_id, original.device_id)
+            self.assertEqual(renamed.pin, original.pin)
+            self.assertEqual(load(path), renamed)
+            before = path.read_bytes()
+            with self.assertRaises(ValueError):
+                set_name(path, '')
+            self.assertEqual(path.read_bytes(), before)
+
     def test_wire_identity_matches_harmony_model_and_adapter_vector(self):
         stored = Identity('a' * 64, '000042', 'test receiver')
         wire = stored.for_adapter('00040a00', '02:11:22:33:44:55')

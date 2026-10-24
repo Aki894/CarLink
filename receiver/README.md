@@ -26,7 +26,7 @@ and the wireless hotspot; Ethernet management remains connected.
 carlink-carplay probe --pair 600
 ```
 
-On the iPhone, pair with **OpenXPlay Linux** and allow CarPlay. `probe` replaces
+On the iPhone, pair with **CarLink** and allow CarPlay. `probe` replaces
 the upstream output subprocess with a Python OXP consumer. It advertises H.264,
 reports video/audio metadata and drains media without decoding or displaying it.
 `carlink-carplay web --pair 600` uses the original web output subprocess instead.

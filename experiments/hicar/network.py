@@ -78,7 +78,7 @@ class Hotspot:
                 command('systemctl', 'stop', 'carlink')
             command('nmcli', 'device', 'disconnect', self.interface, optional=True)
             command('nmcli', 'connection', 'add', 'type', 'wifi', 'ifname', self.interface,
-                    'con-name', self.name, 'autoconnect', 'no', 'ssid', 'HiCar-CarLink')
+                    'con-name', self.name, 'autoconnect', 'no', 'ssid', 'CarLink')
             self.created = True
             password = secrets.token_hex(16)
             command('nmcli', 'connection', 'modify', self.name,
@@ -92,7 +92,7 @@ class Hotspot:
             if 'type AP' not in info or '(5745 MHz)' not in info:
                 raise RuntimeError('5 GHz AP not ready')
             bssid = Path('/sys/class/net', self.interface, 'address').read_text().strip()
-            self.offer = Offer('HiCar-CarLink', bssid, password)
+            self.offer = Offer('CarLink', bssid, password)
             return self.offer
         except BaseException:
             self.__exit__(None, None, None)

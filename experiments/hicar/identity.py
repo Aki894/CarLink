@@ -18,7 +18,7 @@ DEFAULT_PATH = '/var/lib/carlink/hicar/identity.json'
 class Identity:
     device_id: str = field(repr=False)
     pin: str = field(repr=False)
-    name: str = 'CarLink HiCar'
+    name: str = 'CarLink'
 
     def validate(self):
         if not isinstance(self.device_id, str) or not re.fullmatch(r'[0-9A-Fa-f]{64}', self.device_id):
@@ -104,6 +104,13 @@ def load_or_create(path=DEFAULT_PATH):
 def set_pin(path, pin):
     old = load(path)
     changed = Identity(old.device_id, pin, old.name).validate()
+    _write(path, changed, create=False)
+    return changed
+
+
+def set_name(path, name):
+    old = load(path)
+    changed = Identity(old.device_id, old.pin, name).validate()
     _write(path, changed, create=False)
     return changed
 
