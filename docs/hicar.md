@@ -6,7 +6,7 @@
 
 2026-10-23 已实测走通：FDEE 发现 → FE35 控制通道 → FE36 业务 19 → 身份 JSON → 固定六位 PIN → HiChain 认证成功。手机为 HiCar 14.2.0.400；H3 上两次独立进程测试均得到结果 `[2,3,0]`，即处理中、密钥协商完成、认证成功。两次使用同一持久化身份与 PIN。
 
-认证后的 Nearby ResourceManager、5 GHz 热点加入、TCP 控制通道和业务 20 已实测通过。DMSDP 加密控制、显示服务、HiSight H.264、基础输入和可信 STS 重连已通过；AAC 扬声器收流、H3 解码重采样、周期 UDP 时钟交换也已实测。下一步接入 CarLife 输出，验证实际音画同步与 Remote Touch。
+认证后的 Nearby ResourceManager、5 GHz 热点加入、TCP 控制通道和业务 20 已实测通过。DMSDP 加密控制、HiSight H.264、输入和 STS 重连、AAC 收流与 H3 解码、周期时钟已通过。实验 CarLife 桥接已显示真实桌面并支持点击/滑动；下一阶段按 [Rust 迁移计划](hicar-rust.md)工程化，同时保留独立 HU 音频和 Lexus 实车验收。
 
 ## 阶段与验收
 
@@ -16,7 +16,7 @@
 | 2. Nearby 封装 | 已通过所观察 BR 路径；变长整数/TLV/CRC、拆包粘包、有界捕获 | 真实首包及业务 19 请求与参考实现对应；异常长度/校验测试 |
 | 3. 身份认证 | 固定 PIN、持久化身份/HUKS、公开 Linux HiChain 后端、真实手机免 PIN STS 重连已通过 | 正确/错误 PIN 本机对照；真实手机 STS 17/18 后恢复视频与输入 |
 | 4. 网络与接收 | 热点/TCP、AES 控制、H.264、点按/方向键、AAC 收流与解码、周期时钟已实测 | 800×480 视频与真实音频同收；H3 输出 44.1 kHz PCM，真实手机免 PIN 重连和输入有效 |
-| 5. CarLife 桥接 | 下一阶段：接入本地媒体接口、有界队列、Remote Touch | 独立 CarLife HU 联调，验证音画同步，再测 Lexus 的声音、控制、重连与延迟 |
+| 5. CarLife 桥接 | 实验版已接入 H.264、AAC/PCM 和 UIBC；同手机桌面、点击、滑动已反馈 | 独立 HU 验证实际出声和音画同步，再测 Lexus 的声音、触控板、重连与延迟 |
 | 6. 启动与交付 | 待桥接稳定；服务互斥、日志、恢复、固件集成 | 完整 firmware job、镜像校验和上传；冷启动、长时播放与断电恢复 |
 
 ## 已确定的协议与适配
@@ -199,6 +199,30 @@ AX900 驱动声明支持 P2P-client/GO/device。直接调用现有 supplicant �
 [完整构建 40083411013](https://github.com/Aki894/CarLink/actions/runs/40083411013) 已成功：73 项测试、原生认证回归、ARMv7 编译、完整 firmware job、镜像结构/内容校验与上传全部完成。认证 artifact 12555898805 的下载 ZIP 与包内 10 个文件校验通过；镜像 artifact 12555779690，ZIP 420,403,510 字节，上传 SHA-256 为 c9694eb789b408930cc4fab309a3c0775dabce214e1870e2ea3dfb0703c4c3d3。板上通过 SSH 更新实验源码，完整镜像本轮未重刷。
 
 下一步将 H.264、分流 AAC 解码后的 PCM 和反向输入接到 CarLife 实时接口，完成媒体/导航混音、节拍与有界队列调度，再验证 HU 的实际音画输出及 Lexus Remote Touch。麦克风、通话与无屏常驻产品化仍按后续阶段推进。
+
+## HiCar → CarLife 实时桥接（2026-10-24）
+
+实现版本 `9e2ea35`，通过 `probe.py --live-socket` 显式启用。热点实验期间暂时停止正式 CarPlay，启动独立 CarLife USB 输出，正常退出后恢复原服务。HiCar 尚未加入生产自启或镜像默认运行入口。
+
+- H.264 直接接入既有有界 live 通道，缓存 SPS/PPS，等待真实 IDR 后恢复；AAC/ADTS 经现有原生解码器输出 44.1 kHz 双声道 PCM。
+- CarLife 归一化触摸与焦点键转为加密 UIBC。复用已验证的发送边沿节奏，新增 `left_move` 能力及事件 2。用户确认点击、左右滑动；较长按压后的直接点击识别仍需改进，Lexus 优先焦点导航。
+- 修复 DMSDP SSRC：原生 `RTPDataReceiver::OnRTPData` 将用途字段与流编号分开，流编号取低 12 位。此前高位变化被当成不同音频流，产生虚假丢包和频繁解码器重建。现保持同一协商/格式的解码器连续。
+- 修复 CarLife 心跳调度：连续音频不得提前返回并挤掉视频心跳。Unix Rust 回归覆盖持续 PCM 时仍发送 `0x20002`。
+- 输出子进程退出后进行有界恢复并保留 HiCar；界面主动退出、USB 断开和自动重连继续留作产品管理器的场景测试。
+
+第 107 轮 600 秒限时探针最终记录：7,575 个视频访问单元、19,030 个 AAC 帧、246 次输入发送；音频丢包/拒绝均为 0。中间一次约 306 秒采样为 14,317 AAC 帧、15,267 块 PCM，其中 6,009 块非静音。完整探针包含界面切换与输出恢复，原始日志留在忽略目录 `.build/hicar-research/bridge107-board.log`。
+
+单手机音频路由已核实：CarLife 进程存在活动的 44.1 kHz 双声道 AudioTrack，输出是 `AUDIO_DEVICE_OUT_PROXY`；实体扬声器没有对应活动轨。HiCar 手机同时充当 CarLife HU 时，回放也进入手机的投屏媒体路由。实际出声、同步和回声使用独立 HU 或实车验证。
+
+构建与校验：
+
+- Windows 和 H3 各通过 79 项 HiCar 测试。
+- [应用构建 40103163348](https://github.com/Aki894/CarLink/actions/runs/40103163348)成功；临时板端应用 SHA256 为 `15b6b8ddaf1fea4212df807c348cda295b410caf9afcc0e4c9ae3d3a93e5cf3f`，与下载清单一致。
+- [完整构建 40105347479](https://github.com/Aki894/CarLink/actions/runs/40105347479)的 native、firmware、镜像校验和上传均成功。公开源码 artifact `12563853293`，35 项清单哈希已校验，并与本地源码按统一换行比较一致。
+- 镜像 artifact `12564358354`，ZIP 420,710,190 字节，SHA256 `a94760427e41c6a8a7edb426773fc54816b029933d86c347bc2d9dcf6d24b123`。已实际下载，压缩镜像清单校验通过：`4a11f8f04d3cf480906b52a52b22c898aea1d7bb6916d5e67db0c7c299e566ea`。
+- 实验结束已恢复正式 `carlink` 为 active、NRestarts=0；Ethernet 管理路由保留。生产应用仍保留原版本，心跳修复版仅在临时实验路径运行。
+
+下一步按 [Rust 迁移与集成](hicar-rust.md)分 R1 协议/FFI、R2 实际会话与媒体、R3 统一连接管理与菜单推进。
 
 ## 前期构建记录
 

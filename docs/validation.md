@@ -1,8 +1,8 @@
 # 验证与部署记录
 
-状态截至 2026-10-23。这里汇总已完成的检查，日常运行见[运行说明](live-forwarding.md)。
+状态截至 2026-10-24。这里汇总已完成的检查，日常运行见[运行说明](live-forwarding.md)。
 
-本页当前基线为已部署的 CarPlay/CarLife 路线。独立 HiCar 实验及后续完整镜像刷新记录见 [HiCar 构建与实测](hicar.md)；HiCar 已完成加密控制、显示服务及超过五分钟的真实 H.264 接收，已解码到桌面。基础输入、音频、可信重连和生产自启继续实施。
+下表保留正式部署的 CarPlay/CarLife 基线。最新 HiCar 实验已接入 CarLife 视频、AAC/PCM 和 UIBC，79 项测试通过；[完整构建 40105347479](https://github.com/Aki894/CarLink/actions/runs/40105347479)成功，镜像已下载并校验 ZIP 与压缩镜像清单。实测和产物摘要见 [HiCar 构建与实测](hicar.md)。下一阶段按 [Rust 迁移计划](hicar-rust.md)推进；HiCar 当前仍手动实验运行。
 
 ## 当前基线
 

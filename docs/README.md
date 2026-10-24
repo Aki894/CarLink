@@ -15,6 +15,7 @@
 | [CarLife 应用](../app/README.md) | CLI、合成媒体、独立 USB/TCP 测试和诊断 JSON |
 | [无线 HiCar 计划](hicar.md) | 阶段验收、认证技术路线与隔离探针 |
 | [双协议连接与设备菜单](connection-management.md) | 多手机优先级、配对与切换、Remote Touch 菜单、单手机台架计划 |
+| [HiCar Rust 迁移](hicar-rust.md) | 协议对照、HiChain FFI、原生媒体、统一程序与分批验收 |
 | [CarPlay 接收端](../receiver/README.md) | OpenXPlay、探针、录制和许可证 |
 | [AIC 驱动](../drivers/aic8800d80/README.md) | 精确内核构建、驱动 profile 与安装 |
 
