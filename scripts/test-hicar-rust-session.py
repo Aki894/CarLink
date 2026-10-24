@@ -105,6 +105,12 @@ def authentication(binary, library, rust_library):
                 resource = Resource(offer)
                 # Prior to successful auth, even a negotiated data channel is gated.
                 n = RustNegotiator(w, resource, True)
+                for f in [Frame(0, 0, b'', pack_tlv(1, b'\x02') + pack_tlv(3, b'peer') + pack_tlv(5, b'\x00'))]:
+                    n.respond(f)
+                capability = b''.join(pack_uint(k) + pack_uint(v) for k, v in {2: 1, 4: 1, 5: 511}.items())
+                network = Frame(4, 0, b'', pack_tlv(1, pack_uint(3) + pack_tlv(3, capability)))
+                client_mac = Frame(33, 0, b'', pack_tlv(2, b'02:00:00:00:00:02'))
+                assert n.respond(network) is None and n.respond(client_mac) is None
                 auth = RustAuth(w)
                 envelope = lambda op, data: dict(version='A_0', discover_type=1, oper_type=op,
                                                  usb_connection=False, data=json.dumps(data))
@@ -131,6 +137,16 @@ def authentication(binary, library, rust_library):
                 assert not pending and 0 in state['results'] and metadata.get('key_ready')
                 assert hashlib.sha256(auth.session_key).hexdigest() == state['key_hash']
                 assert len(auth.session_key) == (32 if phase == 'bind' else 16)
+                assert n.respond(network) is not None
+                assert offer.credentials() in n.respond(client_mac)
+                # A stale command must not revoke a newer active authentication.
+                try:
+                    w.call(dict(op='auth', generation=auth.generation + 1, envelope='{}'))
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError('stale authentication generation accepted')
+                assert offer.credentials() in n.respond(client_mac)
                 # Repeated identity is rejected and revokes resource authorization.
                 try:
                     auth.receive(envelope(1, dict(deviceId=client_id)))
@@ -139,6 +155,7 @@ def authentication(binary, library, rust_library):
                 else:
                     raise AssertionError('repeated identity accepted')
                 assert auth.session_key is None
+                assert n.respond(client_mac) is None
                 auth.close()
                 n.close()
                 results.append(dict(phase=phase, keys_match=True, stale_auth_revoked=True))
