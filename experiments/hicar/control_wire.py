@@ -5,7 +5,9 @@ frames are preserved for private analysis, never decoded as plaintext.
 """
 from dataclasses import dataclass, field
 import re
-from nearby_wire import ProtocolError
+import json
+import time
+from nearby_wire import ProtocolError, read_uint, pack_uint, Incomplete
 from cipher import Cipher
 
 MAX_FRAME = 1498
@@ -90,7 +92,10 @@ def encode(start, headers):
 
 class Messages:
     """Text messages can span transport frames; reject duplicate/ambiguous fields."""
-    def __init__(self):
+    def __init__(self, protocol='DMSDP'):
+        if protocol not in ('DMSDP', 'RTSP'):
+            raise ValueError('invalid control protocol')
+        self.protocol = protocol
         self.buffer = bytearray()
         self.failed = False
 
@@ -112,8 +117,8 @@ class Messages:
                     rows = bytes(self.buffer[:end]).decode('ascii').split('\r\n')
                 except UnicodeError as error:
                     raise ProtocolError('non-text control message') from error
-                if not (re.fullmatch(r'[A-Z_]+ \S+ DMSDP/1\.0', rows[0])
-                        or re.fullmatch(r'DMSDP/1\.0 [1-5][0-9]{2}(?: [ -~]+)?', rows[0])):
+                if not (re.fullmatch(r'[A-Z_]+ \S+ ' + self.protocol + r'/1\.0', rows[0])
+                        or re.fullmatch(self.protocol + r'/1\.0 [1-5][0-9]{2}(?: [ -~]+)?', rows[0])):
                     raise ProtocolError('unsupported control start line')
                 headers = {}
                 for row in rows[1:]:
@@ -142,13 +147,28 @@ class Messages:
 
 
 class Session:
-    def __init__(self, session_key=None):
+    def __init__(self, session_key=None, device_info=None):
         self.decoder = Decoder()
         self.messages = Messages()
         self.pending = []
         self.negotiated = False
         self.cipher = Cipher(session_key) if session_key else None
         self.on_plaintext = None
+        self.device_info = device_info
+        self.device_exchanged = False
+        self.clock = None
+        self.media_port = None
+
+    def send_payload(self, payload):
+        if not self.negotiated:
+            raise ProtocolError('control session is not negotiated')
+        self.pending.append(pack_frame(self.cipher.encrypt(payload), 0xab)
+                            if self.cipher else pack_frame(payload))
+
+    def send_business(self, module, data_type, body):
+        payload = (b'$' + module.to_bytes(4, 'big') + data_type.to_bytes(4, 'big')
+                   + len(body).to_bytes(2, 'big') + body)
+        self.send_payload(payload)
 
     def initial(self):
         return pack_frame(encode('OPTIONS * DMSDP/1.0', {
@@ -180,6 +200,50 @@ class Session:
                 events.append(dict(binary=True, module=int.from_bytes(payload[1:5], 'big'),
                                    data_type=int.from_bytes(payload[5:9], 'big'),
                                    body_bytes=len(payload) - 11))
+                if payload[1:9] == b'\0\0\0\5\xff\xff\xff\xff':
+                    try:
+                        command, offset = read_uint(payload[11:])
+                        port, end = read_uint(payload[11:], offset)
+                    except Incomplete as error:
+                        raise ProtocolError('incomplete HiSight endpoint') from error
+                    if command != 101 or end != len(payload) - 11 or not 1 <= port <= 65535:
+                        raise ProtocolError('invalid HiSight endpoint')
+                    self.media_port = port
+                    events.append(dict(hisight_endpoint=True, port=port))
+                if payload[1:9] == b'\0\0\0\3\xff\xff\xff\xff' and self.device_info:
+                    body = payload[11:]
+                    try:
+                        command, offset = read_uint(body)
+                    except Incomplete as error:
+                        raise ProtocolError('incomplete device command') from error
+                    events.append(dict(device_command=command, body_bytes=len(body) - offset))
+                    if command == 101:
+                        try:
+                            peer = json.loads(body[offset:])
+                        except (ValueError, UnicodeError) as error:
+                            raise ProtocolError('invalid peer device information') from error
+                        if not isinstance(peer, dict) or not isinstance(peer.get('deviceId'), str):
+                            raise ProtocolError('missing peer device information')
+                        if not self.device_exchanged:
+                            own = dict(self.device_info, businessId=peer.get('businessId', 1))
+                            self.send_business(3, 0xffffffff, pack_uint(101) + json.dumps(
+                                own, separators=(',', ':')).encode('utf-8'))
+                            self.device_exchanged = True
+                            events.append(dict(device_info_sent=True))
+                    elif command == 104:
+                        if not self.device_exchanged or len(body) - offset != 4:
+                            raise ProtocolError('invalid service discovery request')
+                        mask = int.from_bytes(body[offset:], 'big')
+                        events.append(dict(service_request_mask=mask))
+                        if mask & 8:
+                            service = dict(deviceId=self.device_info['deviceId'],
+                                           deviceName=self.device_info['deviceName'],
+                                           serviceId='display1', serviceType=8,
+                                           properties={'4001': 1.0, '1009': 800, '1010': 480},
+                                           status={})
+                            self.send_business(3, 0xffffffff, pack_uint(102) + json.dumps(
+                                service, separators=(',', ':')).encode('utf-8'))
+                            events.append(dict(service_announced=8))
             else:
                 for message in self.messages.feed(payload):
                     events.append(message.metadata())
@@ -209,6 +273,20 @@ class Session:
                         reply = encode('DMSDP/1.0 200 OK', {'CSeq': cseq})
                         self.pending.append(pack_frame(self.cipher.encrypt(reply), 0xab)
                                             if self.cipher else pack_frame(reply))
+                    elif (message.start == 'SET_PARAMETER * DMSDP/1.0' and self.negotiated
+                          and {'timeserverport', 'timeushigh', 'timeuslow'} <= message.headers.keys()):
+                        try:
+                            high, low = (int(message.headers[k]) & 0xffffffff
+                                         for k in ('timeushigh', 'timeuslow'))
+                            port = int(message.headers['timeserverport'])
+                            sequence = message.headers['cseq']
+                            if not 1 <= port <= 65535 or not re.fullmatch(r'[0-9]{1,9}', sequence):
+                                raise ValueError()
+                        except (KeyError, ValueError) as error:
+                            raise ProtocolError('invalid peer clock parameters') from error
+                        self.clock = ((high << 32) | low, time.monotonic_ns() // 1000, port)
+                        self.send_payload(encode('DMSDP/1.0 200 OK', {'CSeq': sequence}))
+                        events.append(dict(clock_initialized=True))
         return events
 
     def take_pending(self):

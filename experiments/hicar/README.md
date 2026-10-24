@@ -2,7 +2,7 @@
 
 目标：悟空派 H3 + AX900/AIC8800 接收鸿蒙 4.2 手机的无线 HiCar，后续复用现有 CarLife 输出。详细阶段和证据见 [实施计划](../../docs/hicar.md)。本目录是手动运行的诊断程序，不随固件安装，不设置开机启动。
 
-`probe.py` 默认使用 BlueZ D-Bus 注册 FDEE 发现广播和 FE35 RFCOMM 服务，只观察收到的字节流。可选启用控制回复、FE36 业务通道和限定手机的蓝牙 SSP 代理，可通过 `--reply-identity` 和 `--auth-library` 接入固定 PIN 身份握手及 HiChain 认证。运行时间默认 60 秒，上限 300 秒；退出时注销自己注册的服务。需要 Linux、BlueZ、Python 3 和 requirements.txt 中的依赖，以及系统 D-Bus/蓝牙管理通道的访问权限（开发板当前使用 root）。
+`probe.py` 默认使用 BlueZ D-Bus 注册 FDEE 发现广播和 FE35 RFCOMM 服务，只观察收到的字节流。可选启用控制回复、FE36 业务通道和限定手机的蓝牙 SSP 代理，可通过 `--reply-identity` 和 `--auth-library` 接入固定 PIN 身份握手及 HiChain 认证。运行时间默认 60 秒，上限 900 秒；退出时注销自己注册的服务。需要 Linux、BlueZ、Python 3 和 requirements.txt 中的依赖，以及系统 D-Bus/蓝牙管理通道的访问权限（开发板当前使用 root）。
 
 在独立 Python 依赖目录中准备 dbus-next 后运行：
 
@@ -70,7 +70,7 @@ PYTHONPATH=/var/tmp/hicar-python python3 probe.py --model "$HICAR_MODEL" \
 --network-interface "$AX900_INTERFACE"
 ```
 
-此选项要求真实认证后端。程序在有线管理通道存在时临时停用 CarLink、保存原无线连接，建立中国大陆区域的 channel 149 / 5745 MHz 热点，并监听 192.168.49.1 的 4005/4006/4007 端口。临时 WPA2 密码随机生成，不打印。手机通过认证和资源协商后自动加入热点，再建立 DMSDP 通道。退出时自动恢复原网络和服务；默认 60 秒，最长 300 秒。
+此选项要求真实认证后端。程序在有线管理通道存在时临时停用 CarLink、保存原无线连接，建立中国大陆区域的 channel 149 / 5745 MHz 热点，并监听 192.168.49.1 的 4005/4006/4007 端口。临时 WPA2 密码随机生成，不打印。手机通过认证和资源协商后自动加入热点，再建立 DMSDP 通道。退出时自动恢复原网络和服务；默认 60 秒，最长 900 秒。
 
 `network_wire.py` 实现 kind 4 资源协商、kind 33 地址/参数交换和业务 20 的真实 TCP 端点。`dmsdp_wire.py` 分别实现无 flags TLV 的模块帧和 16 字节控制端口协商，包含长度、CRC、拆包及粘包检查。
 
@@ -79,3 +79,12 @@ PYTHONPATH=/var/tmp/hicar-python python3 probe.py --model "$HICAR_MODEL" \
 显式指定 `--capture-dir` 时，解密控制记录另存为原捕获路径加 `.plain`，每条为两字节大端长度与明文，权限 0600，受相同接收上限约束。该文件可能包含设备身份和应用信息，与原始捕获一样留在私有目录，不提交。正常日志仅输出方法、字段名称、公共数字能力和消息长度。
 
 手机和开发板各自供电即可，保留开发板网线用于 SSH。测试原始流只保存到指定私有捕获目录，代码和单元测试使用自建示例数据。
+
+
+## HiSight 接收与本地输入实验
+
+开启真实认证、网络和 dmsdp-options 后，探针自动完成设备/显示服务交换与 HiSight RTSP 协商。视频和反向控制 TCP 都连接后再发 PLAY。hisight_media.py 接收有界 TCP/RTP/PES 并解密 H.264；显式捕获时每路原始媒体保存上限 64 MiB，控制记录总量受探针接收上限约束，文件权限 0600。原始媒体保存在忽略目录。
+
+实验输入接口仅在指定私有捕获目录（0700）中创建 hisight-input.sock（0600），退出时移除。客户端通过本机 Unix socket 发送一行 JSON：key 字段允许 up/down/left/right/enter/back/home/play_pause，或整数 x、y 字段指定 800×480 范围内的单次点按。单条命令上限 256 字节；只接受固定字段，返回 OK 或 ERROR。它用于接收端联调，后续由 CarLife/Remote Touch 事件接口替代。
+
+首次使用的 HiCar 声明需要用户确认。视频解码、原始帧检查和输入验证分别记录。音频通道和周期时钟同步尚待实现；当前媒体解包测试覆盖视频，音频包不会作为有效音频输出交付。

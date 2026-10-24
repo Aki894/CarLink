@@ -99,6 +99,7 @@ class Runtime:
         self.lib.destroy.restype = None
         self.lib.receive_data.argtypes = [PTR, C.POINTER(Buffer)]
         self.lib.start_pake.argtypes = [PTR, C.POINTER(Parameters)]
+        self.lib.authenticate_peer.argtypes = [PTR, C.POINTER(Parameters)]
         Runtime._active = self
 
     def path(self, name):
@@ -160,7 +161,8 @@ class Runtime:
 
 
 class Session:
-    def __init__(self, runtime, self_id, peer_id, pin, role=2):
+    def __init__(self, runtime, self_id, peer_id, pin, role=2,
+                 package='com.huawei.authagent', service='SFXTEST'):
         if len(pin) != 6 or not pin.isascii() or not pin.isdigit():
             raise ValueError('PIN must contain six ASCII digits')
         self.runtime = runtime
@@ -172,8 +174,8 @@ class Session:
         fill(self.pin, pin.encode('ascii'))
         self.identity = Identity()
         self.identity.session_id = secrets.randbits(32)
-        fill(self.identity.package, b'com.huawei.authagent')
-        fill(self.identity.service, b'SFXTEST')
+        fill(self.identity.package, package.encode('ascii'))
+        fill(self.identity.service, service.encode('ascii'))
         self.pending = []
         self.results = []
         self.session_key = None
@@ -186,10 +188,25 @@ class Session:
             raise RuntimeError('HiChain instance initialization failed')
 
     def transmit(self, _, data, length):
-        if length > 65536 or len(self.pending) >= 8:
+        if not 0 < length <= 65536 or len(self.pending) >= 8:
             self.callback_error = True
         else:
-            self.pending.append(C.string_at(data, length))
+            try:
+                import json
+                packet = json.loads(C.string_at(data, length))
+                if not isinstance(packet, dict):
+                    raise ValueError('native authentication output must be an object')
+                payload = packet.get('payload', {})
+                if isinstance(payload, dict):
+                    # Legacy serializers quote these integers, while their own
+                    # parsers and current phones expect JSON numeric values.
+                    for name in ('peerUserType', 'keyLength'):
+                        value = payload.get(name)
+                        if isinstance(value, str) and value in ('0', '1', '16', '32'):
+                            payload[name] = int(value)
+                self.pending.append(json.dumps(packet, separators=(',', ':')).encode('utf-8'))
+            except (ValueError, TypeError, UnicodeError):
+                self.callback_error = True
 
     def get_params(self, _, operation, pin, params):
         # start_pake builds its object before assigning BIND, so its initial
@@ -221,12 +238,33 @@ class Session:
     def receive(self, data):
         if not self.handle or not 0 < len(data) <= 65536:
             raise ValueError('invalid HiChain input')
+        # A trusted STS request may negotiate a shorter returned service key
+        # than the initial PAKE binding. Honor the peer's explicit length.
+        import json
+        request = json.loads(data)
+        payload = request.get('payload', {})
+        if isinstance(payload, dict) and payload.get('peerUserType') in ('0', '1'):
+            payload['peerUserType'] = int(payload['peerUserType'])
+            data = json.dumps(request, separators=(',', ':')).encode('utf-8')
+        if request.get('message') == 17:
+            length = request.get('payload', {}).get('keyLength')
+            if isinstance(length, str) and length in ('16', '32'):
+                length = int(length)
+            if type(length) is not int or length not in (16, 32):
+                raise ValueError('unsupported authenticated key length')
+            self.params.key_length = length
         raw = C.create_string_buffer(data)
         buffer = Buffer(C.cast(raw, PTR), len(data), len(data))
         return self.take(self.runtime.lib.receive_data(self.handle, C.byref(buffer)))
 
     def start(self):
         return self.take(self.runtime.lib.start_pake(self.handle, C.byref(self.params)))
+
+    def authenticate(self, key_length=16):
+        if key_length not in (16, 32):
+            raise ValueError('unsupported authenticated key length')
+        self.params.key_length = key_length
+        return self.take(self.runtime.lib.authenticate_peer(self.handle, C.byref(self.params)))
 
     def close(self):
         if self.handle:

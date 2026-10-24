@@ -13,10 +13,13 @@ from nearby_wire import ProtocolError
 
 
 class Cipher:
-    def __init__(self, session_key):
+    def __init__(self, session_key, max_record=1500):
         if not isinstance(session_key, bytes) or len(session_key) not in (16, 32):
             raise ProtocolError('invalid authenticated session key length')
         self.key = bytearray(session_key[:16])
+        if not 17 <= max_record <= 10 * 1024 * 1024:
+            raise ProtocolError('invalid cipher record limit')
+        self.max_record = max_record
         library = find_library('crypto')
         if not library and sys.platform == 'win32':
             library = str(Path(sys.prefix) / 'Library/bin/libcrypto-3-x64.dll')
@@ -31,7 +34,7 @@ class Cipher:
         self.lib.EVP_EncryptFinal_ex.argtypes = [C.c_void_p, C.c_void_p, C.POINTER(C.c_int)]
 
     def transform(self, data, iv):
-        if self.key is None or len(iv) != 16 or not 0 < len(data) < 1500:
+        if self.key is None or len(iv) != 16 or not 0 < len(data) < self.max_record:
             raise ProtocolError('invalid cipher record')
         context = self.lib.EVP_CIPHER_CTX_new()
         if not context:
@@ -57,7 +60,7 @@ class Cipher:
         return iv + self.transform(plaintext, iv)
 
     def decrypt(self, record):
-        if not 16 < len(record) < 1500:
+        if not 16 < len(record) < self.max_record:
             raise ProtocolError('invalid encrypted record length')
         return self.transform(record[16:], record[:16])
 

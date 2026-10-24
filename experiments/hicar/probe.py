@@ -23,6 +23,7 @@ from auth_wire import AuthError, AuthSession, JsonStream
 from identity import DEFAULT_PATH, load_or_create
 from dmsdp_wire import Decoder as DmsdpDecoder, Negotiation as DmsdpNegotiation
 from control_wire import Session as ControlSession
+from hisight import receive as receive_hisight
 
 FDEE = '0000fdee-0000-1000-8000-00805f9b34fb'
 FE35 = '0000fe35-0000-1000-8000-00805f9b34fb'
@@ -114,6 +115,7 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
     digest = hashlib.sha256()
     capture = None
     plaintext_capture = None
+    media_task = None
     decoder = Decoder()
     parsing = decode_control
     auth_stream = JsonStream() if auth_session else None
@@ -154,6 +156,21 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                     for reply in control.take_pending():
                         await asyncio.wait_for(loop.sock_sendall(sock, reply), 2)
                         log('control_reply_sent', session=session, size=len(reply))
+                    if control.media_port and media_task is None:
+                        async def observe_media():
+                            media = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            media.setblocking(False)
+                            try:
+                                media.bind((control.device_info['localIp'], 0))
+                                await asyncio.wait_for(loop.sock_connect(media,
+                                    (control.device_info['remoteIp'], control.media_port)), 5)
+                                log('hisight_connected', port=control.media_port)
+                                await receive_hisight(media, bytes(control.cipher.key), capture_dir, log)
+                            except (OSError, asyncio.TimeoutError) as error:
+                                log('hisight_error', error=type(error).__name__)
+                            finally:
+                                media.close()
+                        media_task = asyncio.create_task(observe_media())
                 except ProtocolError as error:
                     log('control_parse_stopped', session=session, reason=str(error))
                     return
@@ -209,6 +226,9 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
         if total == limit:
             log('capture_limit', session=session, limit=limit)
     finally:
+        if media_task:
+            media_task.cancel()
+            await asyncio.gather(media_task, return_exceptions=True)
         if plaintext_capture:
             plaintext_capture.close()
         if control:
@@ -423,7 +443,8 @@ async def run(args):
             from hichain import Runtime, Session
             runtime = Runtime(args.auth_library, args.auth_store,
                               business_profile.auth_identity.device_id)
-            business_profile.backend_factory = lambda own, peer, pin: Session(runtime, own, peer, pin)
+            business_profile.backend_factory = lambda own, peer, pin: Session(
+                runtime, own, peer, pin, package='com.huawei.hicar', service='CarDevice')
     bus.export(ROOT + '/profile', profile)
     bus.export(ROOT + '/business', business_profile)
     bus.export(ROOT + '/advertisement', Advertisement(payload, stop, args.tx_power))
@@ -450,6 +471,7 @@ async def run(args):
             raise RuntimeError('Bluetooth adapter is powered off')
         if args.reply_control:
             address = (await props.call_get('org.bluez.Adapter1', 'Address')).value
+            own_bluetooth_address = address
             seed = args.model.upper() + address.replace(':', '').upper()
             profile.control_summary = hashlib.sha256(seed.encode('ascii')).hexdigest().upper().encode('ascii')
         if args.network_offer:
@@ -475,7 +497,14 @@ async def run(args):
                     task = asyncio.create_task(observe(client, session, args.capture_dir,
                                                        negotiator=negotiator, decode_control=decode_control,
                                                        dmsdp=DmsdpNegotiation(dmsdp_port) if dmsdp_port else None,
-                                                       control=ControlSession(profile.resource.session_key)
+                                                       control=ControlSession(profile.resource.session_key,
+                                                           dict(deviceId=business_profile.auth_identity.device_id,
+                                                                deviceName=business_profile.auth_identity.name,
+                                                                deviceType=4, bluetoothMac=own_bluetooth_address,
+                                                                btName='CarLink', localIp=args.network_offer.owner_ip,
+                                                                remoteIp=args.network_offer.client_ip, port=0,
+                                                                properties={'2003': args.model, '5004': True,
+                                                                            '5014': False}))
                                                        if control else None))
                     tcp_clients.add(task)
                     tcp_sockets.add(client)
@@ -609,7 +638,7 @@ async def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', required=True, help='local reference model, eight hex characters')
-    parser.add_argument('--duration', type=int, default=60, help='1..300 seconds')
+    parser.add_argument('--duration', type=int, default=60, help='1..900 seconds')
     parser.add_argument('--adapter', default='/org/bluez/hci0')
     parser.add_argument('--channel', type=int, default=23, help='RFCOMM channel, 1..30')
     parser.add_argument('--sequence', type=int, default=1, help='discovery sequence, 0..255')
@@ -629,8 +658,8 @@ def main():
                         help='negotiate DMSDP AES control and reply to keepalives')
     parser.add_argument('--capture-dir', help='optional private directory for raw streams')
     args = parser.parse_args()
-    if not 1 <= args.duration <= 300:
-        parser.error('duration must be between 1 and 300 seconds')
+    if not 1 <= args.duration <= 900:
+        parser.error('duration must be between 1 and 900 seconds')
     if not (args.adapter.startswith('/org/bluez/hci')
             and args.adapter[len('/org/bluez/hci'):].isdigit()):
         parser.error('adapter must be /org/bluez/hci followed by its numeric index')

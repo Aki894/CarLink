@@ -49,4 +49,8 @@ if __name__ == '__main__':
         runtime = Runtime(sys.argv[1], directory, 'native-self-test')
         exchange(runtime, True)
         exchange(runtime, False)
+    # Each device needs an isolated HUKS store. A shared in-process store can
+    # overwrite one device's private alias when importing its public peer key.
+    from test_trusted import verify_trusted
+    verify_trusted(sys.argv[1])
     print('native PAKE: correct PIN accepted, wrong PIN rejected, session keys match')
