@@ -115,8 +115,9 @@ def authentication(binary, library, rust_library):
                 client_mac = Frame(33, 0, b'', pack_tlv(2, b'02:00:00:00:00:02'))
                 assert n.respond(network) is None and n.respond(client_mac) is None
                 auth = RustAuth(w)
-                envelope = lambda op, data: dict(version='A_0', discover_type=1, oper_type=op,
-                                                 usb_connection=False, data=json.dumps(data))
+                envelope = lambda op, data: (dict(version='14.2.0.400', oper_type=op, synctime=0,
+                    trace_id='synthetic', data=json.dumps(data)) if phase == 'auth' else
+                    dict(version='A_0', discover_type=1, oper_type=op, usb_connection=False, data=json.dumps(data)))
                 reply, metadata = auth.receive(envelope(1, dict(deviceId=client_id, usb_connection=False)))
                 assert metadata['operation'] == 1 and json.loads(json.loads(reply)['data'])['deviceId'] == own
                 p = codec.Process([sys.executable, str(ROOT / 'scripts/test-hicar-rust-auth.py'), '--python-worker'])

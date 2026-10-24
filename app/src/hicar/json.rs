@@ -61,8 +61,11 @@ impl Stream {
 
 pub fn envelope(data:&[u8],identity_seen:bool)->Result<(u64,Value)> {
     let outer=parse(data)?;let map=outer.as_object().ok_or("auth envelope must be an object")?;
-    if map.get("version").and_then(Value::as_str)!=Some("A_0") || map.get("discover_type").and_then(Value::as_u64)!=Some(1)
-        || map.get("usb_connection").is_some_and(|v|v!=&Value::Bool(false)) {return Err("unsupported auth envelope".into());}
+    // A_0/discover_type=1 describe our response. Harmony 4.2 sends its own
+    // application version (observed 14.2.0.400) and omits discover_type.
+    if map.get("version").is_some_and(|v|!v.as_str().is_some_and(|s|!s.is_empty()&&s.len()<=32&&s.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'.'|b'_'|b'-'))))
+        || map.get("discover_type").is_some_and(|v|!v.as_u64().is_some_and(|n|n<=255))
+        || map.get("usb_connection").is_some_and(|v|v!=&Value::Bool(false)) {return Err("unsupported auth envelope metadata".into());}
     let operation=map.get("oper_type").and_then(Value::as_u64).ok_or("invalid auth operation")?;
     if !matches!(operation,1|3)||operation==3&&!identity_seen{return Err("invalid auth sequence".into());}
     let inner=parse(map.get("data").and_then(Value::as_str).ok_or("auth data must be JSON text")?.as_bytes())?;
@@ -94,5 +97,11 @@ pub fn envelope(data:&[u8],identity_seen:bool)->Result<(u64,Value)> {
         assert!(envelope(&request(1,serde_json::json!({"deviceId":"peer","usb_connection":true})),false).is_err());
         let auth=request(3,serde_json::json!({"message":17}));
         assert!(envelope(&auth,false).is_err());assert_eq!(envelope(&auth,true).unwrap().0,3);
+    }
+    #[test]fn harmony_request_metadata_differs_from_accessory_response(){
+        let request=serde_json::json!({"version":"14.2.0.400","oper_type":1,"synctime":0,"trace_id":"synthetic",
+            "data":serde_json::json!({"deviceId":"synthetic-peer","usb_connection":false,"has_pin":false}).to_string()});
+        assert_eq!(envelope(request.to_string().as_bytes(),false).unwrap().0,1);
+        let mut bad=request;bad["version"]=true.into();assert!(envelope(bad.to_string().as_bytes(),false).is_err());
     }
 }

@@ -67,7 +67,7 @@ class Worker:
             result = json.loads(self._read(size))
             if result.get('ok') is not True:
                 # Never interpolate the input packet, PIN, key or child response.
-                raise ProtocolError('Rust connection protocol rejected the request')
+                raise ProtocolError('Rust connection protocol: ' + result.get('error', 'request rejected'))
             return result
 
     def close(self):
@@ -124,7 +124,7 @@ class AuthSession:
                 envelope=json.dumps(envelope, separators=(',', ':'), ensure_ascii=False)))
         except (ValueError, RuntimeError, OSError) as error:
             self.session_key = None
-            raise AuthError('Rust business authentication failed') from error
+            raise AuthError('Rust business authentication failed: ' + str(error)) from error
         key = result.get('key')
         self.session_key = bytes.fromhex(key) if key else self.session_key
         metadata = result['metadata']

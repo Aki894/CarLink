@@ -175,10 +175,10 @@ pub fn differential(v:&Value)->Result<Value>{
                 "auth-close"=>{if command["generation"].as_u64()==Some(business.generation as u64){business.close(&mut resource);auth_open=false;peer_seen=false;}Ok(value!({}))},
                 "close"=>Ok(value!({"closed":true})),_=>Err("unknown session command".into()),
             }})();
-            match result{Ok(mut v)=>{v["ok"]=true.into();send(&mut socket,&v)?;if op=="close"{break;}},Err(_)=>{
+            match result{Ok(mut v)=>{v["ok"]=true.into();send(&mut socket,&v)?;if op=="close"{break;}},Err(error)=>{
                 // Protocol errors revoke authorization before any later network command.
                 if op=="auth"&&command["generation"].as_u64()==Some(business.generation as u64){business.close(&mut resource);auth_open=false;peer_seen=false;}
-                send(&mut socket,&value!({"ok":false,"error":"Rust session command rejected"}))?;
+                send(&mut socket,&value!({"ok":false,"error":error}))?;
             }}
         }
         business.close(&mut resource);Ok(())
