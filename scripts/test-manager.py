@@ -57,7 +57,7 @@ def check(binary):
         bt.write_text('#!' + sys.executable + '\n' +
             'import json,os,pathlib,sys\nroot=pathlib.Path(' + repr(str(root)) + ')\n' +
             "fd=os.open(root/'events',os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)\n" +
-            "os.write(fd,(json.dumps(dict(event='remove',args=sys.argv[1:]))+'\n').encode());os.close(fd)\n" +
+            "os.write(fd,(json.dumps(dict(event='remove',args=sys.argv[1:]))+" + repr(chr(10)) + ").encode());os.close(fd)\n" +
             "(root/'scenario').write_text('')\n")
         bt.chmod(0o700)
         config = dict(schema=1, socket=str(root / 'control.sock'), live_socket=str(root / 'live.sock'), state=str(root / 'devices.json'),
