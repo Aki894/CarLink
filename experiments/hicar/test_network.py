@@ -1,4 +1,6 @@
 import unittest
+from unittest.mock import patch
+from network import Hotspot
 from network import Offer
 from network_wire import Resource, abilities
 from nearby_wire import Frame, ProtocolError, pack_tlv, pack_uint, read_tlvs
@@ -10,6 +12,26 @@ def request(caps):
 
 
 class NetworkTests(unittest.TestCase):
+    def test_managed_hotspot_never_stops_service_or_restores_another_backend(self):
+        calls = []
+        def run(*args, **_):
+            calls.append(args)
+            if args[0] == 'systemctl':
+                self.fail('managed hotspot changed its owner service')
+            if args[:4] == ('ip', '-j', 'route', 'get'):
+                return '[{"dev":"end0"}]'
+            if args[:4] == ('ip', '-j', '-4', 'address'):
+                return '[]'
+            if args[:3] == ('nmcli', '-t', '-f'):
+                return 'previous-profile:wlan0'
+            if args[:3] == ('iw', 'dev', 'wlan0'):
+                return 'type AP channel 149 (5745 MHz)'
+            return ''
+        with patch('network.command', side_effect=run), patch('network.Path.read_text', return_value='02:00:00:00:00:01'):
+            with Hotspot('wlan0', manage_service=False) as offer:
+                self.assertEqual(offer.ssid, 'CarLink')
+        self.assertFalse(any(args[:4] == ('nmcli', 'connection', 'up', 'uuid') for args in calls))
+
     def setUp(self):
         self.offer = Offer('HiCar-Test', '02:00:00:00:00:01', 'private-example-password')
         self.resource = Resource(self.offer)

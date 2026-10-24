@@ -57,8 +57,8 @@ def check(binary):
         bt.write_text('#!' + sys.executable + '\n' +
             'import json,os,pathlib,sys\nroot=pathlib.Path(' + repr(str(root)) + ')\n' +
             "fd=os.open(root/'events',os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)\n" +
-            "os.write(fd,(json.dumps(dict(event='remove',args=sys.argv[1:]))+" + repr(chr(10)) + ").encode());os.close(fd)\n" +
-            "(root/'scenario').write_text('')\n")
+            "os.write(fd,(json.dumps(dict(event=('remove' if 'remove' in sys.argv else 'setting'),args=sys.argv[1:]))+" + repr(chr(10)) + ").encode());os.close(fd)\n" +
+            "if 'remove' in sys.argv:(root/'scenario').write_text('')\n")
         bt.chmod(0o700)
         config = dict(schema=1, socket=str(root / 'control.sock'), live_socket=str(root / 'live.sock'), state=str(root / 'devices.json'),
             carlife=[sys.executable, str(mock), str(root), 'carlife'],
@@ -123,6 +123,10 @@ def check(binary):
             s=until(lambda s:s['protocol']=='carplay' and s['active'] and s['pairing'])
             removed=[e for e in events() if e['event']=='remove']
             assert len(removed)==1 and removed[0]['args']==['--timeout','5','remove',cp['address']]
+            until(lambda s:s['active'] and not s['pairing'])
+            settings=[e['args'] for e in events() if e['event']=='setting']
+            assert ['--timeout','3','discoverable','off'] in settings
+            assert ['--timeout','3','pairable','off'] in settings
             ctl(op='disconnect')
             s=ctl(op='status')['status'];assert s['paused'] and s['backend_pid'] is None and s['carlife_pid']
             assert (root/'identity-private').read_bytes()==initial_identity

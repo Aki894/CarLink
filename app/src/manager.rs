@@ -60,7 +60,7 @@ fn spawn(args:&[String],generation:u64)->Result<Process>{
         loop{let mut line=vec![];let read=std::io::Read::by_ref(&mut reader).take(16385).read_until(b'\n',&mut line);
             if !matches!(read,Ok(n) if n>0){break;}if line.len()>16384{break;}
             if let Ok(v)=serde_json::from_slice::<Value>(&line){
-                if matches!(v["event"].as_str(),Some("stage"|"retry"|"forward_latency"|"bridge_stats"|"hisight_closed"|"target_selected"|"ready")){
+                if matches!(v["event"].as_str(),Some("stage"|"retry"|"forward_latency"|"bridge_stats"|"hisight_closed"|"target_selected"|"ready"|"session_error")){
                     let _=tx.try_send(v);
                 }
             }
@@ -127,6 +127,10 @@ impl Owner{
         let mut args=if choice.protocol==Protocol::Carplay{self.config.carplay.clone()}else{self.config.hicar.clone()};
         if choice.pairing {args.extend(["--pair".into(),self.config.pair_seconds.to_string()]);}
         if let Some(d)=&choice.device{args.extend([if choice.protocol==Protocol::Carplay{"--iphone".into()}else{"--peer".into()},d.address.clone()]);}
+        if choice.protocol==Protocol::Hicar {
+            let epoch=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_|"invalid system clock")?.as_secs();
+            args.extend(["--sequence".into(),((epoch+self.status.generation)%256).to_string()]);
+        }
         let process=spawn(&args,self.status.generation)?;
         self.status.protocol=Some(choice.protocol);self.status.target=choice.device.clone();self.status.pairing=choice.pairing;
         self.status.backend_pid=Some(process.child.id());self.status.last_error=None;self.backend=Some(process);self.choice=Some(choice.clone());
@@ -137,12 +141,15 @@ impl Owner{
         let d=self.choice.as_ref().and_then(|c|c.device.clone()).ok_or("no target to repair")?;
         if d.protocol!=Protocol::Carplay||self.status.active||self.repair_used{return Err("pairing repair is unavailable in this state".into());}
         self.stop_backend()?;
+        self.bluetooth(&["--timeout","5","remove",&d.address])?;
+        self.select(Choice{protocol:Protocol::Carplay,device:Some(d),pairing:true})?;self.repair_used=true;event("manager_target_repair_window");Ok(())
+    }
+    fn bluetooth(&self,args:&[&str])->Result<()>{
         let tool=self.config.bluetoothctl.as_deref().unwrap_or("/usr/bin/bluetoothctl");
-        let mut child=Command::new(tool).args(["--timeout","5","remove",&d.address]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|_|"cannot request target pairing removal")?;
+        let mut child=Command::new(tool).args(args).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|_|"cannot start Bluetooth control")?;
         let until=Instant::now()+Duration::from_secs(6);let success=loop{if let Some(status)=child.try_wait().map_err(|_|"pairing cleanup failed")?{break status.success();}
             if Instant::now()>=until{let _=child.kill();let _=child.wait();break false;}thread::sleep(Duration::from_millis(20));};
-        if !success{return Err("target pairing cleanup failed".into());}
-        self.select(Choice{protocol:Protocol::Carplay,device:Some(d),pairing:true})?;self.repair_used=true;event("manager_target_repair_window");Ok(())
+        if !success{return Err("Bluetooth control failed".into());}Ok(())
     }
     fn ingest(&mut self,generation:u64,v:Value)->Result<()>{
         if generation!=self.status.generation{return Ok(());}
@@ -150,6 +157,10 @@ impl Owner{
         if name=="retry"||name=="stage"&&v["stage"]=="WaitingForPairedIphone" {
             if self.status.active {self.status.active=false;self.ready=None;self.started=Instant::now()-Duration::from_secs(22);}
             let reason=v["reason"].as_str().unwrap_or("");
+            if reason.contains("no longer paired")&&self.status.protocol==Some(Protocol::Carplay)&&!self.status.pairing {
+                if let Some(d)=self.status.target.clone(){self.select(Choice{protocol:Protocol::Carplay,device:Some(d),pairing:true})?;
+                    self.repair_used=true;event("manager_pairing_needed");return Ok(());}
+            }
             if reason.contains("Connection refused"){self.refusals=self.refusals.saturating_add(1);}
             if (auth_mismatch(reason)||self.refusals>=3)&&self.status.protocol==Some(Protocol::Carplay)&&!self.status.active&&!self.repair_used{
                 let now=Instant::now();if self.last_auth.is_none_or(|t|now.duration_since(t)>Duration::from_secs(120)){
@@ -189,12 +200,16 @@ impl Owner{
             "repair"=>self.repair()?,
             "disconnect"=>{self.stop_backend()?;self.choice=None;self.status.protocol=None;self.status.target=None;self.status.pairing=false;self.pair_deadline=None;
                 self.store.paused=true;self.status.paused=true;save(&self.config.state,&self.store)?;},
+            "pause"=>{self.store.paused=true;self.status.paused=true;save(&self.config.state,&self.store)?;},
             "resume"=>{self.store.paused=false;self.status.paused=false;self.tried.clear();save(&self.config.state,&self.store)?;
                 if self.backend.is_none(){if let Some(c)=self.automatic(){self.select(c)?;}}},
             "shutdown"=>STOP.store(true,Ordering::Relaxed),_=>return Err("unsupported manager operation".into()),
         }Ok(json!({"ok":true,"status":self.status}))
     }
     fn tick(&mut self)->Result<()>{
+        if let Some(life)=self.life.as_mut(){for v in life.events.try_iter().take(16){if v["event"]=="session_error"{
+            self.status.last_error=Some(v["detail"].as_str().unwrap_or("CarLife output failed").chars().take(256).collect());event("manager_carlife_error");
+        }}}
         if self.life.as_mut().is_some_and(|p|p.child.try_wait().ok().flatten().is_some()){
             self.life=None;self.status.carlife_pid=None;self.retry_at=Instant::now()+Duration::from_millis(500);event("manager_carlife_restart");
             if fs::symlink_metadata(&self.config.live_socket).is_ok_and(|m|m.file_type().is_socket()){
@@ -213,6 +228,10 @@ impl Owner{
             if let Some(mut d)=self.status.target.clone(){d.last_used=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_|"invalid system clock")?.as_secs();
                 self.store.devices.retain(|v|!(v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address)));
                 if self.store.devices.len()<8{self.store.devices.push(d.clone());}self.store.last=Some(d.clone());self.status.target=Some(d);save(&self.config.state,&self.store)?;}
+            if self.status.pairing&&self.status.protocol==Some(Protocol::Carplay){
+                self.bluetooth(&["--timeout","3","discoverable","off"])?;
+                self.bluetooth(&["--timeout","3","pairable","off"])?;
+            }
             self.committed=true;self.status.pairing=false;self.pair_deadline=None;event("manager_stable_session");
         }
         if self.pair_deadline.is_some_and(|t|Instant::now()>=t)&&!self.status.active{

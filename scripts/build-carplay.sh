@@ -75,6 +75,8 @@ install -m 0755 "$root/scripts/run-carlink.sh" "$out/run-carlink.sh"
 mkdir -p "$out/hicar/experiments/hicar" "$out/hicar/receiver"
 cp "$root"/experiments/hicar/*.py "$root/experiments/hicar/requirements.txt" "$out/hicar/experiments/hicar/"
 cp "$root/receiver/forward.py" "$root/receiver/probe.py" "$out/hicar/receiver/"
+python3 -m pip install --disable-pip-version-check --no-compile --no-deps --require-hashes \
+    --target "$out/hicar/python" -r "$root/experiments/hicar/requirements.txt"
 bash "$root/scripts/build-audio.sh"
 cp -a "$root/dist/audio/bin/." "$out/bin/"
 cp -a "$root/dist/audio/share/." "$out/share/"

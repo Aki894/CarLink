@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "socket": "/run/carlink-manager/control.sock",
+  "live_socket": "/run/carlink/live.sock",
+  "state": "/var/lib/carlink/manager/devices.json",
+  "carlife": ["/usr/local/bin/carlink", "carlife", "usb", "--duration", "0", "--live-socket", "/run/carlink/live.sock"],
+  "carplay": ["/usr/local/bin/carlink-carplay", "forward"],
+  "hicar": [
+    "/usr/bin/env", "PYTHONDONTWRITEBYTECODE=1", "PYTHONPATH=/usr/local/lib/carlink/carplay/hicar/python",
+    "/usr/bin/python3", "/usr/local/lib/carlink/carplay/hicar/experiments/hicar/probe.py",
+    "--model", "00040A00", "--duration", "0", "--tx-power", "11", "--allow-incoming",
+    "--reply-control", "--reply-identity", "--auth-library", "/usr/local/lib/carlink/hicar-native/libcarlink_hichain.so",
+    "--identity", "/var/lib/carlink/hicar/production/identity.json", "--auth-store", "/var/lib/carlink/hicar/production/keys",
+    "--network-interface", "wlx002e2d91fc8e", "--dmsdp-options", "--audio", "--managed",
+    "--live-socket", "/run/carlink/live.sock", "--rust-session-binary", "/usr/local/bin/carlink"
+  ],
+  "devices": [],
+  "initial": "carplay",
+  "connect_seconds": 30,
+  "stable_seconds": 10,
+  "pair_seconds": 120
+}

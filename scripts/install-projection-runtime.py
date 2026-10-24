@@ -67,7 +67,7 @@ def install(project, app, receiver, rootfs):
     receiver_files = checksums(receiver)
     if 'carlink' not in app_files:
         raise ValueError('Application binary missing from checksum manifest')
-    required = ['bin/openxplay-relay', 'bin/oxp-relay', 'probe.py', 'forward.py', 'supervisor.py', 'run-carplay.sh', 'run-carlink.sh', 'bin/carlink-audio', 'share/source/audio/SOURCE.json', 'share/source/audio/ffmpeg.tar.gz', 'share/licenses/audio/COPYING.LGPLv2.1', 'SOURCE.json',
+    required = ['bin/openxplay-relay', 'bin/oxp-relay', 'probe.py', 'forward.py', 'supervisor.py', 'run-carplay.sh', 'run-carlink.sh', 'hicar/experiments/hicar/probe.py', 'hicar/receiver/forward.py', 'hicar/python/dbus_next/__init__.py', 'bin/carlink-audio', 'share/source/audio/SOURCE.json', 'share/source/audio/ffmpeg.tar.gz', 'share/licenses/audio/COPYING.LGPLv2.1', 'SOURCE.json',
                 'share/web/receiver/index.html', 'share/admin/index.html', 'share/source/relay.tar.gz',
                 'share/source/stream.tar.gz', 'share/licenses/relay/LICENSE',
                 'share/licenses/relay/LICENSE-GPL-3.0', 'share/licenses/relay/NOTICE',
