@@ -24,6 +24,7 @@ from identity import DEFAULT_PATH, load_or_create
 from dmsdp_wire import Decoder as DmsdpDecoder, Negotiation as DmsdpNegotiation
 from control_wire import Session as ControlSession
 from hisight import receive as receive_hisight
+from audio_transport import Receiver as AudioReceiver, synchronize
 
 FDEE = '0000fdee-0000-1000-8000-00805f9b34fb'
 FE35 = '0000fe35-0000-1000-8000-00805f9b34fb'
@@ -116,6 +117,16 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
     capture = None
     plaintext_capture = None
     media_task = None
+    clock_task = None
+    audio_receiver = None
+    audio_tasks = []
+    heartbeat_task = None
+    control_lock = asyncio.Lock()
+
+    async def send_control(records):
+        async with control_lock:
+            for record in records:
+                await asyncio.wait_for(asyncio.get_running_loop().sock_sendall(sock, record), 2)
     decoder = Decoder()
     parsing = decode_control
     auth_stream = JsonStream() if auth_session else None
@@ -136,6 +147,12 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                 control.on_plaintext = save_plaintext
         sock.setblocking(False)
         loop = asyncio.get_running_loop()
+        if control and control.speaker:
+            audio_receiver = AudioReceiver(control.device_info['localIp'],
+                                           control.device_info['remoteIp'],
+                                           bytes(control.cipher.key), capture_dir, log)
+            control.speaker.ports = audio_receiver.ports
+            audio_tasks = [asyncio.create_task(audio_receiver.receive(0))]
         if control:
             await asyncio.wait_for(loop.sock_sendall(sock, control.initial()), 2)
             log('control_options_sent', session=session, crypto_ability=222)
@@ -153,9 +170,32 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                 try:
                     for event in control.receive(data):
                         log('control_message', session=session, **event)
-                    for reply in control.take_pending():
-                        await asyncio.wait_for(loop.sock_sendall(sock, reply), 2)
-                        log('control_reply_sent', session=session, size=len(reply))
+                        if audio_receiver:
+                            if event.get('audio_setup_sent'):
+                                audio_receiver.begin()
+                            elif event.get('audio_ready'):
+                                audio_receiver.active = True
+                            elif event.get('audio_stopped'):
+                                audio_receiver.active = False
+                    await send_control(control.take_pending())
+                    if control.negotiated and heartbeat_task is None:
+                        async def heartbeat():
+                            try:
+                                while True:
+                                    await send_control([control.heartbeat()])
+                                    await asyncio.sleep(1)
+                            except (OSError, asyncio.TimeoutError) as error:
+                                log('control_heartbeat_stopped', error=type(error).__name__)
+                                try:
+                                    sock.shutdown(socket.SHUT_RDWR)
+                                except OSError:
+                                    pass
+                        heartbeat_task = asyncio.create_task(heartbeat())
+                    if control.clock and clock_task is None:
+                        clock_task = asyncio.create_task(synchronize(control.device_info['localIp'],
+                            control.device_info['remoteIp'], control.clock[2],
+                            bytes(control.cipher.key), log,
+                            audio_receiver.clock if audio_receiver else None))
                     if control.media_port and media_task is None:
                         async def observe_media():
                             media = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -226,9 +266,25 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
         if total == limit:
             log('capture_limit', session=session, limit=limit)
     finally:
+        if heartbeat_task:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+        if control and control.speaker:
+            control.stop_audio()
+            try:
+                await asyncio.wait_for(send_control(control.take_pending()), 1)
+                log('audio_teardown_sent')
+            except (OSError, asyncio.TimeoutError):
+                log('audio_teardown_stopped')
         if media_task:
             media_task.cancel()
             await asyncio.gather(media_task, return_exceptions=True)
+        for task in [clock_task, *audio_tasks]:
+            if task:
+                task.cancel()
+        await asyncio.gather(*(t for t in [clock_task, *audio_tasks] if t), return_exceptions=True)
+        if audio_receiver:
+            audio_receiver.close()
         if plaintext_capture:
             plaintext_capture.close()
         if control:
@@ -525,7 +581,7 @@ async def run(args):
                                                                 btName='CarLink', localIp=args.network_offer.owner_ip,
                                                                 remoteIp=args.network_offer.client_ip, port=0,
                                                                 properties={'2003': args.model, '5004': True,
-                                                                            '5014': False}))
+                                                                            '5014': False}), audio=args.audio)
                                                        if control else None))
                     tcp_clients.add(task)
                     if control:
@@ -673,7 +729,8 @@ def main():
                         help='private persistent HUKS directory')
     parser.add_argument('--network-interface', help='temporarily replace CarPlay hotspot with a HiCar AP')
     parser.add_argument('--dmsdp-options', action='store_true',
-                        help='negotiate DMSDP AES control and reply to keepalives')
+                        help='negotiate DMSDP AES control, symmetric heartbeats and clock sync')
+    parser.add_argument('--audio', action='store_true', help='enable experimental speaker service')
     parser.add_argument('--capture-dir', help='optional private directory for raw streams')
     args = parser.parse_args()
     if not 1 <= args.duration <= 900:
@@ -691,6 +748,8 @@ def main():
         parser.error('--network-interface requires --auth-library')
     if args.dmsdp_options and not args.network_interface:
         parser.error('--dmsdp-options requires --network-interface')
+    if args.audio and not args.dmsdp_options:
+        parser.error('--audio requires --dmsdp-options')
     if args.peer:
         parts = args.peer.split(':')
         if len(parts) != 6 or any(len(part) != 2 for part in parts):

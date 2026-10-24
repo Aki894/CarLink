@@ -9,6 +9,7 @@ import json
 import time
 from nearby_wire import ProtocolError, read_uint, pack_uint, Incomplete
 from cipher import Cipher
+from audio_wire import Speaker
 
 MAX_FRAME = 1498
 MAX_BODY = 65536
@@ -77,7 +78,8 @@ class Message:
 
 
 def encode(start, headers):
-    if start not in ('OPTIONS * DMSDP/1.0', 'DMSDP/1.0 200 OK'):
+    if start not in ('OPTIONS * DMSDP/1.0', 'GET_PARAMETER * DMSDP/1.0', 'SETUP * DMSDP/1.0',
+                     'PLAY * DMSDP/1.0', 'TEARDOWN * DMSDP/1.0', 'DMSDP/1.0 200 OK'):
         raise ProtocolError('unsupported initial control request')
     rows = [start]
     for name, value in headers.items():
@@ -147,7 +149,7 @@ class Messages:
 
 
 class Session:
-    def __init__(self, session_key=None, device_info=None):
+    def __init__(self, session_key=None, device_info=None, audio=False):
         self.decoder = Decoder()
         self.messages = Messages()
         self.pending = []
@@ -158,6 +160,17 @@ class Session:
         self.device_exchanged = False
         self.clock = None
         self.media_port = None
+        self.audio = audio
+        self.speaker = Speaker() if audio else None
+        self.heartbeat_sequence = 1
+
+    def heartbeat(self):
+        if not self.negotiated:
+            raise ProtocolError('heartbeat before control negotiation')
+        self.heartbeat_sequence += 1
+        payload = encode('GET_PARAMETER * DMSDP/1.0', {'CSeq': self.heartbeat_sequence})
+        return (pack_frame(self.cipher.encrypt(payload), 0xab)
+                if self.cipher else pack_frame(payload))
 
     def send_payload(self, payload):
         if not self.negotiated:
@@ -244,9 +257,28 @@ class Session:
                             self.send_business(3, 0xffffffff, pack_uint(102) + json.dumps(
                                 service, separators=(',', ':')).encode('utf-8'))
                             events.append(dict(service_announced=8))
+                        if mask & 4 and self.audio:
+                            service = dict(deviceId=self.device_info['deviceId'],
+                                           deviceName=self.device_info['deviceName'],
+                                           serviceId='speaker1', serviceType=4,
+                                           properties={'2003': '48000,44100', '2004': '1',
+                                                       '2005': '12'}, status={})
+                            self.send_business(3, 0xffffffff, pack_uint(102) + json.dumps(
+                                service, separators=(',', ':')).encode('utf-8'))
+                            events.append(dict(service_announced=4))
             else:
                 for message in self.messages.feed(payload):
                     events.append(message.metadata())
+                    if self.speaker:
+                        if message.headers.get('serviceid') == 'speaker1' and not self.negotiated:
+                            raise ProtocolError('speaker before control negotiation')
+                        audio_events = self.speaker.receive(message, encode)
+                        if audio_events is not None:
+                            events.extend(audio_events)
+                            for reply in self.speaker.pending:
+                                self.send_payload(reply)
+                            self.speaker.pending.clear()
+                            continue
                     if (message.start == 'SET_PARAMETER * DMSDP/1.0'
                             and 'cryptoswitch' in message.headers):
                         headers = message.headers
@@ -270,9 +302,10 @@ class Session:
                         cseq = message.headers['cseq']
                         if not re.fullmatch(r'[0-9]{1,9}', cseq):
                             raise ProtocolError('invalid keepalive sequence')
-                        reply = encode('DMSDP/1.0 200 OK', {'CSeq': cseq})
-                        self.pending.append(pack_frame(self.cipher.encrypt(reply), 0xab)
-                                            if self.cipher else pack_frame(reply))
+                        # DMSDP uses symmetric one-way heartbeats. Its native
+                        # OnGetParameterRequest marks the peer alive and sends
+                        # no response; RTSP HiSight has separate reply rules.
+                        events.append(dict(keepalive_received=True))
                     elif (message.start == 'SET_PARAMETER * DMSDP/1.0' and self.negotiated
                           and {'timeserverport', 'timeushigh', 'timeuslow'} <= message.headers.keys()):
                         try:
@@ -292,6 +325,12 @@ class Session:
     def take_pending(self):
         pending, self.pending = self.pending, []
         return pending
+
+    def stop_audio(self):
+        if self.speaker:
+            record = self.speaker.teardown(encode)
+            if record:
+                self.send_payload(record)
 
     def close(self):
         if self.cipher:

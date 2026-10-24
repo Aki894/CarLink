@@ -5,6 +5,15 @@ from nearby_wire import ProtocolError
 
 
 class ControlTests(unittest.TestCase):
+    def test_no_heartbeat_or_speaker_before_negotiation(self):
+        session = Session(audio=True)
+        with self.assertRaises(ProtocolError):
+            session.heartbeat()
+        with self.assertRaises(ProtocolError):
+            session.receive(pack_frame(encode('GET_PARAMETER * DMSDP/1.0',
+                dict(ServiceID='speaker1', ServiceType=3, DataSessionID=42, CSeq=1))))
+        self.assertIsNone(session.speaker.session_id)
+
     def test_initial_offer_has_only_implemented_capabilities(self):
         wire = Session().initial()
         frame = Decoder().feed(wire)[0]
@@ -101,9 +110,13 @@ class ControlTests(unittest.TestCase):
         request = b'GET_PARAMETER * DMSDP/1.0\r\nCSeq: 1\r\n\r\n'
         events = session.receive(pack_frame(peer.encrypt(request), 0xab))
         self.assertEqual(events[0]['method'], 'GET_PARAMETER')
-        response = Decoder().feed(session.take_pending()[0])[0]
+        self.assertIn(dict(keepalive_received=True), events)
+        self.assertEqual(session.take_pending(), [])
+        response = Decoder().feed(session.heartbeat())[0]
         self.assertEqual(response.marker, 0xab)
-        self.assertEqual(Messages().feed(peer.decrypt(response.payload))[0].headers['cseq'], '1')
+        heartbeat = Messages().feed(peer.decrypt(response.payload))[0]
+        self.assertEqual(heartbeat.start, 'GET_PARAMETER * DMSDP/1.0')
+        self.assertEqual(heartbeat.headers['cseq'], '2')
         # Ordinary service parameters are observed, never misclassified as
         # repeated crypto negotiation or acknowledged before implementation.
         events = session.receive(pack_frame(peer.encrypt(
