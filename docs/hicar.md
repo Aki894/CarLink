@@ -154,3 +154,7 @@ AX900 驱动声明支持 P2P-client/GO/device。直接调用现有 supplicant �
 关键修正是对手机的 GET_PARAMETER 明确返回 his_uibc_capability，声明 GENERIC 类别和点按、按键的按下/抬起能力。此前只连反向控制 socket 能启动视频，但事件不生效。54 项协议测试已在本地和 H3 的独立源码快照上全部通过。
 
 真实手机的免 PIN STS 仍返回签名校验失败；删除手机上这一条实验车辆记录后，固定 PIN 首配可恢复。设备/控制交换、连续视频和基础输入已通过，音频与周期时钟同步待接入。下一步优先修复可信重连，随后做音画同传，再接 CarLife 输出。
+
+本轮结束统计：连续接收 540.858 秒、2,554 帧、8,529,854 字节媒体包。SIGTERM 后本地输入 socket 清理，carlink 恢复 active，CarPlay 热点和有线管理连接恢复。
+
+输入修正提交 9fc8bb1，文档 59d356d。[完整构建 40061050563](https://github.com/Aki894/CarLink/actions/runs/40061050563) 的 native 与 firmware 均成功，镜像检查和上传完成；镜像 artifact 12547795788，ZIP 420,203,138 字节，上传摘要 e1db73cd64b4fa9b5d1d0f2aba6d705a700509c72d1623efcecf66d50544ac3a。认证库 artifact 12547218616 下载后，ZIP 及包内 10 个成员校验通过。本轮通过 SSH 更新独立实验代码，生产镜像未重刷。
