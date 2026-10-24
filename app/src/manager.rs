@@ -22,6 +22,7 @@ impl Device{fn validate(&self)->Result<()>{if !mac(&self.address)||self.name.is_
 struct Config{schema:u32,socket:PathBuf,live_socket:PathBuf,state:PathBuf,carlife:Vec<String>,carplay:Vec<String>,hicar:Vec<String>,
     #[serde(default)]devices:Vec<Device>,#[serde(default)]initial:Option<Protocol>,#[serde(default)]bluetoothctl:Option<String>,
     #[serde(default)]radio_lock:Option<PathBuf>,
+    #[serde(default)]media_socket:Option<PathBuf>,
     #[serde(default="connect_seconds")]connect_seconds:u64,#[serde(default="stable_seconds")]stable_seconds:u64,#[serde(default="pair_seconds")]pair_seconds:u64}
 fn connect_seconds()->u64{30}fn stable_seconds()->u64{10}fn pair_seconds()->u64{120}
 #[derive(Default,Deserialize,Serialize)]
@@ -117,7 +118,7 @@ impl Owner{
         if let Some(mut p)=self.backend.take(){p.end()?;}
         self.status.backend_pid=None;self.status.active=false;self.ready=None;self.seen_media=false;
         // Only our terminated receiver's socket in its private directory.
-        let media=Path::new("/run/carlink-carplay/media.sock");
+        let media=self.config.media_socket.as_deref().unwrap_or(Path::new("/run/carlink-carplay/media.sock"));
         if had_carplay&&media.parent().is_some_and(|p|p.is_dir())&&fs::symlink_metadata(media).is_ok_and(|m|m.file_type().is_socket()){
             fs::remove_file(media).map_err(|_|"cannot remove stopped receiver socket")?;
         }Ok(())
@@ -295,7 +296,7 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
 #[cfg(test)]mod tests{use super::*;
     #[test]fn ordinary_offline_does_not_erase_pairing(){for s in ["Host is down","Connection timed out","No route to host","AirPlay session ended"]{assert!(!auth_mismatch(s));}assert!(auth_mismatch("org.bluez.Error.AuthenticationFailed"));}
     #[test]fn stale_generation_cannot_steal_active_backend(){
-        let c=Config{schema:1,socket:"/tmp/cm/control".into(),live_socket:"/tmp/cm/live".into(),state:"/tmp/cm/missing-state".into(),carlife:vec![],carplay:vec![],hicar:vec![],devices:vec![],initial:None,bluetoothctl:None,radio_lock:None,connect_seconds:30,stable_seconds:10,pair_seconds:120};
+        let c=Config{schema:1,socket:"/tmp/cm/control".into(),live_socket:"/tmp/cm/live".into(),state:"/tmp/cm/missing-state".into(),carlife:vec![],carplay:vec![],hicar:vec![],devices:vec![],initial:None,bluetoothctl:None,radio_lock:None,media_socket:None,connect_seconds:30,stable_seconds:10,pair_seconds:120};
         let mut owner=Owner::new(c).unwrap();owner.status.generation=3;owner.status.protocol=Some(Protocol::Carplay);
         owner.ingest(2,json!({"event":"stage","stage":"WirelessActive"})).unwrap();assert!(!owner.status.active);
     }

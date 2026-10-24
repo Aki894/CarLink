@@ -60,7 +60,7 @@ def check(binary):
             "os.write(fd,(json.dumps(dict(event=('remove' if 'remove' in sys.argv else 'setting'),args=sys.argv[1:]))+" + repr(chr(10)) + ").encode());os.close(fd)\n" +
             "if 'remove' in sys.argv:(root/'scenario').write_text('')\n")
         bt.chmod(0o700)
-        config = dict(schema=1, socket=str(root / 'control.sock'), live_socket=str(root / 'live.sock'), state=str(root / 'devices.json'), radio_lock=str(root/'radio-owner.lock'),
+        config = dict(schema=1, socket=str(root / 'control.sock'), live_socket=str(root / 'live.sock'), state=str(root / 'devices.json'), radio_lock=str(root/'radio-owner.lock'), media_socket=str(root/'media.sock'),
             carlife=[sys.executable, str(mock), str(root), 'carlife'],
             carplay=[sys.executable, str(mock), str(root), 'carplay'], hicar=[sys.executable, str(mock), str(root), 'hicar'],
             devices=[cp, hc], initial='carplay', bluetoothctl=str(bt), connect_seconds=2, stable_seconds=1, pair_seconds=5)
