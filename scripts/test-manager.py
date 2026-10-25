@@ -71,7 +71,10 @@ def check(binary):
         bt.write_text('#!' + sys.executable + '\n' +
             'import json,os,pathlib,sys\nroot=pathlib.Path(' + repr(str(root)) + ')\n' +
             "fd=os.open(root/'events',os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)\n" +
-            "os.write(fd,(json.dumps(dict(event=('remove' if 'remove' in sys.argv else 'setting'),args=sys.argv[1:]))+" + repr(chr(10)) + ").encode());os.close(fd)\n" +
+            "operation='remove' if 'remove' in sys.argv else ('disconnect' if 'disconnect' in sys.argv else 'setting')\n" +
+            "failed=operation=='disconnect' and (root/'scenario').exists() and (root/'scenario').read_text()=='disconnect-fail'\n" +
+            "os.write(fd,(json.dumps(dict(event=operation,args=sys.argv[1:],failed=failed))+" + repr(chr(10)) + ").encode());os.close(fd)\n" +
+            "if failed:raise SystemExit(1)\n" +
             "if 'remove' in sys.argv:(root/'scenario').write_text('')\n")
         bt.chmod(0o700)
         config = dict(schema=1, socket=str(root / 'control.sock'), live_socket=str(root / 'live.sock'), state=str(root / 'devices.json'), radio_lock=str(root/'radio-owner.lock'), media_socket=str(root/'media.sock'),
@@ -136,8 +139,12 @@ def check(binary):
             assert other.returncode!=0, 'second runtime acquired the same radio'
             (root/'scenario').write_text('no-hu')
             until(lambda s:not s['usb_connected'])
+            marker=len(events())
             ctl(op='connect',protocol='hicar',address=hc['address'])
             no_hu=until(lambda s:s['protocol']=='hicar' and s['active'])
+            cleanup=[e for e in events()[marker:] if e['event']=='disconnect']
+            assert len(cleanup)==1 and cleanup[0]['args']==['--timeout','3','disconnect',cp['address']], 'CarPlay-to-HiCar did not disconnect only its old target'
+            assert not any(e['event']=='remove' for e in events()[marker:]), 'source switch removed a pairing bond'
             time.sleep(2.5)
             no_hu_now=ctl(op='status')['status']
             assert no_hu_now['backend_pid']==no_hu['backend_pid'], 'missing HU stole the wireless source'
@@ -148,9 +155,25 @@ def check(binary):
             until(lambda s:s['usb_connected'])
             for _ in range(3):
                 for protocol,device in [('hicar',hc),('carplay',cp)]:
+                    old=ctl(op='status')['status'];marker=len(events())
                     ctl(op='connect',protocol=protocol,address=device['address'])
                     s=until(lambda s:s['protocol']==protocol and s['active'])
                     assert s['carlife_pid']==first_life, 'source switch restarted the USB output'
+                    cleanup=[e for e in events()[marker:] if e['event']=='disconnect']
+                    assert len(cleanup)==1 and cleanup[0]['args']==['--timeout','3','disconnect',old['target']['address']], 'switch cleaned the wrong Bluetooth target'
+                    assert not any(e['event']=='remove' for e in events()[marker:]), 'ordinary source switching removed a bond'
+            # Bluetooth may already be disconnected or the controller may reject
+            # cleanup. Both directions must still transfer ownership successfully.
+            (root/'scenario').write_text('disconnect-fail')
+            for protocol,device in [('hicar',hc),('carplay',cp)]:
+                old=ctl(op='status')['status'];marker=len(events())
+                ctl(op='connect',protocol=protocol,address=device['address'])
+                switched=until(lambda s:s['protocol']==protocol and s['active'])
+                assert switched['carlife_pid']==first_life
+                cleanup=[e for e in events()[marker:] if e['event']=='disconnect']
+                assert len(cleanup)==1 and cleanup[0]['failed'] and cleanup[0]['args']==['--timeout','3','disconnect',old['target']['address']], 'disconnect failure fixture was not exercised'
+                assert not any(e['event']=='remove' for e in events()[marker:]), 'cleanup failure removed a pairing bond'
+            (root/'scenario').write_text('')
             ctl(op='connect',protocol='hicar',address=hc['address'])
             s=until(lambda s:s['protocol']=='hicar' and s['active'])
             backend=s['backend_pid']
@@ -225,9 +248,12 @@ def check(binary):
             # after disconnect/resume and across a manager restart.
             ctl(op='policy',mode='manual')
             assert ctl(op='status')['status']['backend_pid']==stable['backend_pid']
-            ctl(op='disconnect');ctl(op='resume')
+            ctl(op='disconnect')
+            cleanup_count=len([e for e in events() if e['event']=='disconnect'])
+            ctl(op='pause');ctl(op='resume');ctl(op='status')
             time.sleep(2.3)
             assert ctl(op='status')['status']['backend_pid'] is None, 'manual policy automatically selected a phone'
+            assert len([e for e in events() if e['event']=='disconnect'])==cleanup_count, 'idle pause/resume/status repeated Bluetooth cleanup'
             (root/'scenario').write_text('')
             ctl(op='connect',protocol='hicar',address=hc['address'])
             until(lambda s:s['protocol']=='hicar' and s['active'])
@@ -289,7 +315,7 @@ def check(binary):
             ctl(op='shutdown');assert p.wait(timeout=12)==0;p=None
             starts=[e for e in events() if e['event']=='start' and e['role']=='carplay']
             assert any('--pair' in e['args'] and '--iphone' in e['args'] for e in starts)
-            print(json.dumps(dict(connection_manager='passed',switches=7,usb_pid_preserved=True,
+            print(json.dumps(dict(connection_manager='passed',switches=9,usb_pid_preserved=True,target_only_bluetooth_disconnect=True,disconnect_failure_nonfatal=True,
                 independent_usb_recovery=True,pre_usb_success_not_committed=True,radio_overlap=False,offline_pairing_retained=True,
                 authentication_and_repeated_refusal_repaired=True,target_only=True,identity_unchanged=True,
                 manual_and_favorite_policy=True,current_auto_record_respected=True,hicar_enrollment_stability_gate=True,user_preferences_survive_repair_and_stability=True,forget_confirmation_and_persistence=True)))

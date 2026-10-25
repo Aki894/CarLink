@@ -159,7 +159,15 @@ impl Owner{
     fn stop_backend(&mut self)->Result<()>{
         self.menu_pending=None;self.menu_focus=0;
         let had_carplay=self.backend.is_some()&&self.status.protocol==Some(Protocol::Carplay);
-        if let Some(mut p)=self.backend.take(){p.end()?;}
+        if let Some(mut p)=self.backend.take(){
+            p.end()?;
+            // Unregistering a profile can leave its selected phone's ACL up.
+            // Drop that transport after the backend exits, retaining its bond
+            // and application keys. An absent/already-down link is harmless.
+            if let Some(target)=self.status.target.as_ref(){
+                if self.bluetooth(&["--timeout","3","disconnect",&target.address]).is_err(){event("manager_target_disconnect_failed");}
+            }
+        }
         self.status.backend_pid=None;self.status.active=false;self.ready=None;self.seen_media=false;
         // Only our terminated receiver's socket in its private directory.
         let media=self.config.media_socket.as_deref().unwrap_or(Path::new("/run/carlink-carplay/media.sock"));
@@ -458,6 +466,19 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
     #[test]fn stopping_a_session_revokes_its_pending_menu_confirmation(){
         let root=test_root("menu-confirm");let mut owner=test_owner(&root);owner.menu_pending=Some(json!({"op":"pair","protocol":"hicar"}));owner.menu_focus=1;
         owner.stop_backend().unwrap();assert!(owner.menu_pending.is_none());assert_eq!(owner.menu_focus,0);fs::remove_dir(root).unwrap();
+    }
+    #[test]fn stopping_backend_disconnects_only_its_target_and_tolerates_an_absent_link(){
+        let root=test_root("target-acl");let mut owner=test_owner(&root);let tool=root.join("bluetoothctl");
+        fs::write(&tool,b"#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"${0%/*}/args\"\nexit 1\n").unwrap();fs::set_permissions(&tool,fs::Permissions::from_mode(0o700)).unwrap();owner.config.bluetoothctl=Some(tool.to_string_lossy().into_owned());
+        let target=Device{protocol:Protocol::Hicar,address:"02:00:00:00:00:01".into(),name:"selected".into(),auto:true,last_used:0};
+        let other=Device{protocol:Protocol::Carplay,address:"02:00:00:00:00:02".into(),name:"other".into(),auto:true,last_used:0};
+        owner.store.devices=vec![target.clone(),other];owner.status.target=Some(target.clone());owner.status.protocol=Some(Protocol::Hicar);
+        owner.backend=Some(spawn(&["/bin/sleep".into(),"60".into()],1,None).unwrap());
+        // The mock reports an already-disconnected link with a nonzero exit.
+        owner.stop_backend().unwrap();let first=fs::read_to_string(root.join("args")).unwrap();
+        assert_eq!(first,format!("--timeout\n3\ndisconnect\n{}\n",target.address));assert_eq!(owner.store.devices.len(),2);assert!(owner.backend.is_none());
+        owner.stop_backend().unwrap();assert_eq!(fs::read_to_string(root.join("args")).unwrap(),first);
+        fs::remove_file(tool).unwrap();fs::remove_file(root.join("args")).unwrap();fs::remove_dir(root).unwrap();
     }
     #[test]fn backend_stage_summaries_never_forward_raw_fields(){
         let raw=json!({"event":"rfcomm_connected","address":"02:00:00:00:00:01","reason":"private detail","payload":[1,2],"pin":"test-only","key":"test-only","metadata":{"anything":true}});
