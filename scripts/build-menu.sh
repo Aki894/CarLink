@@ -5,7 +5,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 work="$root/.build/menu"
 out="$root/dist/menu"
 [[ ! -e "$work" && ! -e "$out" ]] || { echo 'Menu build/output directory already exists' >&2; exit 1; }
-mkdir -p "$work/deps" "$out/lib" "$out/share/fonts" "$out/share/source/menu" "$out/share/licenses/menu"
+mkdir -p "$work/deps" "$out/lib" "$out/bin" "$out/share/fonts" "$out/share/source/menu" "$out/share/licenses/menu"
 python3 - "$root/sources.lock.json" "$work/deps" <<'PY'
 import hashlib, json, pathlib, sys, urllib.request
 lock=json.load(open(sys.argv[1]))['menu']
@@ -23,6 +23,7 @@ gcc "${flags[@]}" -shared "$root/receiver/menu/menu.c" -o "$work/libcarlink_menu
 gcc "${flags[@]}" -DCARLINK_MENU_TEST "$root/receiver/menu/menu.c" -o "$work/menu-test-host" -lm
 arm-linux-gnueabihf-gcc "${flags[@]}" "${arm_flags[@]}" -shared "$root/receiver/menu/menu.c" -o "$out/lib/libcarlink_menu.so" -Wl,--gc-sections -lm
 arm-linux-gnueabihf-gcc "${flags[@]}" "${arm_flags[@]}" -DCARLINK_MENU_TEST "$root/receiver/menu/menu.c" -o "$work/menu-test-arm" -lm
+install -m 0755 "$work/menu-test-arm" "$out/bin/carlink-menu-selftest"
 arm-linux-gnueabihf-strip "$out/lib/libcarlink_menu.so"
 arm-linux-gnueabihf-readelf -h -A "$out/lib/libcarlink_menu.so" > "$out/menu.elf.txt"
 grep -q 'Class:.*ELF32' "$out/menu.elf.txt"

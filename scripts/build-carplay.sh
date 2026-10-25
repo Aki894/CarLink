@@ -80,6 +80,7 @@ python3 -m pip install --disable-pip-version-check --no-compile --no-deps --requ
     --target "$out/hicar/python" -r "$root/experiments/hicar/requirements.txt"
 mkdir -p "$out/lib"
 cp -a "$root/dist/menu/lib/." "$out/lib/"
+cp -a "$root/dist/menu/bin/." "$out/bin/"
 cp -a "$root/dist/menu/share/." "$out/share/"
 cp "$root/dist/menu/menu-validation.txt" "$root/dist/menu/menu.elf.txt" "$out/share/source/menu/"
 bash "$root/scripts/build-audio.sh"

@@ -45,6 +45,7 @@ for package in metadata['packages']:
 shutil.copyfile(project/'app/Cargo.lock',source/'Cargo.lock')
 shutil.copyfile(project/'app/Cargo.toml',source/'Cargo.toml')
 shutil.copytree(project/'app/src',source/'src',dirs_exist_ok=True)
+shutil.copytree(project/'app/ui',source/'ui',dirs_exist_ok=True)
 notices.mkdir(parents=True,exist_ok=True)
 (notices/'SOURCE.json').write_text(json.dumps(dict(toolchain=version,
     project_commit=os.environ['GITHUB_SHA'],dependencies=records),indent=2)+'\n')

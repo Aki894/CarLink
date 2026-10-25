@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: MIT
 // CarLink's local menu only. Phone video is never decoded or encoded here.
 #define _POSIX_C_SOURCE 200809L
-#define MINIH264_IMPLEMENTATION
-#define H264E_MAX_THREADS 0
-#define H264E_SVC_API 0
-#include "minih264e.h"
-#define STB_TRUETYPE_IMPLEMENTATION
-#include "stb_truetype.h"
+#include <assert.h>
+#include <math.h>
+#include <stddef.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +12,18 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+// minih264's SSE implementation defines __inline as an empty macro. Keep
+// that internal choice inside its header; glibc fortify wrappers require the
+// compiler's real inline semantics, as do headers used by the font renderer.
+#pragma push_macro("__inline")
+#define MINIH264_IMPLEMENTATION
+#define H264E_MAX_THREADS 0
+#define H264E_SVC_API 0
+#include "minih264e.h"
+#pragma pop_macro("__inline")
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"
 
 #define WIDTH 800
 #define HEIGHT 480

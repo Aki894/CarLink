@@ -79,7 +79,7 @@ test -x "$receiver/forward.py"
 test -x "$receiver/supervisor.py"
 test -x "$mountdir/usr/local/bin/carlink-run"
 python3 "$(dirname "$0")/install-boot-profile.py" --root "$mountdir" --verify
-for payload in forward.py supervisor.py share/source/audio/SOURCE.json share/source/audio/ffmpeg.tar.gz share/licenses/audio/COPYING.LGPLv2.1 SOURCE.json SHA256SUMS share/source/relay.tar.gz share/source/stream.tar.gz \
+for payload in lib/libcarlink_menu.so share/fonts/NotoSansCJKsc-Regular.otf share/source/menu/SOURCE.json share/licenses/menu/OFL.txt forward.py supervisor.py share/source/audio/SOURCE.json share/source/audio/ffmpeg.tar.gz share/licenses/audio/COPYING.LGPLv2.1 SOURCE.json SHA256SUMS share/source/relay.tar.gz share/source/stream.tar.gz \
     share/licenses/relay/LICENSE share/licenses/relay/LICENSE-GPL-3.0 share/licenses/relay/NOTICE \
     share/licenses/stream/LICENSE share/admin/index.html share/web/receiver/index.html; do
     test -s "$receiver/$payload"
@@ -97,8 +97,42 @@ audio=json.load(open(Path(sys.argv[1]).parent/'share/source/audio/SOURCE.json'))
 for key,value in build['sources']['audio_transcoder'].items():
     assert audio[key]==value, 'Audio source lock mismatch: '+key
 assert audio['project_commit']==receiver['project_commit']
+menu=json.load(open(Path(sys.argv[1]).parent/'share/source/menu/SOURCE.json'))
+assert menu==build['sources']['menu'], 'Menu source lock mismatch'
+import hashlib
+font=Path(sys.argv[1]).parent/'share/fonts/NotoSansCJKsc-Regular.otf'
+expected_font=next(item['sha256'] for item in menu['dependencies'] if item['name']==font.name)
+assert hashlib.sha256(font.read_bytes()).hexdigest()==expected_font, 'Menu font source checksum mismatch'
 PY
+readelf -h "$receiver/lib/libcarlink_menu.so" | grep -q 'Machine:.*ARM'
+readelf -h "$receiver/lib/libcarlink_menu.so" | grep -q 'Flags:.*hard-float ABI'
 fi
+
+# The native auth runtime is optional for legacy images. When declared, verify
+# its complete artifact manifest, ABI and exact source lock from the image.
+python3 - "$mountdir" "$(dirname "$0")" <<'PY'
+import hashlib,importlib.util,json,sys
+from pathlib import Path
+root=Path(sys.argv[1])
+build=json.load(open(root/'etc/carlink-build.json'))
+expected=build.get('hicar_native_source')
+if expected is not None:
+    spec=importlib.util.spec_from_file_location('runtime_install',Path(sys.argv[2])/'install-projection-runtime.py')
+    installer=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(installer)
+    native=root/'usr/local/lib/carlink/hicar-native'
+    declared=installer.checksums(native)
+    required=['libcarlink_hichain.so','lib/libcrypto.so.3','lib/libmbedcrypto.so.7','lib/libcjson.so.1']
+    assert 'sources.json' in declared, 'HiCar native source lock is not checksummed'
+    for relative in required:
+        assert relative in declared, 'HiCar native runtime missing: '+relative
+        installer.armhf(native/relative)
+    assert json.load(open(native/'sources.json'))==expected, 'HiCar native source lock mismatch'
+    assert hashlib.sha256((native/'libcarlink_hichain.so').read_bytes()).hexdigest()==build['hicar_native_sha256'], 'HiCar native image manifest checksum mismatch'
+    for path in native.rglob('*'):
+        assert path.stat().st_mode&0o777==(0o755 if path.is_dir() else 0o644), 'HiCar native permissions differ: '+path.relative_to(native).as_posix()
+    print('HiCar native runtime checksums, ARM hard-float ABI, source lock and permissions checked')
+PY
 test -x "$mountdir/usr/sbin/sshd"
 sudo grep -q '192.168.77.2/24' "$mountdir/etc/NetworkManager/system-connections/carlink-direct.nmconnection"
 grep -q '^CONFIG_RTW88_8821CU=m$' "$mountdir"/boot/config-*
@@ -110,4 +144,4 @@ for fw in rtw88/rtw8821c_fw.bin rtl_bt/rtl8821c_fw.bin rtl_bt/rtl8821c_config.bi
     require_payload "$mountdir/lib/firmware" firmware "$fw"
 done
 require_no_g_serial "$mountdir/etc/modules" "$mountdir/etc/modules-load.d/"
-echo "Image structure, app, kernel configuration, modules and firmware checked (mode=$mode); current mode also checks CarPlay runtime/source/checksums. Hardware untested."
+echo "Image structure, app, kernel configuration, modules and firmware checked (mode=$mode); current mode also checks projection/menu runtime/source/checksums. Hardware untested."

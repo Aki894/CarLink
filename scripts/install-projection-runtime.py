@@ -15,9 +15,12 @@ def checksums(directory):
         relative = PurePosixPath(name)
         if (len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest)
                 or relative.is_absolute() or '..' in relative.parts or '\\' in name
-                or ':' in name or name in declared):
+                or ':' in name or relative.as_posix() in declared):
             raise ValueError('Unsafe or duplicate checksum entry')
+        name = relative.as_posix()
         path = directory / name
+        if not path.resolve().is_relative_to(directory.resolve()):
+            raise ValueError('Artifact path escapes its root')
         if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
             raise ValueError('Artifact checksum mismatch: ' + name)
         declared.add(name)
@@ -84,6 +87,7 @@ def install(project, app, receiver, rootfs):
             raise ValueError('Audio transcoder source lock mismatch: ' + key)
     for path in (app / 'carlink', receiver / 'bin/openxplay-relay', receiver / 'bin/oxp-relay', receiver / 'bin/carlink-audio'):
         armhf(path)
+    native_source = native_sha = None
     native_dir = os.environ.get('HICAR_NATIVE_DIR')
     if native_dir:
         native = Path(native_dir).resolve()
@@ -95,6 +99,8 @@ def install(project, app, receiver, rootfs):
         expected = json.loads((project / 'experiments/hicar/native/sources.json').read_text())
         if json.loads((native / 'sources.json').read_text()) != expected:
             raise ValueError('HiCar native source mismatch')
+        native_source = expected
+        native_sha = hashlib.sha256((native / 'libcarlink_hichain.so').read_bytes()).hexdigest()
         native_dest = rootfs / 'usr/local/lib/carlink/hicar-native'
         if native_dest.exists():
             shutil.rmtree(native_dest)
@@ -136,6 +142,7 @@ def install(project, app, receiver, rootfs):
                     app_source_commit=os.environ['APP_COMMIT'], app_run_id=os.environ['APP_RUN_ID'],
                     app_sha256=hashlib.sha256((app / 'carlink').read_bytes()).hexdigest(),
                     app_notices=(app/'share').is_dir(),
+                    hicar_native_source=native_source, hicar_native_sha256=native_sha,
                     carplay_receiver=source, stage='CarLife MD and separate ARMv7 CarPlay receiver')
     (rootfs / 'etc/carlink-build.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print('CI application and CarPlay runtime installed after checksum, ARM ABI and source validation')
