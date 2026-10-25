@@ -461,15 +461,22 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
     fn test_root(name:&str)->PathBuf{let p=std::env::temp_dir().join(format!("carlink-manager-{}-{name}",std::process::id()));fs::create_dir(&p).unwrap();p}
     fn test_owner(root:&Path)->Owner{Owner::new(Config{schema:1,socket:root.join("control"),live_socket:root.join("live"),state:root.join("state"),carlife:vec![],carplay:vec![],hicar:vec![],devices:vec![],initial:None,bluetoothctl:None,radio_lock:None,media_socket:None,web_listen:None,source_socket:None,menu_library:None,menu_font:None,connect_seconds:30,stable_seconds:10,pair_seconds:120}).unwrap()}
     #[test]fn stale_socket_cleanup_preserves_active_files_and_symlinks(){
+        fn await_stale(path:&Path){
+            // A parallel Command::spawn can briefly inherit this CLOEXEC FD
+            // between fork and exec. The live-owner guard must keep refusing
+            // it until that temporary listener reference is actually gone.
+            let deadline=Instant::now()+Duration::from_secs(2);
+            loop {match clear_stale_socket(path){Ok(())=>break,Err(e)=>{assert!(Instant::now()<deadline,"{e}");thread::sleep(Duration::from_millis(5));}}}
+        }
         let root=test_root("socket-paths");let path=root.join("socket");let listener=UnixListener::bind(&path).unwrap();
         // Fill its pending queue as well: EAGAIN is still a live owner.
         assert_eq!(unsafe{libc::listen(listener.as_raw_fd(),1)},0);
         for _ in 0..8{assert!(clear_stale_socket(&path).is_err());assert!(path.exists());}
-        drop(listener);clear_stale_socket(&path).unwrap();assert!(!path.exists());
+        drop(listener);await_stale(&path);assert!(!path.exists());
         fs::write(&path,b"keep").unwrap();assert!(clear_stale_socket(&path).is_err());assert_eq!(fs::read(&path).unwrap(),b"keep");fs::remove_file(&path).unwrap();
         let other=root.join("other");drop(UnixListener::bind(&other).unwrap());std::os::unix::fs::symlink(&other,&path).unwrap();
         assert!(clear_stale_socket(&path).is_err());assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());assert!(other.exists());
-        fs::remove_file(path).unwrap();clear_stale_socket(&other).unwrap();fs::remove_dir(root).unwrap();
+        fs::remove_file(path).unwrap();await_stale(&other);fs::remove_dir(root).unwrap();
     }
     #[test]fn bound_socket_guard_cleans_startup_errors_and_preserves_replacements(){
         let root=test_root("socket-guard");let path=root.join("control");
