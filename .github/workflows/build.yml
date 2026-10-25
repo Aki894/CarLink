@@ -58,6 +58,8 @@ jobs:
             app/target
             .build/carplay/target
           key: carlink-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('app/Cargo.lock', 'sources.lock.json', 'receiver/patches/*.patch') }}
+          restore-keys: |
+            carlink-rust-${{ runner.os }}-${{ runner.arch }}-
       - name: Test and cross compile app
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc

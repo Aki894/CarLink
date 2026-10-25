@@ -180,6 +180,11 @@ impl Owner{
         self.stop_backend()?;self.status.generation=self.status.generation.checked_add(1).ok_or("generation exhausted")?;
         let mut args=if choice.protocol==Protocol::Carplay{self.config.carplay.clone()}else{self.config.hicar.clone()};
         if choice.pairing {args.extend(["--pair".into(),self.config.pair_seconds.to_string()]);}
+        if choice.protocol==Protocol::Carplay&&choice.pairing&&choice.device.is_none(){args.push("--new-device-only".into());}
+        if choice.protocol==Protocol::Hicar&&choice.pairing&&choice.device.is_none(){
+            for d in self.store.devices.iter().filter(|d|d.protocol==Protocol::Hicar){args.extend(["--exclude-peer".into(),d.address.clone()]);}
+        }
+
         if let Some(d)=&choice.device{args.extend([if choice.protocol==Protocol::Carplay{"--iphone".into()}else{"--peer".into()},d.address.clone()]);}
         if choice.protocol==Protocol::Hicar {
             let epoch=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_|"invalid system clock")?.as_secs();
@@ -242,12 +247,12 @@ impl Owner{
                 if self.status.pairing {
                     let current=self.store.devices.iter().find(|d|d.protocol==Protocol::Carplay&&d.address.eq_ignore_ascii_case(address)).cloned()
                         .or_else(||self.status.target.as_ref().filter(|d|d.protocol==Protocol::Carplay&&d.address.eq_ignore_ascii_case(address)).cloned());
-                    self.status.target=Some(current.unwrap_or(Device{protocol:Protocol::Carplay,address:address.to_uppercase(),name:"iPhone".into(),auto:true,last_used:0}));
+                    self.status.target=Some(current.unwrap_or(Device{protocol:Protocol::Carplay,address:address.to_uppercase(),name:format!("iPhone · {}",&address[address.len()-5..].to_uppercase()),auto:true,last_used:0}));
                 }
             }
         }
         if name=="target_selected"&&self.status.pairing&&self.status.protocol==Some(Protocol::Hicar){
-            if let Some(address)=v["address"].as_str().filter(|s|mac(s)){if self.status.target.is_none(){self.status.target=Some(Device{protocol:Protocol::Hicar,address:address.to_uppercase(),name:"Huawei".into(),auto:true,last_used:0});}}
+            if let Some(address)=v["address"].as_str().filter(|s|mac(s)){if self.status.target.is_none()&&!self.store.devices.iter().any(|d|d.protocol==Protocol::Hicar&&d.address.eq_ignore_ascii_case(address)){self.status.target=Some(Device{protocol:Protocol::Hicar,address:address.to_uppercase(),name:format!("Huawei · {}",&address[address.len()-5..].to_uppercase()),auto:true,last_used:0});}}
         }
         if name=="hisight_closed" {self.status.active=false;self.ready=None;self.started=Instant::now()-Duration::from_secs(22);}
         Ok(())
@@ -335,7 +340,7 @@ impl Owner{
         if self.menu_idle&&self.status.active{self.status.menu_visible=false;self.menu_idle=false;}
         if let Some(mux)=&self.mux{let (rows,_)=self.menu_model();self.menu_focus=self.menu_focus.min(rows.len()-1);mux.set_menu(rows,self.menu_focus,self.status.menu_visible)?;}
 
-        if let Some(life)=self.life.as_mut(){for v in life.events.try_iter().take(16){if v["event"]=="carlife_state"{self.status.usb_connected=true;}if v["event"]=="session_error"{
+        if let Some(life)=self.life.as_mut(){for v in life.events.try_iter().take(16){if v["event"]=="carlife_state"{self.status.usb_connected=true;self.status.last_error=None;}if v["event"]=="session_error"{
             self.status.usb_connected=false;
             self.status.last_error=Some(v["detail"].as_str().unwrap_or("CarLife output failed").chars().take(256).collect());event("manager_carlife_error");
         }}}
@@ -409,7 +414,7 @@ fn serve(config:&Path)->Result<()>{
     let _web=owner.config.web_listen.map(|listen|crate::manager_web::start(listen,owner.config.socket.clone())).transpose()?;
     event("manager_started");let result=(||{while !STOP.load(Ordering::Relaxed){
         for _ in 0..4{match listener.accept(){Ok((mut stream,_))=>{
-            let response=exchange(&mut stream).and_then(|v|owner.command(v)).unwrap_or_else(|e|json!({"ok":false,"error":e}));
+            let response=exchange(&mut stream).and_then(|v|owner.command(v)).unwrap_or_else(|e|{owner.status.last_error=Some(e.clone());json!({"ok":false,"error":e})});
             let _=stream.set_write_timeout(Some(Duration::from_millis(500)));let _=serde_json::to_writer(&mut stream,&response);let _=stream.write_all(b"\n");
         },Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>break,Err(_)=>return Err("manager accept failed".into())}}
         if let Err(error)=owner.tick(){owner.status.last_error=Some(error);owner.retry_at=Instant::now()+Duration::from_secs(3);}

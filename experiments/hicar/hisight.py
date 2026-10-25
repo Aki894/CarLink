@@ -196,11 +196,12 @@ async def graceful_close(sock, session, log, timeout=1.0):
         log('hisight_teardown_stopped', error=type(error).__name__)
 
 
-async def receive(sock, key, capture_dir, log, sink=None):
+async def receive(sock, key, capture_dir, log, sink=None, continuous=False):
     session = Session(key)
     raw = plain = None
     loop = asyncio.get_running_loop()
     total = 0
+    capture_limit = 1024 * 1024
     media_task = None
     media_writer = None
     input_writer = None
@@ -211,18 +212,20 @@ async def receive(sock, key, capture_dir, log, sink=None):
             raw = os.fdopen(os.open(str(root) + '.bin', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb')
             plain = os.fdopen(os.open(str(root) + '.plain', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb')
             def save_plaintext(payload):
-                plain.write(len(payload).to_bytes(4, 'big') + payload)
-                plain.flush()
+                record = len(payload).to_bytes(4, 'big') + payload
+                if plain.tell() + len(record) <= capture_limit:
+                    plain.write(record)
+                    plain.flush()
             session.on_plaintext = save_plaintext
         await loop.sock_sendall(sock, session.initial())
         log('hisight_announce_sent')
-        while total < 1024 * 1024:
-            data = await loop.sock_recv(sock, min(4096, 1024 * 1024 - total))
+        while continuous or total < capture_limit:
+            data = await loop.sock_recv(sock, 4096 if continuous else min(4096, capture_limit - total))
             if not data:
                 break
             total += len(data)
-            if raw:
-                raw.write(data); raw.flush()
+            if raw and raw.tell() < capture_limit:
+                raw.write(data[:capture_limit - raw.tell()]); raw.flush()
             events, plaintexts = session.receive(data)
             for event in events:
                 log('hisight_message', **event)

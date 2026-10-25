@@ -1,0 +1,430 @@
+diff --git a/rust/direlay-linux/src/host_backends.rs b/rust/direlay-linux/src/host_backends.rs
+index 65551db..c53828c 100644
+--- a/rust/direlay-linux/src/host_backends.rs
++++ b/rust/direlay-linux/src/host_backends.rs
+@@ -22,6 +22,8 @@ pub struct AccessPointConfig {
+     pub state_dir: PathBuf,
+     pub interface: String,
+     pub channel: u8,
++    /// Explicit credentials remain in memory; the saved normal profile is unchanged.
++    pub credentials: Option<AccessPointCredentials>,
+     pub provisioning: Option<Arc<provision::ProvisioningGate>>,
+     pub before_activation: Option<BeforeActivation>,
+ }
+@@ -30,11 +32,19 @@ pub enum WifiBand {
+     Ghz2,
+     Ghz5,
+ }
+-#[derive(Clone, Debug)]
++#[derive(Clone)]
+ pub enum AccessPointCredentials {
+     Saved(PathBuf),
+     Supplied { ssid: String, password: String },
+ }
++impl std::fmt::Debug for AccessPointCredentials {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::Saved(path) => f.debug_tuple("Saved").field(path).finish(),
++            Self::Supplied { ssid, .. } => f.debug_struct("Supplied").field("ssid", ssid).field("password", &"[redacted]").finish(),
++        }
++    }
++}
+ #[derive(Clone, Debug)]
+ pub struct AccessPointRequest {
+     pub credentials: AccessPointCredentials,
+@@ -231,7 +241,8 @@ impl AccessPointFactory for NetworkManagerBackend {
+         linux_hotspot::remove_stale_hotspots(self.runner.as_ref())
+     }
+     fn access_point(&self, config: AccessPointConfig) -> Arc<dyn WirelessHotspotManager> {
+-        let request = AccessPointRequest::saved(config.state_dir.clone(), config.channel);
++        let mut request = AccessPointRequest::saved(config.state_dir.clone(), config.channel);
++        if let Some(credentials) = config.credentials { request.credentials = credentials; }
+         let ap = LinuxHotspot::new(
+             config.state_dir,
+             self.runner.clone(),
+diff --git a/rust/direlay-linux/src/linux_bluetooth.rs b/rust/direlay-linux/src/linux_bluetooth.rs
+index 43cd7a1..cee6a49 100644
+--- a/rust/direlay-linux/src/linux_bluetooth.rs
++++ b/rust/direlay-linux/src/linux_bluetooth.rs
+@@ -128,6 +128,24 @@ pub fn select_iphone(devices: &[BondedDevice], choice: Option<&str>) -> Result<B
+         })
+     })
+ }
++/// Frozen before the pairing window opens. Retries keep this snapshot and the
++/// first selected new target; they never promote an old bond or another phone.
++pub struct NewDeviceSelection {
++    excluded: std::collections::BTreeSet<String>,
++    selected: Option<String>,
++}
++impl NewDeviceSelection {
++    pub fn snapshot(devices: &[BondedDevice]) -> Self {
++        Self { excluded: devices.iter().filter(|d| d.paired).map(|d| d.address.to_ascii_uppercase()).collect(), selected: None }
++    }
++    pub fn select(&mut self, devices: &[BondedDevice]) -> Result<BondedDevice> {
++        if let Some(selected) = &self.selected { return select_iphone(devices, Some(selected)); }
++        let eligible: Vec<_> = devices.iter().filter(|d| !self.excluded.contains(&d.address.to_ascii_uppercase())).cloned().collect();
++        let selected = select_iphone(&eligible, None)?;
++        self.selected = Some(selected.address.clone());
++        Ok(selected)
++    }
++}
+ pub fn rfcomm_channel(text: &str) -> Result<u8> {
+     let mut records = Vec::new();
+     let mut current = String::new();
+@@ -1314,3 +1332,32 @@ mod signal_tests {
+         assert_eq!(adapter_path_index("/org/bluez/hcix"), None);
+     }
+ }
++
++#[cfg(test)]
++mod carlink_enrollment_selection_tests {
++    use super::*;
++    fn phone(address: &str, connected: bool) -> BondedDevice {
++        BondedDevice { address: address.into(), name: "iPhone".into(), connected, paired: true, phone_class: true, iap2: true }
++    }
++    #[test]
++    fn carlink_new_device_snapshot_excludes_old_bonds_and_sticks_through_retries() {
++        let old = phone("02:00:00:00:00:01", true);
++        let old_two = phone("02:00:00:00:00:02", true);
++        let new = phone("02:00:00:00:00:03", false);
++        let mut window = NewDeviceSelection::snapshot(&[old.clone(), old_two.clone()]);
++        assert!(window.select(&[old.clone(), old_two.clone()]).is_err());
++        assert_eq!(window.select(&[old.clone(), old_two.clone(), new.clone()]).unwrap().address, new.address);
++        // The already-paired new phone remains eligible; another freshly paired
++        // phone or an old connected phone cannot replace it during a retry.
++        let newer = phone("02:00:00:00:00:04", true);
++        assert_eq!(window.select(&[old.clone(), new.clone(), newer.clone()]).unwrap().address, new.address);
++        assert!(window.select(&[old.clone(), newer]).is_err());
++        assert_eq!(window.select(&[old, new.clone()]).unwrap().address, new.address);
++    }
++    #[test]
++    fn carlink_known_target_repair_keeps_legacy_explicit_selection() {
++        let old = phone("02:00:00:00:00:01", false);
++        let other = phone("02:00:00:00:00:02", true);
++        assert_eq!(select_iphone(&[old.clone(), other], Some(&old.address)).unwrap().address, old.address);
++    }
++}
+diff --git a/rust/direlay-linux/src/linux_hotspot.rs b/rust/direlay-linux/src/linux_hotspot.rs
+index 8498862..ee0663b 100644
+--- a/rust/direlay-linux/src/linux_hotspot.rs
++++ b/rust/direlay-linux/src/linux_hotspot.rs
+@@ -310,6 +310,50 @@ struct HotspotState {
+     connection: Option<String>,
+     ready: Option<WirelessHotspotInfo>,
+ }
++// New-device credentials are installed over the existing system D-Bus,
++// never as nmcli arguments or persistent normal hotspot credentials.
++fn ephemeral_ap_settings<'a>(id: &'a str, interface: &'a str, ssid: &'a str, password: &'a str,
++    band: &'a str, channel: u32, subnet: &str,
++) -> Result<std::collections::HashMap<&'static str, std::collections::HashMap<&'static str, zbus::zvariant::Value<'a>>>> {
++    use std::collections::HashMap;
++    use zbus::zvariant::Value;
++    let invalid = || std::io::Error::other("Invalid ephemeral hotspot settings");
++    validate_hotspot_credentials(ssid, password).map_err(|_| invalid())?;
++    let (address, prefix) = subnet.split_once('/').ok_or_else(invalid)?;
++    let address: Ipv4Addr = address.parse().map_err(|_| invalid())?;
++    let prefix: u32 = prefix.parse().map_err(|_| invalid())?;
++    if prefix > 32 || !matches!(band, "a" | "bg") || channel == 0 { return Err(invalid()); }
++    let hex = crate::admin::auth::random_hex(16)?;
++    let uuid = format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]);
++    Ok(HashMap::from([
++        ("connection", HashMap::from([
++            ("id", Value::from(id)), ("uuid", Value::from(uuid)),
++            ("type", Value::from("802-11-wireless")), ("interface-name", Value::from(interface)),
++            ("autoconnect", Value::from(false)),
++        ])),
++        ("802-11-wireless", HashMap::from([
++            ("ssid", Value::from(ssid.as_bytes().to_vec())), ("mode", Value::from("ap")),
++            ("band", Value::from(band)), ("channel", Value::from(channel)),
++        ])),
++        ("802-11-wireless-security", HashMap::from([
++            ("key-mgmt", Value::from("wpa-psk")), ("psk", Value::from(password)),
++            ("proto", Value::from(vec!["rsn"])), ("pairwise", Value::from(vec!["ccmp"])), ("group", Value::from(vec!["ccmp"])),
++        ])),
++        ("ipv4", HashMap::from([
++            ("method", Value::from("shared")),
++            ("addresses", Value::from(vec![vec![u32::from_ne_bytes(address.octets()), prefix, 0]])),
++        ])),
++        ("ipv6", HashMap::from([("method", Value::from("disabled"))])),
++    ]))
++}
++fn add_ephemeral_ap(id: &str, interface: &str, ssid: &str, password: &str, band: &str, channel: u32, subnet: &str) -> Result<()> {
++    let settings = ephemeral_ap_settings(id, interface, ssid, password, band, channel, subnet)?;
++    let failed = |_| std::io::Error::other("Ephemeral hotspot profile installation failed");
++    let connection = zbus::blocking::Connection::system().map_err(failed)?;
++    let proxy = zbus::blocking::Proxy::new(&connection, "org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager/Settings", "org.freedesktop.NetworkManager.Settings").map_err(failed)?;
++    let _: zbus::zvariant::OwnedObjectPath = proxy.call("AddConnectionUnsaved", &(settings,)).map_err(failed)?;
++    Ok(())
++}
+ pub struct LinuxHotspot {
+     state_dir: PathBuf,
+     runner: Arc<dyn CommandRunner>,
+@@ -383,6 +427,7 @@ impl LinuxHotspot {
+             }
+             command(self.runner.as_ref(), args, remaining)
+         };
++        let ephemeral = matches!(&request.credentials, crate::host_backends::AccessPointCredentials::Supplied { .. });
+         let (ssid, password) = match &request.credentials {
+             crate::host_backends::AccessPointCredentials::Saved(dir) => hotspot_credentials(dir)?,
+             crate::host_backends::AccessPointCredentials::Supplied { ssid, password } => {
+@@ -428,6 +473,9 @@ impl LinuxHotspot {
+             } else {
+                 "bg"
+             };
++            if ephemeral {
++                add_ephemeral_ap(&id, &self.interface, &ssid, &password, band, selected.into(), &subnet)?;
++            } else {
+             cmd(&[
+                 "nmcli",
+                 "connection",
+@@ -465,19 +513,14 @@ impl LinuxHotspot {
+                 "ipv6.method",
+                 "disabled",
+             ])?;
++            }
+             self.wait_for_provisioning(deadline);
+             self.wait_for_device(deadline);
+             if cmd(&["nmcli", "connection", "up", "id", &id]).is_err() {
+-                cmd(&[
+-                    "nmcli",
+-                    "connection",
+-                    "modify",
+-                    &id,
+-                    "802-11-wireless.band",
+-                    "bg",
+-                    "802-11-wireless.channel",
+-                    "6",
+-                ])?;
++                let mut args = vec!["nmcli", "connection", "modify"];
++                if ephemeral { args.push("--temporary"); }
++                args.extend([id.as_str(), "802-11-wireless.band", "bg", "802-11-wireless.channel", "6"]);
++                cmd(&args)?;
+                 cmd(&["nmcli", "connection", "up", "id", &id])?;
+             }
+             let address = loop {
+@@ -915,3 +958,19 @@ mod credential_tests {
+         assert!(validate_hotspot_credentials(&"a".repeat(32), &"~".repeat(63)).is_ok());
+     }
+ }
++
++#[cfg(test)]
++mod carlink_ephemeral_profile_tests {
++    use super::*;
++    #[test]
++    fn carlink_ephemeral_profile_uses_memory_security_settings() {
++        use zbus::zvariant::Value;
++        let secret = crate::admin::auth::random_hex(16).unwrap();
++        let profile = ephemeral_ap_settings("CarLink-test", "wlan0", crate::branding::HOTSPOT_SSID, &secret, "a", 149, "10.77.0.1/24").unwrap();
++        assert!(matches!(&profile["connection"]["autoconnect"], Value::Bool(false)));
++        assert!(matches!(&profile["802-11-wireless-security"]["psk"], Value::Str(v) if v.as_str() == secret));
++        assert!(matches!(&profile["802-11-wireless-security"]["key-mgmt"], Value::Str(v) if v.as_str() == "wpa-psk"));
++        assert!(matches!(&profile["ipv4"]["method"], Value::Str(v) if v.as_str() == "shared"));
++        assert!(ephemeral_ap_settings("id", "wlan0", "CarLink", &secret, "a", 149, "not-a-network").is_err());
++    }
++}
+diff --git a/rust/direlay-linux/src/linux_wireless_platform.rs b/rust/direlay-linux/src/linux_wireless_platform.rs
+index 0001c9a..f0ad326 100644
+--- a/rust/direlay-linux/src/linux_wireless_platform.rs
++++ b/rust/direlay-linux/src/linux_wireless_platform.rs
+@@ -15,6 +15,12 @@ use std::{
+     },
+     time::Duration,
+ };
++fn enrollment_credentials(password: &mut Option<String>) -> Result<crate::host_backends::AccessPointCredentials> {
++    if password.is_none() { *password = Some(crate::admin::auth::random_hex(16)?); }
++    Ok(crate::host_backends::AccessPointCredentials::Supplied {
++        ssid: crate::branding::HOTSPOT_SSID.into(), password: password.as_ref().unwrap().clone(),
++    })
++}
+ pub struct LinuxWirelessPlatform {
+     options: Options,
+     identity: Arc<AirPlayIdentity>,
+@@ -30,6 +36,9 @@ pub struct LinuxWirelessPlatform {
+     secure_connections: Option<Arc<crate::secure_connections::SecureConnections>>,
+     /// The SSID of the access point `create_hotspot` prepared, when known before it is up.
+     planned_ssid: Mutex<Option<String>>,
++    new_device: Mutex<Option<crate::linux_bluetooth::NewDeviceSelection>>,
++    new_device_password: Mutex<Option<String>>,
++    new_device_ap_isolated: Mutex<Option<bool>>,
+     provisioning: Option<Arc<crate::provision::ProvisioningGate>>,
+     before_activation: Option<crate::host_backends::BeforeActivation>,
+ }
+@@ -65,6 +74,9 @@ impl LinuxWirelessPlatform {
+             bluetooth_wake: None,
+             secure_connections: None,
+             planned_ssid: Mutex::new(None),
++            new_device: Mutex::new(None),
++            new_device_password: Mutex::new(None),
++            new_device_ap_isolated: Mutex::new(None),
+             provisioning: None,
+             before_activation: None,
+         }
+@@ -192,6 +204,12 @@ impl BluetoothConnection for BluetoothClient {
+ impl WirelessPlatform for LinuxWirelessPlatform {
+     fn check_bluetooth_radio(&self) -> Result<()> {
+         self.backends.bluetooth.check_radio()?;
++        if self.options.new_device_only {
++            let mut selection = self.new_device.lock().unwrap();
++            if selection.is_none() {
++                *selection = Some(crate::linux_bluetooth::NewDeviceSelection::snapshot(&self.backends.bluetooth.devices()?));
++            }
++        }
+         // A bonded iPhone reconnects only with Secure Connections on: a switch the policy is
+         // making for this adapter, e.g. at startup or after BlueZ reset it, completes first.
+         if let Some(policy) = &self.secure_connections {
+@@ -213,12 +231,26 @@ impl WirelessPlatform for LinuxWirelessPlatform {
+             *self.planned_ssid.lock().unwrap() = Some(ssid);
+             Ok(self.observe_hotspot(manager))
+         } else {
++            let credentials = if self.options.new_device_only {
++                // Tear down old profiles/stations before exposing this window.
++                // Failure stays closed for this window; retries cannot skip it.
++                let mut isolated = self.new_device_ap_isolated.lock().unwrap();
++                if isolated.is_none() {
++                    let result = self.hotspot_lifetime.remove_stale_once(|| self.backends.access_point.prepare())
++                        .unwrap_or_else(|| self.backends.access_point.prepare());
++                    *isolated = Some(result.is_ok());
++                }
++                if *isolated != Some(true) { return Err(std::io::Error::other("New-device hotspot isolation failed")); }
++                let mut password = self.new_device_password.lock().unwrap();
++                Some(enrollment_credentials(&mut password)?)
++            } else { None };
+             let hotspot = self.hotspot_lifetime.create(|| {
+                 self.observe_hotspot(self.backends.access_point.access_point(
+                     crate::host_backends::AccessPointConfig {
+                         state_dir: self.options.state_dir.clone(),
+                         interface: self.options.wifi_interface.clone(),
+                         channel: self.options.wifi_channel,
++                        credentials: credentials.clone(),
+                         provisioning: self.provisioning.clone(),
+                         before_activation: self.before_activation.clone(),
+                     },
+@@ -227,6 +259,8 @@ impl WirelessPlatform for LinuxWirelessPlatform {
+             // A new AP takes the saved credentials; a reused one tells its SSID at once.
+             *self.planned_ssid.lock().unwrap() = if self.hotspot_lifetime.reused() {
+                 None
++            } else if self.options.new_device_only {
++                Some(crate::branding::HOTSPOT_SSID.into())
+             } else {
+                 crate::linux_hotspot::hotspot_credentials(&self.options.state_dir)
+                     .ok()
+@@ -296,6 +330,10 @@ impl WirelessPlatform for LinuxWirelessPlatform {
+         }
+     }
+     fn select_iphone(&self) -> Result<BondedDevice> {
++        if self.options.new_device_only {
++            return self.new_device.lock().unwrap().as_mut().ok_or_else(|| std::io::Error::other("New-device snapshot not ready"))?
++                .select(&self.backends.bluetooth.devices()?);
++        }
+         self.backends
+             .bluetooth
+             .select(self.options.iphone.as_deref())
+@@ -961,3 +999,38 @@ mod network_tests {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod carlink_enrollment_credentials_tests {
++    use super::*;
++    use crate::host_backends::AccessPointCredentials;
++    #[test]
++    fn carlink_new_device_psk_is_session_private_random_and_redacted() {
++        let mut window = None;
++        let first = enrollment_credentials(&mut window).unwrap();
++        let retry = enrollment_credentials(&mut window).unwrap();
++        let other = enrollment_credentials(&mut None).unwrap();
++        let parts = |c: AccessPointCredentials| match c { AccessPointCredentials::Supplied { ssid, password } => (ssid, password), _ => panic!("not ephemeral") };
++        let (ssid, secret) = parts(first.clone());
++        let (retry_ssid, retry_secret) = parts(retry);
++        let (other_ssid, other_secret) = parts(other);
++        assert_eq!(ssid, crate::branding::HOTSPOT_SSID);
++        assert_eq!(ssid, retry_ssid); assert_eq!(ssid, other_ssid);
++        assert!(secret.len() == 32 && secret.chars().all(|c| c.is_ascii_hexdigit()));
++        assert!(secret == retry_secret, "retry must keep this window's credential");
++        assert!(secret != other_secret, "another window must have an independent credential");
++        let diagnostic = format!("{:?}", crate::host_backends::AccessPointRequest { credentials: first, band: crate::host_backends::WifiBand::Ghz5, channel: 149 });
++        assert!(diagnostic.contains("[redacted]")); assert!(!diagnostic.contains(&secret));
++        let captured = Arc::new(Mutex::new(Vec::new())); let lines = captured.clone();
++        let events = JsonEvents::new(Arc::new(move |line| lines.lock().unwrap().push(line)));
++        let endpoint = Iap2WirelessCarPlayEndpoint {
++            ssid, passphrase: secret.clone(), channel: 149, security: Iap2WirelessSecurity::WpaWpa2,
++            ip_addresses: vec!["10.77.0.1".into()], air_play_port: 7000,
++            device_identifier: "02:00:00:00:00:01".into(), public_key: "1234".into(), source_version: "1.0".into(), access_point_bssid: None,
++        };
++        let frame = Iap2WirelessControlClient::accessory_wifi_configuration(&endpoint).unwrap();
++        let trace = Iap2FrameFormatter::format_with_context(Iap2TraceDirection::Tx, "wireless", &frame);
++        assert!(trace.contains(&secret)); events.trace(&trace);
++        assert!(!captured.lock().unwrap().join(" ").contains(&secret));
++    }
++}
+diff --git a/rust/direlay-linux/src/main.rs b/rust/direlay-linux/src/main.rs
+index 3b16304..75f673b 100644
+--- a/rust/direlay-linux/src/main.rs
++++ b/rust/direlay-linux/src/main.rs
+@@ -29,6 +29,7 @@ pub struct Options {
+     pub iphone: Option<String>,
+     pub rfcomm_channel: Option<u8>,
+     pub pair_seconds: Option<u32>,
++    pub new_device_only: bool,
+     pub identity_dir: PathBuf,
+     pub stream_socket: PathBuf,
+     pub record_dir: Option<PathBuf>,
+@@ -60,7 +61,7 @@ impl Options {
+         while i < args.len() {
+             let option = &args[i];
+             i += 1;
+-            if option == "--pairing" || option == "--reset-admin-password" {
++            if option == "--pairing" || option == "--reset-admin-password" || option == "--new-device-only" {
+                 if values.insert(option.clone(), "true".into()).is_some() {
+                     return Err(invalid(format!("Missing or duplicate value for {option}")));
+                 }
+@@ -131,6 +132,7 @@ impl Options {
+             iphone: settings.iphone.clone(),
+             rfcomm_channel: settings.rfcomm_channel,
+             pair_seconds: None,
++            new_device_only: values.contains_key("--new-device-only"),
+             identity_dir: path(
+                 values
+                     .get("--identity-dir")
+@@ -245,6 +247,13 @@ impl Options {
+         self.wifi_interface = s.wifi_interface.clone();
+         self.wifi_channel = s.hotspot_channel;
+         self.iphone = s.iphone.clone();
++        if self.new_device_only {
++            if self.pair_seconds.is_none() || self.overrides.contains_key("--iphone") || s.network_mode != "device-hotspot" {
++                return Err(invalid("--new-device-only requires --pair, device-hotspot and no --iphone"));
++            }
++            // A saved default target must not override an explicit add-device window.
++            self.iphone = None;
++        }
+         self.rfcomm_channel = s.rfcomm_channel;
+         Ok(())
+     }
+@@ -495,4 +504,25 @@ pub fn run() -> Result<()> {
+     }
+     state.close()
+ }
+-pub const USAGE:&str="Usage: openxplay-relay [options]\n  --identity-dir DIR    Local identity.pk8 and certificate.p7b (default /var/lib/openxplay/mfi)\n  --state-dir DIR       Private state (default /var/lib/openxplay)\n  --host-profile PATH  Device profile (default /etc/openxplay/host.json)\n  --network-mode MODE   device-hotspot or shared-wifi\n  --wifi-interface IF   Wi-Fi interface (profile default, otherwise wlan0)\n  --carlink-interface IF Carlink station interface (empty = Wi-Fi interface)\n  --wifi-channel N      AP channel (profile default, otherwise 36; 2.4 GHz fallback 6)\n  --wifi-ssid SSID      Shared Wi-Fi SSID\n  --wifi-password PASS  Shared Wi-Fi password\n  --iphone ADDR         Select bonded iPhone\n  --rfcomm-channel N    iAP2 RFCOMM channel override (1..30)\n  --pair SECONDS        Auto-accept pairing window (1..3600)\n  --stream-socket PATH  oxp-relay socket (default /tmp/oxp-relay.sock)\n  --oxp-relay PATH      Output binary\n  --web-root DIR        Receiver web assets\n  --plugins-root DIR   Installed plugins (default /opt/openxplay/share/plugins)\n  --admin-root DIR      Admin assets (default /opt/openxplay/share/admin)\n  --bluetooth-guard-status PATH Bluetooth guard state (default /run/openxplay/bluetooth-guard.json)\n  --receiver-port PORT  Receiver HTTPS port (default 8443)\n  --pairing             Require receiver pairing code\n  --output MODE        web, carlink or both\n  --record DIR          Record decrypted media\n  --test-input replay:PATH[,PATH]  Test mode: replay Annex B clips (files or directories; a <file>.jsonl timing index from --record is used when present) instead of an iPhone\n  --test-keyframe RULES Test-mode key-frame answers: immediate (default), delay:MS, ignore-first, ignore:N, ignore-all, stream-restart; comma-separated, an h264: or h265: prefix limits a rule to that codec\n  --test-context FILE   Test-mode context script (JSON) or demo; needs the plugins setting\n  --reset-admin-password Reset admin password and exit\n  --help                Show this help";
++pub const USAGE:&str="Usage: openxplay-relay [options]\n  --identity-dir DIR    Local identity.pk8 and certificate.p7b (default /var/lib/openxplay/mfi)\n  --state-dir DIR       Private state (default /var/lib/openxplay)\n  --host-profile PATH  Device profile (default /etc/openxplay/host.json)\n  --network-mode MODE   device-hotspot or shared-wifi\n  --wifi-interface IF   Wi-Fi interface (profile default, otherwise wlan0)\n  --carlink-interface IF Carlink station interface (empty = Wi-Fi interface)\n  --wifi-channel N      AP channel (profile default, otherwise 36; 2.4 GHz fallback 6)\n  --wifi-ssid SSID      Shared Wi-Fi SSID\n  --wifi-password PASS  Shared Wi-Fi password\n  --iphone ADDR         Select bonded iPhone\n  --rfcomm-channel N    iAP2 RFCOMM channel override (1..30)\n  --pair SECONDS        Auto-accept pairing window (1..3600)\n  --new-device-only    Add a newly bonded iPhone with an isolated temporary hotspot (requires --pair, no --iphone)\n  --stream-socket PATH  oxp-relay socket (default /tmp/oxp-relay.sock)\n  --oxp-relay PATH      Output binary\n  --web-root DIR        Receiver web assets\n  --plugins-root DIR   Installed plugins (default /opt/openxplay/share/plugins)\n  --admin-root DIR      Admin assets (default /opt/openxplay/share/admin)\n  --bluetooth-guard-status PATH Bluetooth guard state (default /run/openxplay/bluetooth-guard.json)\n  --receiver-port PORT  Receiver HTTPS port (default 8443)\n  --pairing             Require receiver pairing code\n  --output MODE        web, carlink or both\n  --record DIR          Record decrypted media\n  --test-input replay:PATH[,PATH]  Test mode: replay Annex B clips (files or directories; a <file>.jsonl timing index from --record is used when present) instead of an iPhone\n  --test-keyframe RULES Test-mode key-frame answers: immediate (default), delay:MS, ignore-first, ignore:N, ignore-all, stream-restart; comma-separated, an h264: or h265: prefix limits a rule to that codec\n  --test-context FILE   Test-mode context script (JSON) or demo; needs the plugins setting\n  --reset-admin-password Reset admin password and exit\n  --help                Show this help";
++
++#[cfg(test)]
++mod carlink_new_device_options_tests {
++    use super::*;
++    #[test]
++    fn carlink_new_device_flag_has_explicit_pairing_constraints() {
++        let root = std::env::temp_dir().join(format!("carlink-options-{}", crate::admin::auth::random_hex(8).unwrap()));
++        let parse = |args: &[&str]| { let mut all = vec!["--state-dir".into(), root.to_string_lossy().into_owned()]; all.extend(args.iter().map(|s| s.to_string())); Options::parse(&all) };
++        for args in [vec!["--new-device-only"], vec!["--pair", "30", "--new-device-only", "--iphone", "02:00:00:00:00:01"], vec!["--pair", "30", "--new-device-only", "--new-device-only"], vec!["--pair", "30", "--new-device-only", "--network-mode", "shared-wifi"]] {
++            assert!(parse(&args).is_err());
++        }
++        let adding = parse(&["--pair", "30", "--new-device-only"]).unwrap();
++        assert!(adding.new_device_only && adding.iphone.is_none());
++        let mut saved_default = adding.clone(); saved_default.settings.iphone = Some("02:00:00:00:00:01".into());
++        saved_default.apply_overrides().unwrap(); assert!(saved_default.iphone.is_none());
++        assert_eq!(saved_default.settings.iphone.as_deref(), Some("02:00:00:00:00:01"));
++        let repair = parse(&["--pair", "30", "--iphone", "02:00:00:00:00:01"]).unwrap();
++        assert!(!repair.new_device_only); assert_eq!(repair.iphone.as_deref(), Some("02:00:00:00:00:01"));
++        if root.exists() { std::fs::remove_dir_all(root).unwrap(); }
++    }
++}

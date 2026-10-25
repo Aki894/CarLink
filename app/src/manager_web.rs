@@ -78,7 +78,20 @@ pub fn start(listen:SocketAddr,socket:PathBuf)->Result<Web,String>{
  ("GET","/style.css")=>response(&mut s,200,"text/css; charset=utf-8",include_bytes!("../ui/manager.css")),
  ("GET","/api/status")|("GET","/api/devices")|("POST","/api/control")=>{
  let v=if m=="GET"{Ok(json!({"op":if p.ends_with("status"){"status"}else{"devices"}}))}else{serde_json::from_slice::<Value>(&body).map_err(|_|"invalid JSON".to_string())};
- let r=v.and_then(|v|{if !matches!(v["op"].as_str(),Some("status"|"devices"|"connect"|"pair"|"pause"|"resume"|"disconnect"|"menu"|"policy"|"forget")){return Err("unsupported web operation".into());}control(&socket,v,&channels,&quit)}).unwrap_or_else(|e|json!({"ok":false,"error":e}));response(&mut s,200,"application/json",&serde_json::to_vec(&r).unwrap_or_default());},
+ let checked=v.and_then(|v|{if !matches!(v["op"].as_str(),Some("status"|"devices"|"connect"|"pair"|"pause"|"resume"|"disconnect"|"menu"|"policy"|"forget")){return Err("unsupported web operation".into());}Ok(v)});
+ match checked{
+  Ok(v) if matches!(v["op"].as_str(),Some("connect"|"pair"|"disconnect"|"forget"|"resume"))=>{
+   // A source change may tear down the very AP carrying this browser. Finish
+   // its bounded HTTP acknowledgement before asking the owner to change radio
+   // state. The existing single worker then waits on the private control path.
+   response(&mut s,202,"application/json",br#"{"ok":true,"accepted":true}"#);
+   let completed=matches!(control(&socket,v,&channels,&quit),Ok(ref value) if value["ok"]==true);
+   if !completed&&!quit.load(Ordering::Relaxed){
+    println!("{}",json!({"event":"manager_web_control_error","stage":"connection_change"}));
+   }
+  },
+  value=>{let r=value.and_then(|v|control(&socket,v,&channels,&quit)).unwrap_or_else(|e|json!({"ok":false,"error":e}));response(&mut s,200,"application/json",&serde_json::to_vec(&r).unwrap_or_default());}
+ }},
  _=>response(&mut s,404,"text/plain",b"Not found")},
  Err(_)=>response(&mut s,400,"text/plain",b"Invalid local request"),}
  channels.tcp.lock().unwrap_or_else(|e|e.into_inner()).take();
@@ -94,6 +107,22 @@ pub fn start(listen:SocketAddr,socket:PathBuf)->Result<Web,String>{
   });
   let(mut peer,_)=server.accept().unwrap();let start=Instant::now();assert!(request(&mut peer,address.port()).is_err());
   let elapsed=start.elapsed();assert!(elapsed>=Duration::from_millis(1700));assert!(elapsed<Duration::from_secs(3));drop(peer);sender.join().unwrap();
+ }
+ #[test]fn source_change_ack_precedes_private_control_completion(){
+  use std::{fs,os::unix::net::UnixListener};
+  let path=std::env::temp_dir().join(format!("carlink-web-ack-{}",std::process::id()));let ipc=UnixListener::bind(&path).unwrap();
+  let reserve=TcpListener::bind("127.0.0.1:0").unwrap();let address=reserve.local_addr().unwrap();drop(reserve);
+  let web=start(address,path.clone()).unwrap();let mut browser=TcpStream::connect(address).unwrap();browser.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+  let body=br#"{"op":"connect","protocol":"hicar","address":"02:00:00:00:00:01"}"#;
+  write!(browser,"POST /api/control HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",body.len()).unwrap();browser.write_all(body).unwrap();
+  // No private controller has even accepted yet, much less changed a network.
+  let mut reply=Vec::new();browser.read_to_end(&mut reply).unwrap();assert!(reply.starts_with(b"HTTP/1.1 202 "));assert!(reply.ends_with(br#"{"ok":true,"accepted":true}"#));
+  ipc.set_nonblocking(true).unwrap();let deadline=Instant::now()+Duration::from_secs(3);
+  let(mut manager,_)=loop{match ipc.accept(){Ok(peer)=>break peer,Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{assert!(Instant::now()<deadline,"acknowledged command was never forwarded");thread::sleep(Duration::from_millis(10));},Err(e)=>panic!("private accept: {e}")}};
+  manager.set_read_timeout(Some(Duration::from_secs(3))).unwrap();let mut command=[0u8;1024];let n=manager.read(&mut command).unwrap();assert!(n>0);
+  // Keep the accepted private command unanswered. Drop must still interrupt it.
+  let before=Instant::now();drop(web);assert!(before.elapsed()<Duration::from_secs(2));
+  drop(manager);drop(browser);drop(ipc);fs::remove_file(path).unwrap();
  }
  #[test]fn shutdown_interrupts_a_request_waiting_on_the_manager(){
   use std::{fs,os::unix::net::UnixListener};

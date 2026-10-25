@@ -111,8 +111,8 @@ def log(event, **fields):
 
 async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                   decode_control=True, auth_session=None, resource=None, dmsdp=None, control=None,
-                  live_socket=None, audio_binary=None):
-    """Observe a byte stream without treating recv boundaries as protocol frames."""
+                  live_socket=None, audio_binary=None, continuous=False):
+    """Observe bounded records; managed sessions outlive the capture byte budget."""
     total = 0
     digest = hashlib.sha256()
     capture = None
@@ -144,8 +144,10 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                 def save_plaintext(payload):
                     # Length-delimited private records, bounded by the same
                     # receive limit. Never store the session key itself.
-                    plaintext_capture.write(len(payload).to_bytes(2, 'big') + payload)
-                    plaintext_capture.flush()
+                    record = len(payload).to_bytes(2, 'big') + payload
+                    if plaintext_capture.tell() + len(record) <= limit:
+                        plaintext_capture.write(record)
+                        plaintext_capture.flush()
                 control.on_plaintext = save_plaintext
         sock.setblocking(False)
         loop = asyncio.get_running_loop()
@@ -161,14 +163,14 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
         if control:
             await asyncio.wait_for(loop.sock_sendall(sock, control.initial()), 2)
             log('control_options_sent', session=session, crypto_ability=222)
-        while total < limit:
-            data = await loop.sock_recv(sock, min(4096, limit - total))
+        while continuous or total < limit:
+            data = await loop.sock_recv(sock, 4096 if continuous else min(4096, limit - total))
             if not data:
                 break
             total += len(data)
             digest.update(data)
-            if capture:
-                capture.write(data)
+            if capture and capture.tell() < limit:
+                capture.write(data[:limit - capture.tell()])
                 capture.flush()
             log('rx_chunk', session=session, size=len(data), total=total)
             if control:
@@ -212,7 +214,8 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                                 await asyncio.wait_for(loop.sock_connect(media,
                                     (control.device_info['remoteIp'], control.media_port)), 5)
                                 log('hisight_connected', port=control.media_port)
-                                await receive_hisight(media, bytes(control.cipher.key), capture_dir, log, sink)
+                                await receive_hisight(media, bytes(control.cipher.key), capture_dir, log, sink,
+                                                       continuous=continuous)
                             except (OSError, asyncio.TimeoutError) as error:
                                 log('hisight_error', error=type(error).__name__)
                             finally:
@@ -270,7 +273,7 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                 except ProtocolError as error:
                     log('parse_stopped', session=session, reason=str(error))
                     parsing = False  # Keep private capture for unsupported formats.
-        if total == limit:
+        if not continuous and total == limit:
             log('capture_limit', session=session, limit=limit)
     finally:
         if heartbeat_task:
@@ -376,6 +379,17 @@ class Advertisement(ServiceInterface):
         self.stop.set()
 
 
+def normalize_peer(value):
+    """Strict stable Bluetooth address; whitespace is never hexadecimal input."""
+    if not isinstance(value, str):
+        raise ValueError('peer must be a six-byte colon-separated Bluetooth address')
+    parts = value.split(':')
+    if (len(parts) != 6 or any(len(part) != 2 for part in parts)
+            or any(char not in '0123456789abcdefABCDEF' for part in parts for char in part)):
+        raise ValueError('peer must be a six-byte colon-separated hexadecimal Bluetooth address')
+    return ':'.join(parts).upper()
+
+
 class PeerSelection:
     """One transport peer per explicitly bounded enrollment attempt.
 
@@ -383,9 +397,12 @@ class PeerSelection:
     FE35/FE36 socket takes the selection, shared by both profiles and the agent.
     HiChain still authenticates the selected phone before any network offer.
     """
-    def __init__(self, adapter, selected=None, pair_seconds=0, clock=None):
+    def __init__(self, adapter, selected=None, pair_seconds=0, clock=None, exclude_peers=()):
         if pair_seconds and not 5 <= pair_seconds <= 120:
             raise ValueError('pairing window must be 5..120 seconds')
+        if len(exclude_peers) > 8:
+            raise ValueError('at most eight excluded peers are supported')
+        self.excluded = frozenset(normalize_peer(peer) for peer in exclude_peers)
         self.prefix = adapter + '/dev_'
         self.selected = selected
         self.clock = clock or time.monotonic
@@ -409,6 +426,8 @@ class PeerSelection:
             return False
         if self.selected is not None:
             return device == self.selected
+        if address in self.excluded:
+            return False
         if self.deadline is None or self.clock() >= self.deadline:
             return False
         if select:
@@ -461,7 +480,7 @@ class PeerAgent(ServiceInterface):
 
 class Profile(ServiceInterface):
     def __init__(self, stop, capture_dir, peer_path=None, control_summary=None,
-                 decode_control=True, selection=None):
+                 decode_control=True, selection=None, continuous=False):
         super().__init__('org.bluez.Profile1')
         self.stop, self.capture_dir = stop, capture_dir
         self.tasks = {}
@@ -469,6 +488,7 @@ class Profile(ServiceInterface):
         self.sequence = 0
         self.peer_path = peer_path
         self.selection = selection
+        self.continuous = continuous
         self.control_summary = control_summary
         self.decode_control = decode_control
         self.business_channel = None
@@ -515,7 +535,8 @@ class Profile(ServiceInterface):
             raise
         task = asyncio.create_task(observe(sock, session, self.capture_dir,
                                            negotiator=negotiator, decode_control=self.decode_control,
-                                           auth_session=auth_session, resource=self.resource))
+                                           auth_session=auth_session, resource=self.resource,
+                                           continuous=self.continuous))
         self.tasks[device] = task
         self.sockets[device] = sock
 
@@ -579,9 +600,10 @@ async def run(args):
         return False
     bus.add_message_handler(property_trace)
     peer_path = args.adapter + '/dev_' + args.peer.upper().replace(':', '_') if args.peer else None
-    selection = PeerSelection(args.adapter, peer_path, args.pair) if peer_path or args.pair else None
-    profile = Profile(stop, args.capture_dir, peer_path, selection=selection)
-    business_profile = Profile(stop, args.capture_dir, peer_path, decode_control=False, selection=selection)
+    selection = PeerSelection(args.adapter, peer_path, args.pair, exclude_peers=args.exclude_peer) if peer_path or args.pair else None
+    profile = Profile(stop, args.capture_dir, peer_path, selection=selection, continuous=args.managed)
+    business_profile = Profile(stop, args.capture_dir, peer_path, decode_control=False,
+                               selection=selection, continuous=args.managed)
     if args.network_offer:
         from network_wire import Resource
         profile.resource = business_profile.resource = Resource(args.network_offer)
@@ -673,7 +695,8 @@ async def run(args):
                                                                             '5014': False}), audio=args.audio)
                                                        if control else None,
                                                        live_socket=args.live_socket,
-                                                       audio_binary=args.audio_binary))
+                                                       audio_binary=args.audio_binary,
+                                                       continuous=args.managed))
                     tcp_clients.add(task)
                     if control:
                         tcp_controls.add(task)
@@ -813,6 +836,8 @@ def main():
     parser.add_argument('--allow-incoming', action='store_true',
                         help='temporarily enable BR/EDR incoming connections; restore on exit')
     parser.add_argument('--peer', help='selected phone Bluetooth address; required outside an explicit pairing window')
+    parser.add_argument('--exclude-peer', action='append', type=normalize_peer, default=[], metavar='MAC',
+                        help='exclude a registered phone only from managed unknown-peer enrollment; repeat up to eight times')
     parser.add_argument('--pair', type=int, default=0, metavar='SECONDS',
                         help='managed-only enrollment window, 5..120 seconds; first transport peer is selected')
     parser.add_argument('--reply-control', action='store_true',
@@ -833,6 +858,10 @@ def main():
     parser.add_argument('--audio-binary', default='/usr/local/lib/carlink/carplay/bin/carlink-audio')
     parser.add_argument('--capture-dir', help='optional private directory for raw streams')
     args = parser.parse_args()
+    if len(args.exclude_peer) > 8:
+        parser.error('--exclude-peer accepts at most eight addresses')
+    if args.exclude_peer and not (args.managed and args.pair):
+        parser.error('--exclude-peer requires an explicit managed --pair window')
     if args.rust_session_binary and not (args.auth_library and args.network_interface and args.reply_control and args.reply_identity):
         parser.error('--rust-session-binary requires the authenticated network test configuration')
     if args.live_socket and not (args.audio and args.network_interface and args.dmsdp_options):

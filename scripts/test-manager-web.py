@@ -72,6 +72,13 @@ def check(binary):
                     if not part:raise AssertionError('manager control closed without a reply')
                     response+=part
             return json.loads(response)
+        def until_status(predicate,timeout=5):
+            deadline=time.monotonic()+timeout
+            while time.monotonic()<deadline:
+                status=ctl(dict(op='status'))['status']
+                if predicate(status):return status
+                time.sleep(.025)
+            raise AssertionError('accepted HTTP control did not reach the expected state')
         def raw(request):
             with socket.create_connection(('127.0.0.1',port),timeout=3) as stream:
                 stream.settimeout(5);stream.sendall(request)
@@ -83,6 +90,41 @@ def check(binary):
             origin=f'http://{host}' if origin is None else origin
             return raw((f'POST /api/control HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\n'
                 f'Content-Type: {kind}\r\nContent-Length: {len(body)}\r\n\r\n').encode()+body)
+        @contextlib.contextmanager
+        def stalled_controller():
+            # Replace only the harness-owned control pathname temporarily. The
+            # real manager keeps its original listener; no production socket is
+            # touched. Hold the private reply until the browser receives 202.
+            original=root/'control.original.sock';control=root/'control.sock'
+            control.rename(original)
+            fake=socket.socket(socket.AF_UNIX)
+            arrived=threading.Event();release=threading.Event();finished=threading.Event();errors=[]
+            worker=None
+            try:
+                fake.bind(str(control));fake.listen(1);fake.settimeout(5)
+                def serve():
+                    try:
+                        stream,_=fake.accept()
+                        with stream:
+                            stream.settimeout(5);request=b''
+                            while not request.endswith(b'\n'):
+                                chunk=stream.recv(4096)
+                                assert chunk, 'accepted web control was not delivered'
+                                request+=chunk;assert len(request)<=16384
+                            assert json.loads(request)['op']=='connect'
+                            arrived.set()
+                            assert release.wait(8), 'browser waited for private control completion'
+                            stream.sendall(json.dumps(dict(ok=False,error='synthetic delayed rejection')).encode()+b'\n')
+                    except BaseException as error:errors.append(error)
+                    finally:finished.set()
+                worker=threading.Thread(target=serve,daemon=True);worker.start()
+                yield arrived,release,finished,errors
+            finally:
+                release.set()
+                if worker:worker.join(timeout=2)
+                fake.close()
+                control.unlink(missing_ok=True);original.rename(control)
+                assert worker is None or not worker.is_alive(), 'fake controller did not stop'
         @contextlib.contextmanager
         def drip():
             # Keep each byte below the socket's idle timeout, while the whole
@@ -143,7 +185,24 @@ def check(binary):
             code,_,body=post(dict(op='pause'))
             assert code==200 and json.loads(body)['status']['paused']
             code,_,body=post(dict(op='resume'))
-            assert code==200 and not json.loads(body)['status']['paused']
+            assert code==202 and json.loads(body)==dict(ok=True,accepted=True)
+            until_status(lambda status:not status['paused'])
+            code,_,body=post(dict(op='disconnect'))
+            assert code==202 and json.loads(body)==dict(ok=True,accepted=True)
+            until_status(lambda status:status['paused'] and status['backend_pid'] is None)
+            code,_,body=post(dict(op='resume'))
+            assert code==202 and json.loads(body)==dict(ok=True,accepted=True)
+            until_status(lambda status:not status['paused'])
+            with stalled_controller() as (arrived,release,finished,errors):
+                started=time.monotonic()
+                code,_,body=post(dict(op='connect',protocol='hicar',address='02:00:00:00:00:01'))
+                assert code==202 and json.loads(body)==dict(ok=True,accepted=True)
+                assert time.monotonic()-started<1.5, 'HTTP ACK waited for source selection'
+                assert not release.is_set() and not finished.is_set(), 'fake controller did not stall the source change'
+                assert arrived.wait(2), 'acknowledged source selection was never forwarded'
+                release.set();assert finished.wait(2)
+                assert not errors, 'fake controller failed: '+repr(errors)
+            assert get('/api/status')[0]==200, 'listener did not recover after acknowledged control completed'
             # Web allowlist excludes process lifecycle and unrestricted record
             # injection even when the browser otherwise satisfies same-origin.
             for operation in ('shutdown','remember','repair','shell','__proto__'):
@@ -188,7 +247,8 @@ def check(binary):
             assert not os.path.lexists(root/'control.sock'), 'normal shutdown left a control endpoint'
             print(json.dumps(dict(manager_web='passed',http_requests=True,same_origin_control=True,
                 duplicate_length_and_chunked_rejected=True,body_bound=True,operation_allowlist=True,
-                body_drip_total_deadline=True,startup_failure_cleanup=True,bounded_shutdown=True)))
+                body_drip_total_deadline=True,startup_failure_cleanup=True,bounded_shutdown=True,
+                source_change_ack_precedes_controller=True)))
         except BaseException:
             log.flush()
             print((root/'manager.log').read_text(encoding='utf-8',errors='replace')[-8000:],file=sys.stderr)

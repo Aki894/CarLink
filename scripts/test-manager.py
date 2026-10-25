@@ -38,7 +38,7 @@ try:
         for v in [dict(event='stage',stage='ConnectingBluetooth',address=address),dict(event='stage',stage='WirelessActive'),dict(event='forward_latency',sent=30)]:print(json.dumps(v),flush=True)
     elif role=='hicar':
         if scenario=='pair-hicar' and '--pair' in sys.argv:
-            for address in ['not-a-bluetooth-address','02:00:00:00:00:03','02:00:00:00:00:04']:
+            for address in ['not-a-bluetooth-address','02:00:00:00:00:02','02:00:00:00:00:03','02:00:00:00:00:04']:
                 print(json.dumps(dict(event='target_selected',address=address)),flush=True)
         print(json.dumps(dict(event='bridge_stats',active=True,connected=scenario!='no-hu',video_frames=20)),flush=True)
     usb_ready=False
@@ -279,6 +279,9 @@ def check(binary):
             # Unknown HiCar pairing creates a pending record only after a valid
             # selected transport; stable delivered media is the persistence gate.
             (root/'scenario').write_text('pair-hicar')
+            # Every registered HiCar is excluded from an add-new window, even
+            # when its auto-connect preference is already disabled.
+            ctl(op='remember',device=dict(hc,auto=False))
             ctl(op='pair',protocol='hicar')
             selected=until(lambda s:s['protocol']=='hicar' and s['active'] and s['target'] and s['target']['address']=='02:00:00:00:00:03')
             assert selected['pairing']
@@ -295,6 +298,11 @@ def check(binary):
             assert store['last']['name']==pending_hc['name'] and store['last']['auto'] is False
             latest=next(e for e in reversed(events()) if e['event']=='start' and e['role']=='hicar')
             assert '--pair' in latest['args'] and '--peer' not in latest['args']
+            excluded=[latest['args'][i+1] for i,value in enumerate(latest['args'][:-1]) if value=='--exclude-peer']
+            assert excluded==[hc['address']], 'new HiCar enrollment did not exclude only its registered protocol peers'
+            known=[e for e in events() if e['event']=='start' and e['role']=='hicar' and '--peer' in e['args']]
+            assert known and all('--exclude-peer' not in e['args'] for e in known), 'explicit HiCar target was accidentally excluded'
+            assert all('--exclude-peer' not in e['args'] for e in events() if e['event']=='start' and e['role']=='carplay'), 'HiCar exclusion leaked into CarPlay arguments'
             before=len([e for e in events() if e['event']=='remove'])
             ctl(_ok=False,op='forget',protocol='hicar',address='02:00:00:00:00:03')
             assert len([e for e in events() if e['event']=='remove'])==before
@@ -318,7 +326,7 @@ def check(binary):
             print(json.dumps(dict(connection_manager='passed',switches=9,usb_pid_preserved=True,target_only_bluetooth_disconnect=True,disconnect_failure_nonfatal=True,
                 independent_usb_recovery=True,pre_usb_success_not_committed=True,radio_overlap=False,offline_pairing_retained=True,
                 authentication_and_repeated_refusal_repaired=True,target_only=True,identity_unchanged=True,
-                manual_and_favorite_policy=True,current_auto_record_respected=True,hicar_enrollment_stability_gate=True,user_preferences_survive_repair_and_stability=True,forget_confirmation_and_persistence=True)))
+                manual_and_favorite_policy=True,current_auto_record_respected=True,hicar_enrollment_stability_gate=True,registered_hicar_excluded_from_new_pairing=True,user_preferences_survive_repair_and_stability=True,forget_confirmation_and_persistence=True)))
         except BaseException:
             log.flush()
             print((root/'manager.log').read_text(encoding='utf-8',errors='replace')[-8000:],file=sys.stderr)
