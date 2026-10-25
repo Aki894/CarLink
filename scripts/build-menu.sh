@@ -42,4 +42,5 @@ python3 "$root/scripts/test-manager-menu.py" "$work/menu-test-host" "$work/menu-
 version=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["application"]["rust"])' "$root/sources.lock.json")
 CARLINK_MENU_LIBRARY="$work/libcarlink_menu_host.so" CARLINK_MENU_FONT="$out/share/fonts/NotoSansCJKsc-Regular.otf" \
     cargo +"$version" test --locked --manifest-path "$root/app/Cargo.toml" manager_menu:: -- --nocapture
+python3 "$root/scripts/test-manager-menu-control.py" "$root/app/target/debug/carlink" "$work/libcarlink_menu_host.so" "$out/share/fonts/NotoSansCJKsc-Regular.otf" | tee -a "$out/menu-validation.txt"
 (cd "$out" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)

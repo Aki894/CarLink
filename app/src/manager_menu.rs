@@ -6,7 +6,7 @@ use libloading::Library;
 use serde_json::{json,Value};
 use std::{collections::VecDeque,ffi::{c_char,c_void,CString},fs,io::{Read,Write,ErrorKind},
     os::unix::{ffi::OsStrExt,fs::PermissionsExt,io::{AsRawFd,FromRawFd},net::{UnixListener,UnixStream}},path::{Path,PathBuf},
-    sync::{Arc,Mutex,mpsc::{self,Receiver,SyncSender},atomic::{AtomicBool,Ordering}},thread::{self,JoinHandle},time::{Duration,Instant}};
+    sync::{Arc,Mutex,Condvar,mpsc::{self,Receiver,SyncSender},atomic::{AtomicBool,Ordering}},thread::{self,JoinHandle},time::{Duration,Instant}};
 type Result<T>=std::result::Result<T,String>;
 const MAX_FRAME:usize=1024*1024;
 const MAX_QUEUE:usize=2*1024*1024;
@@ -14,37 +14,85 @@ const MENU_BYTES:usize=512*1024;
 #[derive(Clone,PartialEq,Eq)]
 struct View {rows:Vec<String>,focus:usize,visible:bool,revision:u64}
 impl Default for View {fn default()->Self{Self{rows:vec!["CarLink".into()],focus:0,visible:false,revision:0}}}
-/// One producer socket, one output socket, one background IO thread. Menu model
-/// is a single latest-value slot; feedback is bounded to 32 events.
-pub struct Mux {view:Arc<Mutex<View>>,events:Receiver<Value>,stop:Arc<AtomicBool>,thread:Option<JoinHandle<()>>}
+/// One producer socket and one output socket. Native rendering is confined
+/// to its own thread; latest-view/result slots keep native work off media IO.
+pub struct Mux {view:Arc<Mutex<View>>,wake:Arc<Condvar>,events:Receiver<Value>,stop:Arc<AtomicBool>,thread:Option<JoinHandle<()>>,renderer:Option<JoinHandle<()>>}
+type RenderSlot=Arc<Mutex<Option<(u64,Result<Vec<u8>>)>>>;
+fn request_stop(view:&Mutex<View>,wake:&Condvar,stop:&AtomicBool){
+    // Share the waiter's mutex so stopping cannot race between its predicate
+    // check and Condvar::wait, leaving a lost notification.
+    let _view=view.lock().unwrap_or_else(|e|e.into_inner());stop.store(true,Ordering::Release);wake.notify_all();
+}
+fn bounded_join(handle:Option<JoinHandle<()>>){
+    if let Some(handle)=handle{let deadline=Instant::now()+Duration::from_secs(1);
+        while !handle.is_finished()&&Instant::now()<deadline{thread::sleep(Duration::from_millis(5));}
+        if handle.is_finished(){let _=handle.join();}
+        // A malfunctioning native call is detached with its library/context
+        // still owned by that thread. It cannot hold the IO thread or sockets.
+    }
+}
 impl Mux {
     pub fn start(source_socket:&Path,live_socket:&Path,library:&Path,font:&Path)->Result<Self>{
+        let delay=Duration::ZERO;
+        #[cfg(test)]let delay=std::env::var("CARLINK_MENU_TEST_RENDER_DELAY_MS").ok().and_then(|s|s.parse::<u64>().ok()).map(|ms|Duration::from_millis(ms.min(2000))).unwrap_or(delay);
+        Self::start_inner(source_socket,live_socket,library,font,delay)
+    }
+    fn start_inner(source_socket:&Path,live_socket:&Path,library:&Path,font:&Path,delay:Duration)->Result<Self>{
         if source_socket==live_socket || !source_socket.is_absolute() || !live_socket.is_absolute(){return Err("invalid menu socket paths".into());}
         // Never unlink an existing path: another owner may be serving it.
         let listener=UnixListener::bind(source_socket).map_err(|_|"cannot bind menu source socket")?;
         if fs::set_permissions(source_socket,fs::Permissions::from_mode(0o600)).is_err() || listener.set_nonblocking(true).is_err(){let _=fs::remove_file(source_socket);return Err("cannot secure menu source socket".into());}
-        let view=Arc::new(Mutex::new(View::default()));let stop=Arc::new(AtomicBool::new(false));
+        let view=Arc::new(Mutex::new(View::default()));let stop=Arc::new(AtomicBool::new(false));let wake=Arc::new(Condvar::new());let rendered=Arc::new(Mutex::new(None));
         let (send,events)=mpsc::sync_channel(32);let (ready_tx,ready_rx)=mpsc::sync_channel(1);
-        let tv=view.clone();let ts=stop.clone();let input=source_socket.to_path_buf();let output=live_socket.to_path_buf();let library=library.to_path_buf();let font=font.to_path_buf();
-        let handle=thread::spawn(move||{
-            let renderer=Renderer::load(&library,&font);
-            match renderer {Ok(renderer)=>{let _=ready_tx.send(Ok(()));Worker::new(listener,output,tv,ts,send,renderer).run();},Err(e)=>{let _=ready_tx.send(Err(e));}}
-            let _=fs::remove_file(input);
-        });
+        let rv=view.clone();let rs=stop.clone();let rw=wake.clone();let result=rendered.clone();let library=library.to_path_buf();let font=font.to_path_buf();
+        let renderer=thread::spawn(move||render_loop(library,font,rv,rw,rs,result,ready_tx,delay));
         match ready_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(()))=>Ok(Self{view,events,stop,thread:Some(handle)}),
-            Ok(Err(e))=>{let _=handle.join();Err(e)},
-            Err(_)=>{stop.store(true,Ordering::Relaxed);let _=handle.join();Err("menu renderer initialization timed out".into())}
+            Ok(Ok(()))=>{},
+            result=>{request_stop(&view,&wake,&stop);bounded_join(Some(renderer));drop(listener);let _=fs::remove_file(source_socket);
+                return Err(match result{Ok(Err(e))=>e,_=>"menu renderer initialization timed out".into()});}
         }
+        let tv=view.clone();let ts=stop.clone();let tw=wake.clone();let input=source_socket.to_path_buf();let output=live_socket.to_path_buf();
+        let handle=thread::spawn(move||{
+            let exit_view=tv.clone();Worker::new(listener,output,tv,ts.clone(),send,rendered).run();
+            request_stop(&exit_view,&tw,&ts);let _=fs::remove_file(input);
+        });
+        Ok(Self{view,wake,events,stop,thread:Some(handle),renderer:Some(renderer)})
     }
     pub fn set_menu(&self,rows:Vec<String>,focus:usize,visible:bool)->Result<()>{
         if rows.is_empty() || rows.len()>24 || focus>=rows.len() || rows.iter().any(|s|s.chars().count()>128 || s.chars().any(char::is_control)){return Err("invalid menu model".into());}
         let mut view=self.view.lock().map_err(|_|"menu state unavailable")?;
-        if view.rows!=rows || view.focus!=focus || view.visible!=visible {view.revision=view.revision.wrapping_add(1);view.rows=rows;view.focus=focus;view.visible=visible;}Ok(())
+        if view.rows!=rows || view.focus!=focus || view.visible!=visible {view.revision=view.revision.wrapping_add(1);view.rows=rows;view.focus=focus;view.visible=visible;self.wake.notify_one();}Ok(())
     }
     pub fn try_input(&self)->Option<Value>{self.events.try_recv().ok()}
 }
-impl Drop for Mux {fn drop(&mut self){self.stop.store(true,Ordering::Relaxed);if let Some(t)=self.thread.take(){let _=t.join();}}}
+impl Drop for Mux {fn drop(&mut self){request_stop(&self.view,&self.wake,&self.stop);bounded_join(self.thread.take());bounded_join(self.renderer.take());}}
+fn render_loop(library:PathBuf,font:PathBuf,view:Arc<Mutex<View>>,wake:Arc<Condvar>,stop:Arc<AtomicBool>,output:RenderSlot,ready:SyncSender<Result<()>>,delay:Duration){
+    // Load/create, render and destroy all native pointers in this thread only.
+    let mut renderer=match Renderer::load(&library,&font){Ok(r)=>r,Err(e)=>{let _=ready.send(Err(e));return;}};
+    if ready.send(Ok(())).is_err(){return;}
+    let mut processed=None;let mut cache:Option<(Vec<String>,usize,Vec<u8>)>=None;
+    loop{
+        let next={let mut current=view.lock().unwrap_or_else(|e|e.into_inner());loop{
+            if stop.load(Ordering::Acquire){return;}
+            if current.visible&&processed!=Some(current.revision){break current.clone();}
+            current=wake.wait(current).unwrap_or_else(|e|e.into_inner());
+        }};
+        processed=Some(next.revision);
+        let reused=cache.as_ref().and_then(|(rows,focus,data)|if rows==&next.rows&&*focus==next.focus{Some(data.clone())}else{None});
+        let result=if let Some(data)=reused{Ok(data)}else{
+            let until=Instant::now()+delay;
+            while Instant::now()<until&&!stop.load(Ordering::Acquire){thread::sleep(until.saturating_duration_since(Instant::now()).min(Duration::from_millis(5)));}
+            if stop.load(Ordering::Acquire){return;}
+            let fresh={let current=view.lock().unwrap_or_else(|e|e.into_inner());current.visible&&current.revision==next.revision};
+            if !fresh{continue;}
+            renderer.frame(&next)
+        };
+        if let Ok(data)=&result{cache=Some((next.rows.clone(),next.focus,data.clone()));}
+        let current=view.lock().unwrap_or_else(|e|e.into_inner());
+        if !stop.load(Ordering::Acquire)&&current.visible&&current.revision==next.revision{*output.lock().unwrap_or_else(|e|e.into_inner())=Some((next.revision,result));}
+    }
+}
+
 type Create=unsafe extern "C" fn(*const c_char)->*mut c_void;
 type Destroy=unsafe extern "C" fn(*mut c_void);
 type Render=unsafe extern "C" fn(*mut c_void,*const *const u32,*const u32,u32,u32,*mut u8,u32)->i32;
@@ -145,13 +193,13 @@ fn connect_output(path:&Path)->std::io::Result<UnixStream>{
     }
     Ok(unsafe{UnixStream::from_raw_fd(fd)})
 }
-struct Worker {listener:UnixListener,output:PathBuf,view:Arc<Mutex<View>>,stop:Arc<AtomicBool>,events:SyncSender<Value>,renderer:Renderer,
-    source:Option<Pipe>,hu:Option<Pipe>,snapshot:View,source_active:bool,waiting_key:bool,retry:Instant,painted:Option<Instant>,touch:Option<Value>,menu_touch:Option<(usize,f64,f64,bool)>,last_key:Option<Instant>}
+struct Worker {listener:UnixListener,output:PathBuf,view:Arc<Mutex<View>>,stop:Arc<AtomicBool>,events:SyncSender<Value>,rendered:RenderSlot,cached:Option<(u64,Vec<u8>)>,
+    source:Option<Pipe>,hu:Option<Pipe>,snapshot:View,source_active:bool,waiting_key:bool,retry:Instant,painted:Option<Instant>,presented:Option<View>,touch:Option<Value>,menu_touch:Option<(usize,f64,f64,bool)>,last_key:Option<Instant>}
 impl Worker {
-    fn new(listener:UnixListener,output:PathBuf,view:Arc<Mutex<View>>,stop:Arc<AtomicBool>,events:SyncSender<Value>,renderer:Renderer)->Self{
-        Self{listener,output,view,stop,events,renderer,source:None,hu:None,snapshot:View::default(),source_active:false,waiting_key:true,retry:Instant::now(),painted:None,touch:None,menu_touch:None,last_key:None}
+    fn new(listener:UnixListener,output:PathBuf,view:Arc<Mutex<View>>,stop:Arc<AtomicBool>,events:SyncSender<Value>,rendered:RenderSlot)->Self{
+        Self{listener,output,view,stop,events,rendered,cached:None,source:None,hu:None,snapshot:View::default(),source_active:false,waiting_key:true,retry:Instant::now(),painted:None,presented:None,touch:None,menu_touch:None,last_key:None}
     }
-    fn output(&mut self,f:Frame){if self.hu.as_mut().is_some_and(|p|p.push(f).is_err()){self.hu=None;self.painted=None;self.waiting_key=true;}}
+    fn output(&mut self,f:Frame){if self.hu.as_mut().is_some_and(|p|p.push(f).is_err()){self.hu=None;self.painted=None;self.presented=None;self.waiting_key=true;}}
     fn source(&mut self,f:Frame){if self.source.as_mut().is_some_and(|p|p.push(f).is_err()){self.lose_source();}}
     fn lose_source(&mut self){self.source=None;self.source_active=false;self.waiting_key=true;self.touch=None;self.last_key=None;self.stop_source_media();}
     fn stop_source_media(&mut self){
@@ -178,7 +226,7 @@ impl Worker {
     fn emit_menu(&self,mut v:Value){
         // Bind feedback to the displayed rows. The owner must compare this
         // snapshot before acting, so old input cannot approve a new dialog.
-        v["menu_rows"]=json!(self.snapshot.rows);
+        v["menu_rows"]=if v["type"]=="menu-error"{json!(self.snapshot.rows)}else{self.presented.as_ref().map(|v|json!(v.rows)).unwrap_or_else(||json!([]))};
         let _=self.events.try_send(v);
     }
     fn input(&mut self,f:Frame){
@@ -193,7 +241,8 @@ impl Worker {
         let Some(c)=v["contacts"].as_array().and_then(|c|c.first())else{self.menu_touch=None;return};
         let (Some(x),Some(y),Some(down))=(c["x"].as_f64(),c["y"].as_f64(),c["down"].as_bool())else{self.menu_touch=None;return};
         if !x.is_finite() || !y.is_finite() || !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y){self.menu_touch=None;return;}
-        let row=touch_row(x,y,self.snapshot.focus,self.snapshot.rows.len());
+        let Some(displayed)=self.presented.as_ref().filter(|v|v.rows==self.snapshot.rows)else{self.menu_touch=None;return};
+        let row=touch_row(x,y,displayed.focus,displayed.rows.len());
         if down {
             if let Some((_,px,py,moved))=self.menu_touch.as_mut(){if (x-*px).abs()*800.0>12.0 || (y-*py).abs()*480.0>12.0{*moved=true;}}
             else if let Some(row)=row {self.menu_touch=Some((row,x,y,false));}
@@ -204,10 +253,11 @@ impl Worker {
     fn update(&mut self){
         let view=match self.view.lock(){Ok(v)=>v.clone(),Err(_)=>return};
         if view.revision==self.snapshot.revision{return;}
-        let changed=view.visible!=self.snapshot.visible;let model_changed=view.rows!=self.snapshot.rows;self.snapshot=view;
+        let changed=view.visible!=self.snapshot.visible;let model_changed=view.rows!=self.snapshot.rows;self.snapshot=view;self.cached=None;
         if let Some(h)=self.hu.as_mut(){h.discard_video();}
         if model_changed{self.menu_touch=None;}
         if changed {
+            self.presented=None;
             self.menu_touch=None;
             if let Some(h)=self.hu.as_mut(){h.discard_video();}
             if self.snapshot.visible {
@@ -218,18 +268,26 @@ impl Worker {
         }
         self.painted=None;
     }
+    fn take_rendered(&mut self){
+        let result={let mut slot=self.rendered.lock().unwrap_or_else(|e|e.into_inner());
+            if slot.as_ref().is_some_and(|(revision,_)|*revision<=self.snapshot.revision){slot.take()}else{None}};
+        if let Some((revision,result))=result{if self.snapshot.visible&&revision==self.snapshot.revision{
+            match result{Ok(data)=>{self.cached=Some((revision,data));self.painted=None;},Err(_)=>self.emit_menu(json!({"type":"menu-error"}))}
+        }}
+    }
     fn run(&mut self){
-        while !self.stop.load(Ordering::Relaxed){
+        while !self.stop.load(Ordering::Acquire){
             self.update();
             if self.source.is_none(){match self.listener.accept(){Ok((s,_))=>{self.source=Pipe::new(s).ok();self.source_active=false;self.waiting_key=true;self.last_key=None;self.request_key();
                 if !self.snapshot.visible{self.output(configure());self.output(Frame::new(6,0,vec![]));self.output(Frame::new(4,0,vec![]));}},Err(e) if e.kind()==ErrorKind::WouldBlock=>{},Err(_)=>break}}
             if self.hu.is_none() && Instant::now()>=self.retry {self.retry=Instant::now()+Duration::from_millis(200);if let Ok(s)=connect_output(&self.output){self.hu=Pipe::new(s).ok();if self.hu.is_some(){self.state();}}}
             if let Some(p)=self.source.as_mut(){match p.pump(false){Ok(frames)=>{for f in frames{self.incoming(f);}},Err(_)=>self.lose_source()}}
-            if let Some(p)=self.hu.as_mut(){match p.pump(true){Ok(frames)=>{for f in frames{self.input(f);}},Err(_)=>{self.hu=None;self.painted=None;self.waiting_key=true;}}}
-            // Menu heartbeat is an IDR once per second; repaint only on changes
-            // otherwise. This keeps HU recovery independent of a source phone.
+            if let Some(p)=self.hu.as_mut(){match p.pump(true){Ok(frames)=>{for f in frames{self.input(f);}},Err(_)=>{self.hu=None;self.painted=None;self.presented=None;self.waiting_key=true;}}}
+            self.take_rendered();
+            // A static view reuses its independent IDR. Only its monotonic PTS
+            // changes; no native call can block audio/control IO here.
             if self.hu.is_some() && self.snapshot.visible && self.painted.is_none_or(|t|t.elapsed()>=Duration::from_secs(1)) {
-                match self.renderer.frame(&self.snapshot){Ok(data)=>{self.output(menu_frame(data));self.painted=Some(Instant::now());},Err(_)=>{self.emit_menu(json!({"type":"menu-error"}));self.painted=Some(Instant::now());}}
+                if let Some((revision,data))=&self.cached{if *revision==self.snapshot.revision{self.output(menu_frame(data.clone()));self.painted=Some(Instant::now());if self.hu.is_some(){self.presented=Some(self.snapshot.clone());}}}
             }
             thread::sleep(Duration::from_millis(5));
         }
@@ -265,8 +323,41 @@ fn touch_row(x:f64,y:f64,focus:usize,count:usize)->Option<usize>{
         for _ in 0..8{match connect_output(&path){Ok(s)=>held.push(s),Err(_)=>{full=true;break;}}}
         assert!(full);assert!(start.elapsed()<Duration::from_secs(2));drop(held);drop(server);fs::remove_file(path).unwrap();
     }
+    #[test]fn render_results_only_apply_to_the_matching_view(){
+        let root=std::env::temp_dir().join(format!("carlink-menu-revision-{}",std::process::id()));fs::create_dir(&root).unwrap();
+        let path=root.join("source");let listener=UnixListener::bind(&path).unwrap();let slot:RenderSlot=Arc::new(Mutex::new(Some((1,Ok(vec![1])))));
+        let(tx,_rx)=mpsc::sync_channel(32);let mut worker=Worker::new(listener,root.join("live"),Arc::new(Mutex::new(View::default())),Arc::new(AtomicBool::new(false)),tx,slot.clone());
+        worker.snapshot=View{rows:vec!["new".into()],focus:0,visible:true,revision:2};worker.take_rendered();assert!(worker.cached.is_none());
+        *slot.lock().unwrap()=Some((3,Ok(vec![3])));worker.take_rendered();assert!(worker.cached.is_none());assert!(slot.lock().unwrap().is_some());
+        worker.snapshot.revision=3;worker.take_rendered();assert_eq!(worker.cached.as_ref().unwrap().1,vec![3]);assert!(slot.lock().unwrap().is_none());
+        drop(worker);fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
+    }
+    #[test]fn renderer_initialization_failure_releases_source_socket(){
+        let root=std::env::temp_dir().join(format!("carlink-menu-invalid-{}",std::process::id()));fs::create_dir(&root).unwrap();let source=root.join("source");
+        assert!(Mux::start(&source,&root.join("live"),&root.join("missing-library"),&root.join("missing-font")).is_err());
+        assert!(!source.exists());fs::remove_dir(root).unwrap();
+    }
     fn recv(s:&mut UnixStream)->Frame {let mut h=[0u8;4];s.read_exact(&mut h).unwrap();let n=u32::from_le_bytes(h)as usize;assert!((12..=MAX_FRAME).contains(&n));let mut b=vec![0;n];s.read_exact(&mut b).unwrap();Frame{kind:b[0],flags:b[1],pts:u64::from_le_bytes(b[4..12].try_into().unwrap()),payload:b[12..].to_vec()}}
     fn until(s:&mut UnixStream,kind:u8)->Frame {for _ in 0..40{let f=recv(s);if f.kind==kind{return f;}}panic!("expected frame kind {kind}");}
+    #[test]fn slow_native_render_does_not_hold_pcm_and_static_idr_is_cached(){
+        let Ok(library)=std::env::var("CARLINK_MENU_LIBRARY")else{return};let font=std::env::var("CARLINK_MENU_FONT").unwrap();
+        let root=std::env::temp_dir().join(format!("carlink-menu-audio-{}",std::process::id()));fs::create_dir(&root).unwrap();let source=root.join("source");let live=root.join("live");
+        let mux=Mux::start_inner(&source,&live,Path::new(&library),Path::new(&font),Duration::from_millis(800)).unwrap();
+        mux.set_menu(vec!["first view".into()],0,true).unwrap();let server=UnixListener::bind(&live).unwrap();
+        let(mut hu,_)=server.accept().unwrap();hu.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+        let mut upstream=UnixStream::connect(&source).unwrap();upstream.write_all(&configure().wire()).unwrap();upstream.write_all(&Frame::new(4,1,vec![]).wire()).unwrap();
+        // Thirty PCM writes traverse the actual mux while native work is held
+        // for 800ms. An IO-thread renderer would time out on the first write.
+        for sequence in 0..30u8{let payload=vec![sequence;256];let before=Instant::now();upstream.write_all(&Frame::new(3,0,payload.clone()).wire()).unwrap();assert_eq!(until(&mut hu,3).payload,payload);assert!(before.elapsed()<Duration::from_millis(200));thread::sleep(Duration::from_millis(10));}
+        mux.set_menu(vec!["latest view".into()],0,true).unwrap();hu.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+        let mut first=until(&mut hu,2);let mut heartbeat=until(&mut hu,2);
+        for _ in 0..2{if first.payload==heartbeat.payload{break;}first=heartbeat;heartbeat=until(&mut hu,2);}
+        assert_eq!(first.payload,heartbeat.payload);assert!(heartbeat.pts>first.pts);
+        // Decoder keyframe requests replay the same IDR without encoding.
+        hu.write_all(&feedback(json!({"type":"keyframe","screen":0})).wire()).unwrap();hu.set_read_timeout(Some(Duration::from_millis(200))).unwrap();let replay=until(&mut hu,2);assert_eq!(replay.payload,first.payload);
+        mux.set_menu(vec!["pending render".into()],0,true).unwrap();thread::sleep(Duration::from_millis(20));let before=Instant::now();
+        drop(mux);assert!(before.elapsed()<Duration::from_secs(2));assert!(!source.exists());drop(hu);drop(upstream);drop(server);fs::remove_file(live).unwrap();fs::remove_dir(root).unwrap();
+    }
     #[test]fn mux_real_native_contract(){
         let Ok(lib)=std::env::var("CARLINK_MENU_LIBRARY")else{return};let font=std::env::var("CARLINK_MENU_FONT").unwrap();
         let root=std::env::temp_dir().join(format!("carlink-menu-ci-{}",std::process::id()));fs::create_dir(&root).unwrap();
