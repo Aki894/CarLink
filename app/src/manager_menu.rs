@@ -194,14 +194,14 @@ fn connect_output(path:&Path)->std::io::Result<UnixStream>{
     Ok(unsafe{UnixStream::from_raw_fd(fd)})
 }
 struct Worker {listener:UnixListener,output:PathBuf,view:Arc<Mutex<View>>,stop:Arc<AtomicBool>,events:SyncSender<Value>,rendered:RenderSlot,cached:Option<(u64,Vec<u8>)>,
-    source:Option<Pipe>,hu:Option<Pipe>,snapshot:View,source_active:bool,waiting_key:bool,retry:Instant,painted:Option<Instant>,presented:Option<View>,touch:Option<Value>,menu_touch:Option<(usize,f64,f64,bool)>,last_key:Option<Instant>}
+    source:Option<Pipe>,hu:Option<Pipe>,snapshot:View,source_active:bool,waiting_key:bool,retry:Instant,painted:Option<Instant>,presented:Option<View>,touch:Option<Value>,menu_touch:Option<(usize,f64,f64,bool)>,last_key:Option<Instant>,back_frames:Vec<Frame>,back_last:Option<Instant>,back_first:Option<Instant>}
 impl Worker {
     fn new(listener:UnixListener,output:PathBuf,view:Arc<Mutex<View>>,stop:Arc<AtomicBool>,events:SyncSender<Value>,rendered:RenderSlot)->Self{
-        Self{listener,output,view,stop,events,rendered,cached:None,source:None,hu:None,snapshot:View::default(),source_active:false,waiting_key:true,retry:Instant::now(),painted:None,presented:None,touch:None,menu_touch:None,last_key:None}
+        Self{listener,output,view,stop,events,rendered,cached:None,source:None,hu:None,snapshot:View::default(),source_active:false,waiting_key:true,retry:Instant::now(),painted:None,presented:None,touch:None,menu_touch:None,last_key:None,back_frames:vec![],back_last:None,back_first:None}
     }
     fn output(&mut self,f:Frame){if self.hu.as_mut().is_some_and(|p|p.push(f).is_err()){self.hu=None;self.painted=None;self.presented=None;self.waiting_key=true;}}
     fn source(&mut self,f:Frame){if self.source.as_mut().is_some_and(|p|p.push(f).is_err()){self.lose_source();}}
-    fn lose_source(&mut self){self.source=None;self.source_active=false;self.waiting_key=true;self.touch=None;self.last_key=None;self.stop_source_media();}
+    fn lose_source(&mut self){self.back_frames.clear();self.back_last=None;self.back_first=None;let _=self.events.try_send(json!({"type":"source-state","active":false}));self.source=None;self.source_active=false;self.waiting_key=true;self.touch=None;self.last_key=None;self.stop_source_media();}
     fn stop_source_media(&mut self){
         if let Some(h)=self.hu.as_mut(){h.discard_media();}self.painted=None;
         self.output(Frame::new(5,0,vec![0]));self.output(Frame::new(5,1,vec![0]));
@@ -211,7 +211,7 @@ impl Worker {
     fn state(&mut self){self.output(configure());self.output(Frame::new(4,u8::from(self.snapshot.visible||self.source_active),vec![]));self.waiting_key=true;self.request_key();self.painted=None;}
     fn incoming(&mut self,f:Frame){match f.kind {
         1=>{if !self.snapshot.visible {self.output(f);}},
-        4=>{self.source_active=f.flags==1;self.waiting_key=true;if !self.source_active{self.stop_source_media();}else if !self.snapshot.visible {self.output(f);}},
+        4=>{self.source_active=f.flags==1;let _=self.events.try_send(json!({"type":"source-state","active":self.source_active}));self.waiting_key=true;if !self.source_active{self.stop_source_media();}else if !self.snapshot.visible {self.output(f);}},
         6=>{self.waiting_key=true;if !self.snapshot.visible {self.output(f);}},
         2=>{if !self.snapshot.visible && self.source_active {
             if self.waiting_key && f.flags&1==0{return;}
@@ -229,8 +229,18 @@ impl Worker {
         v["menu_rows"]=if v["type"]=="menu-error"{json!(self.snapshot.rows)}else{self.presented.as_ref().map(|v|json!(v.rows)).unwrap_or_else(||json!([]))};
         let _=self.events.try_send(v);
     }
+    fn flush_backs(&mut self){let pending=std::mem::take(&mut self.back_frames);self.back_last=None;self.back_first=None;for f in pending{self.source(f);}}
+    fn back_expired(&self,now:Instant)->bool{self.back_last.is_some_and(|t|now.duration_since(t)>=Duration::from_millis(350))||self.back_first.is_some_and(|t|now.duration_since(t)>=Duration::from_millis(900))}
     fn input(&mut self,f:Frame){
         let Ok(v)=serde_json::from_slice::<Value>(&f.payload)else{return;};
+        if !self.snapshot.visible {
+            let now=Instant::now();if self.back_expired(now){self.flush_backs();}
+            if matches!(v["type"].as_str(),Some("key-press"|"key"))&&v["code"].as_u64()==Some(1){
+                self.back_first.get_or_insert(now);self.back_last=Some(now);self.back_frames.push(f);
+                if self.back_frames.len()==3{self.back_frames.clear();self.back_last=None;self.back_first=None;let _=self.events.try_send(json!({"type":"open-menu"}));}return;
+            }
+            if !self.back_frames.is_empty(){self.flush_backs();}
+        }
         if self.snapshot.visible {
             if v["type"]=="keyframe" {self.painted=None;}else if v["type"]=="touch" {self.menu_touch(v);}else if matches!(v["type"].as_str(),Some("touch"|"key-press"|"key"|"focus")){
                 self.emit_menu(v);
@@ -257,6 +267,7 @@ impl Worker {
         if let Some(h)=self.hu.as_mut(){h.discard_video();}
         if model_changed{self.menu_touch=None;}
         if changed {
+            self.back_frames.clear();self.back_last=None;self.back_first=None;
             self.presented=None;
             self.menu_touch=None;
             if let Some(h)=self.hu.as_mut(){h.discard_video();}
@@ -277,7 +288,7 @@ impl Worker {
     }
     fn run(&mut self){
         while !self.stop.load(Ordering::Acquire){
-            self.update();
+            self.update();if self.back_expired(Instant::now()){self.flush_backs();}
             if self.source.is_none(){match self.listener.accept(){Ok((s,_))=>{self.source=Pipe::new(s).ok();self.source_active=false;self.waiting_key=true;self.last_key=None;self.request_key();
                 if !self.snapshot.visible{self.output(configure());self.output(Frame::new(6,0,vec![]));self.output(Frame::new(4,0,vec![]));}},Err(e) if e.kind()==ErrorKind::WouldBlock=>{},Err(_)=>break}}
             if self.hu.is_none() && Instant::now()>=self.retry {self.retry=Instant::now()+Duration::from_millis(200);if let Ok(s)=connect_output(&self.output){self.hu=Pipe::new(s).ok();if self.hu.is_some(){self.state();}}}
@@ -302,6 +313,20 @@ fn touch_row(x:f64,y:f64,focus:usize,count:usize)->Option<usize>{
 #[cfg(test)]mod tests {
     use super::*;
     #[test]fn touch_maps_visible_scroll_rows(){assert_eq!(touch_row(0.5,0.2,0,3),Some(0));assert_eq!(touch_row(0.5,0.2,8,15),Some(2));assert_eq!(touch_row(0.01,0.2,0,3),None);assert_eq!(touch_row(0.5,0.95,0,3),None);}
+    #[test]fn triple_back_is_consumed_but_single_back_and_order_are_preserved(){
+        let root=std::env::temp_dir().join(format!("carlink-back-{}",std::process::id()));fs::create_dir(&root).unwrap();
+        let listener=UnixListener::bind(root.join("source")).unwrap();let (tx,rx)=mpsc::sync_channel(32);
+        let mut w=Worker::new(listener,root.join("live"),Arc::new(Mutex::new(View::default())),Arc::new(AtomicBool::new(false)),tx,Arc::new(Mutex::new(None)));
+        let (socket,_peer)=UnixStream::pair().unwrap();w.source=Some(Pipe::new(socket).unwrap());
+        for _ in 0..3{w.input(feedback(json!({"type":"key-press","code":1})));}
+        assert_eq!(rx.try_recv().unwrap()["type"],"open-menu");assert!(w.source.as_ref().unwrap().output.is_empty());
+        w.input(feedback(json!({"type":"key-press","code":1})));assert_eq!(w.back_frames.len(),1);
+        assert!(w.back_expired(Instant::now()+Duration::from_millis(351)));w.flush_backs();assert_eq!(w.source.as_ref().unwrap().output.len(),1);
+        w.input(feedback(json!({"type":"key-press","code":1})));w.input(feedback(json!({"type":"key-press","code":2})));
+        assert!(w.back_frames.is_empty());assert_eq!(w.source.as_ref().unwrap().output.len(),3);
+        w.input(feedback(json!({"type":"key-press","code":1})));w.lose_source();assert!(w.back_frames.is_empty());assert_eq!(rx.try_recv().unwrap()["type"],"source-state");
+        drop(w);fs::remove_file(root.join("source")).unwrap();fs::remove_dir(root).unwrap();
+    }
     #[test]fn rejects_bad_media(){assert!(valid(&configure(),false));assert!(!valid(&Frame::new(3,0,vec![1,2,3]),false));assert!(!valid(&Frame::new(129,0,b"{}".to_vec()),false));assert!(valid(&feedback(json!({"type":"keyframe"})),true));assert!(!valid(&Frame::new(2,1,vec![1,2,3]),false));}
     #[test]fn partial_video_is_never_removed(){let(a,_)=UnixStream::pair().unwrap();let mut p=Pipe::new(a).unwrap();p.push(Frame::new(2,1,vec![0,0,0,1,5])).unwrap();p.output.front_mut().unwrap().offset=2;p.queued-=2;p.push(Frame::new(2,1,vec![0,0,0,1,5])).unwrap();p.push(Frame::new(3,0,vec![0;4])).unwrap();p.discard_video();assert_eq!(p.output.len(),2);assert_eq!(p.output.front().unwrap().offset,2);assert_eq!(p.queued,p.output.iter().map(|p|p.data.len()-p.offset).sum::<usize>());}
     #[test]fn cached_batch_is_parsed_without_new_socket_input(){
@@ -369,12 +394,12 @@ fn touch_row(x:f64,y:f64,focus:usize,count:usize)->Option<usize>{
         let menu=until(&mut hu,2);assert_eq!(menu.flags&1,1);assert!(menu.payload.len()>200);
         // Local menu works while no phone has connected at all.
         for down in [true,false]{hu.write_all(&feedback(json!({"type":"touch","contacts":[{"id":0,"x":0.5,"y":0.2,"down":down}]})).wire()).unwrap();}
-        let deadline=Instant::now()+Duration::from_secs(3);loop{if let Some(v)=mux.try_input(){assert_eq!(v["type"],"menu-select");assert_eq!(v["index"],0);assert_eq!(v["menu_rows"],json!(["\u{8fde}\u{63a5} iPhone","\u{8fde}\u{63a5}\u{534e}\u{4e3a}"]));break;}assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(10));}
+        let deadline=Instant::now()+Duration::from_secs(3);loop{if let Some(v)=mux.try_input(){if v["type"]=="source-state"{continue;}assert_eq!(v["type"],"menu-select");assert_eq!(v["index"],0);assert_eq!(v["menu_rows"],json!(["\u{8fde}\u{63a5} iPhone","\u{8fde}\u{63a5}\u{534e}\u{4e3a}"]));break;}assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(10));}
         let mut upstream=UnixStream::connect(&source).unwrap();upstream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         upstream.write_all(&configure().wire()).unwrap();upstream.write_all(&Frame::new(4,1,vec![]).wire()).unwrap();
         upstream.write_all(&Frame::new(3,0,vec![7;256]).wire()).unwrap();assert_eq!(until(&mut hu,3).payload,vec![7;256]);
         hu.write_all(&feedback(json!({"type":"key-press","code":6})).wire()).unwrap();
-        let input_deadline=Instant::now()+Duration::from_secs(3);let input=loop{if let Some(v)=mux.try_input(){break v;}assert!(Instant::now()<input_deadline);thread::sleep(Duration::from_millis(10));};assert_eq!(input["code"],6);assert_eq!(input["menu_rows"],json!(["\u{8fde}\u{63a5} iPhone","\u{8fde}\u{63a5}\u{534e}\u{4e3a}"]));
+        let input_deadline=Instant::now()+Duration::from_secs(3);let input=loop{if let Some(v)=mux.try_input(){if v["type"]=="key-press"{break v;}}assert!(Instant::now()<input_deadline);thread::sleep(Duration::from_millis(10));};assert_eq!(input["code"],6);assert_eq!(input["menu_rows"],json!(["\u{8fde}\u{63a5} iPhone","\u{8fde}\u{63a5}\u{534e}\u{4e3a}"]));
         mux.set_menu(vec!["\u{8fde}\u{63a5} iPhone".into()],0,false).unwrap();thread::sleep(Duration::from_millis(100));
         let key=vec![0,0,0,1,0x65,0xff,0xab,0xcd];upstream.write_all(&Frame::new(2,1,key.clone()).wire()).unwrap();
         let deadline=Instant::now()+Duration::from_secs(5);loop{let f=recv(&mut hu);if f.kind==2 && f.payload==key{break;}assert!(Instant::now()<deadline);}

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import socket
 import struct
 import subprocess
@@ -296,16 +297,26 @@ def check(binary, library, font):
             assert not any(e['event']=='input' and e['role']=='hicar' for e in events()), 'menu input was forwarded into HiCar'
             hu.feedback(dict(type='key-press',code=1))
             until(lambda:any(e['event']=='input' and e['role']=='carplay' and e['code']==1 for e in events()), 'projection input restored after menu exit')
+            before_backs=len([e for e in events() if e['event']=='input' and e['role']=='carplay' and e['code']==1])
+            for _ in range(3):hu.feedback(dict(type='key-press',code=1));time.sleep(.1)
+            until(lambda:status_where(lambda s:s['menu_visible'] and s['backend_pid']==selected['backend_pid']), 'triple back opens menu without disconnect')
+            assert len([e for e in events() if e['event']=='input' and e['role']=='carplay' and e['code']==1])==before_backs
+            ctl(op='menu',visible=False);ctl(op='policy',mode='last');marker=hu.mark()
+            os.kill(selected['backend_pid'],signal.SIGTERM)
+            until(lambda:status_where(lambda s:s['menu_visible'] and not s['active']), 'lost source returns to menu')
+            until(lambda:frame_where(lambda f:f['kind']==2 and f['sha256'] not in source_hash.values(),marker), 'recovery menu replaces frozen source')
+            recovered=until(lambda:status_where(lambda s:s['protocol']=='hicar' and s['active']), 'automatic fallback to other protocol')
+            assert recovered['carlife_pid']==first_life
             records=events()
             assert len([e for e in records if e['event']=='start' and e['role']=='carlife'])==1
-            assert [e['role'] for e in records if e['event']=='connected']==['hicar','carplay']
+            assert [e['role'] for e in records if e['event']=='connected']==['hicar','carplay','hicar']
             assert not any(e['event']=='overlap' for e in records), 'wireless source overlap'
             hu.snapshot();hu.close();hu=None
             ctl(op='shutdown');assert process.wait(timeout=12)==0;process=None
             assert not os.path.lexists(root/'control.sock') and not os.path.lexists(root/'source.sock'), 'manager left runtime sockets'
             print(json.dumps(dict(manager_menu_control='passed',native_idr=True,focus_enter_hicar=True,
                 touch_select_carplay=True,menu_audio_preserved=True,menu_pcm_max_gap_ms=round(menu_pcm_max_gap_ms,1),source_video_restored=True,
-                projection_input_restored=True,carlife_pid_preserved=True,source_overlap=False)))
+                projection_input_restored=True,triple_back_menu=True,disconnect_recovery_menu=True,automatic_other_protocol=True,carlife_pid_preserved=True,source_overlap=False)))
         except BaseException:
             output.flush()
             print((root/'manager.log').read_text(encoding='utf-8',errors='replace')[-12000:],file=sys.stderr)
