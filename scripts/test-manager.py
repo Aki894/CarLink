@@ -313,6 +313,18 @@ def check(binary):
             assert {d['address'] for d in remaining}=={cp['address'],hc['address']}
             # The initial config is a first-run seed, never a way to resurrect a
             # device explicitly forgotten in the persistent store.
+            # A new boot clears only the session pause, then chooses the last
+            # connected protocol even when a different HU-success record exists.
+            ctl(op='shutdown');assert p.wait(timeout=12)==0;p=None
+            stored=json.loads((root/'devices.json').read_text())
+            for d in stored['devices']:d['auto']=True
+            apple=next(d.copy() for d in stored['devices'] if d['protocol']=='carplay')
+            huawei=next(d.copy() for d in stored['devices'] if d['protocol']=='hicar')
+            apple['last_used']=100;stored.update(last=apple,preferred=huawei,paused=True,policy='last',boot_id='previous-test-boot')
+            (root/'devices.json').write_text(json.dumps(stored));(root/'scenario').write_text('')
+            p=subprocess.Popen([*runner,binary,'manager','run','--config',str(root/'config.json')],stdout=log,stderr=log)
+            booted=until(lambda s:s['active'] and s['protocol']=='hicar')
+            assert not booted['paused'], 'previous-boot pause suppressed automatic reconnect'
             ctl(op='forget',protocol='carplay',address=cp['address'],confirm=True)
             ctl(op='shutdown');assert p.wait(timeout=12)==0;p=None
             p=subprocess.Popen([*runner,binary,'manager','run','--config',str(root/'config.json')],stdout=log,stderr=log)
@@ -326,7 +338,7 @@ def check(binary):
             print(json.dumps(dict(connection_manager='passed',switches=9,usb_pid_preserved=True,target_only_bluetooth_disconnect=True,disconnect_failure_nonfatal=True,
                 independent_usb_recovery=True,pre_usb_success_not_committed=True,radio_overlap=False,offline_pairing_retained=True,
                 authentication_and_repeated_refusal_repaired=True,target_only=True,identity_unchanged=True,
-                manual_and_favorite_policy=True,current_auto_record_respected=True,hicar_enrollment_stability_gate=True,registered_hicar_excluded_from_new_pairing=True,user_preferences_survive_repair_and_stability=True,forget_confirmation_and_persistence=True)))
+                manual_and_favorite_policy=True,boot_reconnect_preference=True,current_auto_record_respected=True,hicar_enrollment_stability_gate=True,registered_hicar_excluded_from_new_pairing=True,user_preferences_survive_repair_and_stability=True,forget_confirmation_and_persistence=True)))
         except BaseException:
             log.flush()
             print((root/'manager.log').read_text(encoding='utf-8',errors='replace')[-8000:],file=sys.stderr)
