@@ -76,8 +76,19 @@ fn save(path:&Path,store:&Store)->Result<()>{
 }
 #[derive(Clone,Serialize)]
 struct Status{schema:u32,generation:u64,protocol:Option<Protocol>,target:Option<Device>,active:bool,pairing:bool,paused:bool,
-    carlife_pid:Option<u32>,backend_pid:Option<u32>,usb_connected:bool,menu_visible:bool,last_error:Option<String>}
+    carlife_pid:Option<u32>,backend_pid:Option<u32>,usb_connected:bool,menu_visible:bool,last_error:Option<String>,last_stage:Option<String>}
 fn event(name:&str){println!("{}",json!({"event":name}));}
+fn diagnostic_stage(name:&str)->bool{matches!(name,"ready"|"controller_setting"|"rfcomm_connected"|"rust_connection_worker_ready"|"tcp_connected"|"hisight_connected"|"auth_parse_stopped"|"control_parse_stopped"|"parse_stopped"|"stream_error"|"tcp_stream_error"|"hisight_error"|"stopped")}
+fn stage_summary(v:&Value)->Option<Value>{
+    let stage=v["event"].as_str().filter(|s|diagnostic_stage(s))?;
+    // Reconstruct, never forward the source object or its dynamic fields.
+    Some(json!({"event":"manager_backend_stage","stage":stage}))
+}
+fn stage_report(generation:u64,current:u64,v:&Value)->Option<Value>{
+    if generation!=current||v["event"]!="manager_backend_stage"{return None;}
+    let stage=v["stage"].as_str().filter(|s|diagnostic_stage(s))?;
+    Some(json!({"event":"manager_backend_stage","generation":generation,"stage":stage}))
+}
 struct Process{child:Child,pgid:i32,events:Receiver<Value>,generation:u64}
 fn spawn(args:&[String],generation:u64,source:Option<&Path>)->Result<Process>{
     if args.is_empty(){return Err("backend command is empty".into());}
@@ -91,7 +102,8 @@ fn spawn(args:&[String],generation:u64,source:Option<&Path>)->Result<Process>{
         loop{let mut line=vec![];let read=std::io::Read::by_ref(&mut reader).take(16385).read_until(b'\n',&mut line);
             if !matches!(read,Ok(n) if n>0){break;}if line.len()>16384{break;}
             if let Ok(v)=serde_json::from_slice::<Value>(&line){
-                if matches!(v["event"].as_str(),Some("stage"|"retry"|"forward_latency"|"bridge_stats"|"hisight_closed"|"target_selected"|"ready"|"session_error"))
+                if let Some(summary)=stage_summary(&v){let _=tx.try_send(summary);}
+                if matches!(v["event"].as_str(),Some("stage"|"retry"|"forward_latency"|"bridge_stats"|"hisight_closed"|"target_selected"|"session_error"))
                     ||v["event"]=="carlife_state"&&v["detail"]=="AwaitingVideoSource"{
                     let _=tx.try_send(v);
                 }
@@ -132,7 +144,7 @@ impl Owner{
         for d in config.devices.iter().filter(|_|!config.state.exists()){if !store.devices.iter().any(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address)){store.devices.push(d.clone());}}
         if store.devices.len()>8{return Err("too many configured devices".into());}
         let paused=store.paused;
-        Ok(Self{config,store,status:Status{schema:1,generation:0,protocol:None,target:None,active:false,pairing:false,paused,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,last_error:None},
+        Ok(Self{config,store,status:Status{schema:1,generation:0,protocol:None,target:None,active:false,pairing:false,paused,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,last_error:None,last_stage:None},
             life:None,backend:None,choice:None,started:Instant::now(),ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true})
     }
     fn automatic(&self)->Option<Choice>{
@@ -168,7 +180,7 @@ impl Owner{
         if choice.protocol==Protocol::Hicar{if let Some(path)=&self.config.source_socket{if let Some(i)=args.iter().position(|v|v=="--live-socket"){args[i+1]=path.to_string_lossy().into_owned();}}}
         let process=spawn(&args,self.status.generation,self.config.source_socket.as_deref())?;
         self.status.protocol=Some(choice.protocol);self.status.target=choice.device.clone();self.status.pairing=choice.pairing;
-        self.status.backend_pid=Some(process.child.id());self.status.last_error=None;self.backend=Some(process);self.choice=Some(choice.clone());
+        self.status.backend_pid=Some(process.child.id());self.status.last_error=None;self.status.last_stage=None;self.backend=Some(process);self.choice=Some(choice.clone());
         self.started=Instant::now();self.ready=None;self.seen_media=false;self.committed=false;self.repair_used=false;self.refusals=0;
         self.pair_deadline=choice.pairing.then(||Instant::now()+Duration::from_secs(self.config.pair_seconds));event("manager_backend_started");Ok(())
     }
@@ -189,6 +201,13 @@ impl Owner{
     fn ingest(&mut self,generation:u64,v:Value)->Result<()>{
         if generation!=self.status.generation{return Ok(());}
         let name=v["event"].as_str().unwrap_or("");
+        if name=="manager_backend_stage"{
+            if let Some(report)=stage_report(generation,self.status.generation,&v){
+                let stage=report["stage"].as_str().unwrap();self.status.last_stage=Some(stage.into());
+                if matches!(stage,"auth_parse_stopped"|"control_parse_stopped"|"parse_stopped"|"stream_error"|"tcp_stream_error"|"hisight_error"){self.status.last_error=Some(stage.into());}
+                println!("{report}");
+            }return Ok(());
+        }
         if name=="retry"||name=="stage"&&v["stage"]=="WaitingForPairedIphone" {
             if self.status.active {self.status.active=false;self.ready=None;self.started=Instant::now()-Duration::from_secs(22);}
             let reason=v["reason"].as_str().unwrap_or("");
@@ -439,6 +458,22 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
     #[test]fn stopping_a_session_revokes_its_pending_menu_confirmation(){
         let root=test_root("menu-confirm");let mut owner=test_owner(&root);owner.menu_pending=Some(json!({"op":"pair","protocol":"hicar"}));owner.menu_focus=1;
         owner.stop_backend().unwrap();assert!(owner.menu_pending.is_none());assert_eq!(owner.menu_focus,0);fs::remove_dir(root).unwrap();
+    }
+    #[test]fn backend_stage_summaries_never_forward_raw_fields(){
+        let raw=json!({"event":"rfcomm_connected","address":"02:00:00:00:00:01","reason":"private detail","payload":[1,2],"pin":"test-only","key":"test-only","metadata":{"anything":true}});
+        let summary=stage_summary(&raw).unwrap();assert_eq!(summary,json!({"event":"manager_backend_stage","stage":"rfcomm_connected"}));
+        let report=stage_report(7,7,&summary).unwrap();assert_eq!(report,json!({"event":"manager_backend_stage","generation":7,"stage":"rfcomm_connected"}));
+        assert!(stage_summary(&json!({"event":"private_identity","stage":"ready"})).is_none());
+        assert!(stage_report(7,7,&json!({"event":"manager_backend_stage","stage":"ready\nprivate"})).is_none());
+    }
+    #[test]fn stale_backend_stage_cannot_log_or_change_diagnostics(){
+        let root=test_root("stage-generation");let mut owner=test_owner(&root);owner.status.generation=3;owner.status.last_stage=Some("ready".into());
+        let summary=stage_summary(&json!({"event":"stream_error","reason":"private detail","payload":[9]})).unwrap();
+        assert!(stage_report(2,3,&summary).is_none());owner.ingest(2,summary.clone()).unwrap();
+        assert_eq!(owner.status.last_stage.as_deref(),Some("ready"));assert!(owner.status.last_error.is_none());
+        owner.ingest(3,summary).unwrap();assert_eq!(owner.status.last_stage.as_deref(),Some("stream_error"));assert_eq!(owner.status.last_error.as_deref(),Some("stream_error"));
+        owner.ingest(3,json!({"event":"manager_backend_stage","stage":"unlisted_private_value"})).unwrap();assert_eq!(owner.status.last_stage.as_deref(),Some("stream_error"));
+        fs::remove_dir(root).unwrap();
     }
     #[test]fn stable_source_is_remembered_only_with_a_connected_head_unit(){
         let root=test_root("head-unit-gate");let mut owner=test_owner(&root);
