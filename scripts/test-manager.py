@@ -12,6 +12,7 @@ import time
 MOCK = r'''
 import fcntl,json,os,pathlib,signal,socket,sys,time
 root=pathlib.Path(sys.argv[1]);role=sys.argv[2];stopping=False
+scenario=(root/'scenario').read_text() if (root/'scenario').exists() else ''
 def record(event,**fields):
     fd=os.open(root/'events',os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
     os.write(fd,(json.dumps(dict(event=event,role=role,pid=os.getpid(),**fields))+'\n').encode());os.close(fd)
@@ -21,14 +22,13 @@ def stop(*_):
 signal.signal(signal.SIGTERM,stop)
 lock=None;listener=None
 try:
-    if role=='carlife':
+    if role=='carlife' and scenario!='no-live':
         listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);listener.bind(str(root/'live.sock'));listener.listen(1)
-    else:
+    elif role!='carlife':
         lock=open(root/'radio.lock','a')
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:record('overlap');raise SystemExit(2)
     record('start',args=sys.argv[3:])
-    scenario=(root/'scenario').read_text() if (root/'scenario').exists() else ''
     if role=='carplay' and scenario in ('auth','refused','offline','unpaired'):
         reason={'auth':'org.bluez.Error.AuthenticationFailed','refused':'Connection refused (os error 111)','offline':'Host is down','unpaired':'The configured iPhone is no longer paired'}[scenario]
         for _ in range(3 if scenario=='refused' else 1):
@@ -70,6 +70,7 @@ def check(binary):
         (root / 'devices.json').chmod(0o600)
         (root / 'identity-private').write_bytes(b'synthetic persistent identity must remain untouched')
         initial_identity=(root / 'identity-private').read_bytes()
+        (root/'scenario').write_text('no-live')
         def ctl(**command):
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
                 s.settimeout(12)
@@ -97,6 +98,8 @@ def check(binary):
         try:
             p=subprocess.Popen([*runner,binary,'manager','run','--config',str(root/'config.json')],stdout=log,stderr=log)
             s=until(lambda s:s['protocol']=='carplay' and s['active'])
+            assert not (root/'live.sock').exists(), 'fixture did not exercise pre-USB discovery'
+            (root/'scenario').write_text('')
             first_life=s['carlife_pid']
             duplicate=dict(config,socket=str(root/'second/control.sock'),live_socket=str(root/'second/live.sock'),state=str(root/'second/state.json'))
             (root/'duplicate.json').write_text(json.dumps(duplicate));(root/'duplicate.json').chmod(0o600)

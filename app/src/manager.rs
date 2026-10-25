@@ -245,7 +245,7 @@ impl Owner{
             if let Some(d)=&self.status.target{self.tried.push_back(d.address.clone());}
             self.stop_backend()?;self.retry_at=Instant::now()+Duration::from_secs(2);
         }
-        if self.backend.is_none()&&!self.store.paused&&Instant::now()>=self.retry_at&&self.config.live_socket.exists(){
+        if self.backend.is_none()&&!self.store.paused&&Instant::now()>=self.retry_at&&self.life.is_some(){
             if let Some(c)=self.automatic(){self.select(c)?;}else{self.tried.clear();self.retry_at=Instant::now()+Duration::from_secs(8);}
         }Ok(())
     }
