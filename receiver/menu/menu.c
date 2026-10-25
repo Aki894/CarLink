@@ -117,6 +117,9 @@ int main(int argc,char **argv) {
     static const uint32_t row2[]={'H','i','C','a','r',' ',0x534e,0x4e3a,0x624b,0x673a};
     const uint32_t *rows[]={row1,row2}; uint32_t lengths[]={sizeof(row1)/4,sizeof(row2)/4};
     unsigned char *output=malloc(LIMIT); if (!output) return 4;
+    if (carlink_menu_render(menu,rows,lengths,0,0,output,LIMIT)>=0 ||
+        carlink_menu_render(menu,rows,lengths,2,2,output,LIMIT)>=0 ||
+        carlink_menu_render(menu,rows,lengths,2,0,output,LIMIT-1)>=0) return 6;
     for (uint32_t focus=0; focus<2; ++focus) {
         int size=carlink_menu_render(menu,rows,lengths,2,focus,output,LIMIT);
         if (size<=0 || fwrite(output,1,(size_t)size,stdout)!=(size_t)size) return 5;

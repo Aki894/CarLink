@@ -126,6 +126,12 @@ def install(project, app, receiver, rootfs):
         directory = rootfs / name
         directory.mkdir(parents=True, exist_ok=True)
         directory.chmod(0o700)
+    example = project / 'docs/examples/manager.json'
+    if example.is_file():
+        target = rootfs / 'usr/share/carlink/manager.example.json'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(example, target)
+        target.chmod(0o644)
     manifest.update(project_commit=os.environ['REFRESH_COMMIT'], sources=lock,
                     app_source_commit=os.environ['APP_COMMIT'], app_run_id=os.environ['APP_RUN_ID'],
                     app_sha256=hashlib.sha256((app / 'carlink').read_bytes()).hexdigest(),

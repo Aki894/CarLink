@@ -245,6 +245,7 @@ impl Owner{
     }
     fn menu_input(&mut self,v:Value)->Result<()>{
         if !self.status.menu_visible{return Ok(());}let (rows,actions)=self.menu_model();
+        if v["menu_rows"]!=json!(rows){return Ok(());}
         let kind=v["type"].as_str().unwrap_or("");let mut chosen=None;
         if kind=="key-press"||kind=="key"{match v["code"].as_u64(){
             Some(3|5)=>self.menu_focus=self.menu_focus.saturating_sub(1),Some(4|6)=>self.menu_focus=(self.menu_focus+1).min(rows.len()-1),
