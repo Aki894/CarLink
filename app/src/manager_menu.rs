@@ -239,7 +239,7 @@ impl Worker {
                 self.back_first.get_or_insert(now);self.back_last=Some(now);self.back_frames.push(f);
                 if self.back_frames.len()==3{self.back_frames.clear();self.back_last=None;self.back_first=None;let _=self.events.try_send(json!({"type":"open-menu"}));}return;
             }
-            if !self.back_frames.is_empty(){self.flush_backs();}
+            if !self.back_frames.is_empty()&&matches!(v["type"].as_str(),Some("touch"|"key-press"|"key"|"focus")){self.flush_backs();}
         }
         if self.snapshot.visible {
             if v["type"]=="keyframe" {self.painted=None;}else if v["type"]=="touch" {self.menu_touch(v);}else if matches!(v["type"].as_str(),Some("touch"|"key-press"|"key"|"focus")){
@@ -320,6 +320,11 @@ fn touch_row(x:f64,y:f64,focus:usize,count:usize)->Option<usize>{
         let (socket,_peer)=UnixStream::pair().unwrap();w.source=Some(Pipe::new(socket).unwrap());
         for _ in 0..3{w.input(feedback(json!({"type":"key-press","code":1})));}
         assert_eq!(rx.try_recv().unwrap()["type"],"open-menu");assert!(w.source.as_ref().unwrap().output.is_empty());
+        w.input(feedback(json!({"type":"key-press","code":1})));w.input(keyframe());
+        w.input(feedback(json!({"type":"key-press","code":1})));w.input(feedback(json!({"type":"key-press","code":1})));
+        assert_eq!(rx.try_recv().unwrap()["type"],"open-menu");assert_eq!(w.source.as_ref().unwrap().output.len(),1);
+        w.source.as_mut().unwrap().output.clear();w.source.as_mut().unwrap().queued=0;
+
         w.input(feedback(json!({"type":"key-press","code":1})));assert_eq!(w.back_frames.len(),1);
         assert!(w.back_expired(Instant::now()+Duration::from_millis(351)));w.flush_backs();assert_eq!(w.source.as_ref().unwrap().output.len(),1);
         w.input(feedback(json!({"type":"key-press","code":1})));w.input(feedback(json!({"type":"key-press","code":2})));

@@ -41,3 +41,13 @@ carlink manager ctl /run/carlink-manager/control.sock '{"op":"resume"}'
 明确认证失配或连续三次连接拒绝时，只清理目标 iPhone 的旧 BlueZ 配对并开放有界重配窗口；普通离线保留记录。CarLife 故障单独恢复，已建立的无线源保留。每次切换增加代际，忽略旧后端回调。
 
 验证入口：`scripts/test-manager.py`（生命周期、策略、配对和遗忘）、`scripts/test-manager-web.py`（真实 HTTP 边界）、`scripts/test-manager-menu.py` 与 Rust `manager_menu::`（H.264 实际解码、菜单焦点、PCM 透传、关键帧恢复、USB 重连）。台架、完整固件与 Lexus 实车结果记入 [validation.md](validation.md)。R3 通过后继续 R2 媒体链路迁移，Python 过渡层在迁移结束后移除。
+
+## 断连、启动与返回键入口（2026-10-25）
+
+无线源结束、媒体连接关闭或后端退出时，立即恢复 CarLink 菜单。默认 last 策略先给原手机短暂恢复机会，再尝试其他允许自动连接的设备；等待时菜单可继续选择。USB 输出独立恢复。
+
+已登记手机的无线连接建立后独立保存 preferred，开机优先该手机及协议；last_used 继续要求车机 USB 和稳定媒体均就绪。暂停自动连接只对本次开机有效，手动选择策略继续持久保存。
+
+投屏期间连续按三次返回键打开菜单，相邻按键间隔不超过 350 ms。三次按键不转发至手机，当前无线会话与音乐保持。普通单次或两次返回最多等待 350 ms 判定后按原顺序送出；视频关键帧请求不打断判定。菜单内单次返回可回到已连接投屏。
+
+快捷键已通过抽象 key-press 与模拟车机回归；Lexus 实车的返回键原始消息仍需实车回归。
