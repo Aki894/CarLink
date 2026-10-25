@@ -21,7 +21,13 @@ fn request(s:&mut TcpStream,port:u16)->Result<(String,String,Vec<u8>),String>{
  if first[0]!="POST"&&length!=0{return Err("unexpected request body".into());}
  let mut body=vec![0;length];s.read_exact(&mut body).map_err(|_|"body read")?;Ok((first[0].into(),first[1].into(),body))
 }
-fn response(s:&mut TcpStream,code:u16,kind:&str,body:&[u8]){let _=s.set_write_timeout(Some(Duration::from_millis(700)));let _=write!(s,"HTTP/1.1 {code} Response\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n",body.len());let _=s.write_all(body);}
+fn response(s:&mut TcpStream,code:u16,kind:&str,body:&[u8]){let _=s.set_write_timeout(Some(Duration::from_millis(700)));let _=write!(s,"HTTP/1.1 {code} Response\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n",body.len());let _=s.write_all(body);
+ // Finish the response before discarding a rejected request's unread bytes.
+ // An immediate close with unread data can send RST and erase the response.
+ let _=s.shutdown(std::net::Shutdown::Write);let _=s.set_read_timeout(Some(Duration::from_millis(50)));
+ let deadline=std::time::Instant::now()+Duration::from_millis(150);let mut bytes=[0;1024];let mut total=0;
+ while total<16384&&std::time::Instant::now()<deadline{match s.read(&mut bytes){Ok(0)=>break,Ok(n)=>total+=n,Err(_)=>break,}}
+}
 fn control(path:&PathBuf,v:Value)->Result<Value,String>{let mut s=UnixStream::connect(path).map_err(|_|"manager unavailable")?;s.set_read_timeout(Some(Duration::from_secs(12))).map_err(|_|"timeout")?;s.set_write_timeout(Some(Duration::from_secs(1))).map_err(|_|"timeout")?;let mut data=serde_json::to_vec(&v).map_err(|_|"JSON")?;data.push(b'\n');s.write_all(&data).map_err(|_|"control write")?;let mut bytes=Vec::new();let mut one=[0];while bytes.last()!=Some(&b'\n'){if bytes.len()>32768{return Err("control reply too large".into());}s.read_exact(&mut one).map_err(|_|"control read")?;bytes.push(one[0]);}serde_json::from_slice(&bytes).map_err(|_|"control reply".into())}
 pub fn start(listen:SocketAddr,socket:PathBuf)->Result<Web,String>{
  let listener=TcpListener::bind(listen).map_err(|_|"cannot bind maintenance web UI")?;listener.set_nonblocking(true).map_err(|_|"web nonblocking")?;let port=listener.local_addr().map_err(|_|"web bind address")?.port();let stop=Arc::new(AtomicBool::new(false));let quit=stop.clone();
