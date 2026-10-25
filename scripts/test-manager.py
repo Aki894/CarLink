@@ -180,6 +180,16 @@ def check(binary):
             ctl(op='remember',device=cp);ctl(op='remember',device=hc)
             ctl(op='resume')
             stable=until(lambda s:s['active'] and not s['pairing'])
+            # Re-enrolling an existing transport must not replace the user's
+            # chosen alias or explicit auto-connect preference with defaults.
+            preferred_cp=dict(cp,name='Daily iPhone - user alias',auto=False)
+            ctl(op='remember',device=preferred_cp)
+            ctl(op='pair',protocol='carplay')
+            until(lambda s:s['protocol']=='carplay' and s['active'] and s['pairing'])
+            stable=until(lambda s:s['active'] and not s['pairing'])
+            enrolled=next(d for d in ctl(op='devices')['devices'] if d['protocol']=='carplay' and d['address']==cp['address'])
+            assert enrolled['name']==preferred_cp['name'] and enrolled['auto'] is False, 're-pairing reset user device preferences'
+            ctl(op='remember',device=cp)
             # Manual policy preserves the current session, then waits for a user
             # after disconnect/resume and across a manager restart.
             ctl(op='policy',mode='manual')
@@ -216,11 +226,16 @@ def check(binary):
             selected=until(lambda s:s['protocol']=='hicar' and s['active'] and s['target'] and s['target']['address']=='02:00:00:00:00:03')
             assert selected['pairing']
             assert not any(d['address']=='02:00:00:00:00:03' for d in ctl(op='devices')['devices']), 'pending target persisted before stable media'
+            pending_hc=dict(protocol='hicar',address='02:00:00:00:00:03',name='Huawei - edited while connecting',auto=False,last_used=0)
+            ctl(op='remember',device=pending_hc)
             paired=until(lambda s:s['active'] and not s['pairing'])
             assert paired['target']['address']=='02:00:00:00:00:03', 'later candidate stole the pairing target'
             store=json.loads((root/'devices.json').read_text())
             assert store['last']['address']=='02:00:00:00:00:03'
             assert len(store['devices'])==3 and any(d['protocol']=='hicar' and d['address']=='02:00:00:00:00:03' for d in store['devices'])
+            edited=next(d for d in store['devices'] if d['address']==pending_hc['address'])
+            assert edited['name']==pending_hc['name'] and edited['auto'] is False, 'stable-session commit overwrote an in-flight user edit'
+            assert store['last']['name']==pending_hc['name'] and store['last']['auto'] is False
             latest=next(e for e in reversed(events()) if e['event']=='start' and e['role']=='hicar')
             assert '--pair' in latest['args'] and '--peer' not in latest['args']
             before=len([e for e in events() if e['event']=='remove'])
@@ -246,7 +261,7 @@ def check(binary):
             print(json.dumps(dict(connection_manager='passed',switches=7,usb_pid_preserved=True,
                 independent_usb_recovery=True,radio_overlap=False,offline_pairing_retained=True,
                 authentication_and_repeated_refusal_repaired=True,target_only=True,identity_unchanged=True,
-                manual_and_favorite_policy=True,current_auto_record_respected=True,hicar_enrollment_stability_gate=True,forget_confirmation_and_persistence=True)))
+                manual_and_favorite_policy=True,current_auto_record_respected=True,hicar_enrollment_stability_gate=True,user_preferences_survive_repair_and_stability=True,forget_confirmation_and_persistence=True)))
         except BaseException:
             log.flush()
             print((root/'manager.log').read_text(encoding='utf-8',errors='replace')[-8000:],file=sys.stderr)

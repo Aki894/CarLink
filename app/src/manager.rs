@@ -5,7 +5,7 @@ mod linux {
 use serde::{Deserialize,Serialize};
 use serde_json::{Value,json};
 use std::{collections::VecDeque,fs::{self,File,OpenOptions},io::{BufRead,BufReader,Read,Write},
-    os::unix::{fs::{OpenOptionsExt,PermissionsExt,FileTypeExt},io::AsRawFd,net::{UnixListener,UnixStream},process::CommandExt},
+    os::unix::{ffi::OsStrExt,fs::{OpenOptionsExt,PermissionsExt,FileTypeExt,MetadataExt},io::AsRawFd,net::{UnixListener,UnixStream},process::CommandExt},
     path::{Path,PathBuf},process::{Child,Command,Stdio},sync::{atomic::{AtomicBool,Ordering},mpsc::{self,Receiver}},thread,time::{Duration,Instant,SystemTime,UNIX_EPOCH}};
 type Result<T>=std::result::Result<T,String>;
 static STOP:AtomicBool=AtomicBool::new(false);
@@ -37,6 +37,30 @@ fn private_dir(path:&Path)->Result<()>{
     if !meta.is_dir()||meta.file_type().is_symlink(){return Err("manager path is not a directory".into());}
     fs::set_permissions(path,fs::Permissions::from_mode(0o700)).map_err(|_|"cannot secure manager directory".into())
 }
+// Called only while both manager ownership locks are held. A successful or
+// queued connection belongs to a live server and must never be removed.
+fn clear_stale_socket(path:&Path)->Result<()>{
+    let before=match fs::symlink_metadata(path){Ok(m)=>m,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(()),Err(_)=>return Err("cannot inspect runtime socket".into())};
+    let uid=unsafe{libc::geteuid()};
+    if !before.file_type().is_socket()||before.uid()!=uid{return Err("runtime endpoint is not an owned socket".into());}
+    let bytes=path.as_os_str().as_bytes();let mut address:libc::sockaddr_un=unsafe{std::mem::zeroed()};
+    if bytes.len()>=address.sun_path.len(){return Err("runtime socket path is too long".into());}
+    address.sun_family=libc::AF_UNIX as libc::sa_family_t;
+    for (dst,src) in address.sun_path.iter_mut().zip(bytes){*dst=*src as libc::c_char;}
+    let fd=unsafe{libc::socket(libc::AF_UNIX,libc::SOCK_STREAM|libc::SOCK_NONBLOCK|libc::SOCK_CLOEXEC,0)};
+    if fd<0{return Err("cannot inspect runtime socket owner".into());}
+    let connected=unsafe{libc::connect(fd,&address as *const _ as *const libc::sockaddr,std::mem::size_of::<libc::sockaddr_un>()as libc::socklen_t)};
+    let error=std::io::Error::last_os_error();unsafe{libc::close(fd);}
+    if connected==0||error.raw_os_error()!=Some(libc::ECONNREFUSED){return Err("runtime socket has an active or unverified owner".into());}
+    let after=fs::symlink_metadata(path).map_err(|_|"runtime endpoint changed during inspection")?;
+    if !after.file_type().is_socket()||after.uid()!=uid||after.dev()!=before.dev()||after.ino()!=before.ino(){return Err("runtime endpoint changed during inspection".into());}
+    fs::remove_file(path).map_err(|_|"cannot remove inactive runtime socket".into())
+}
+struct SocketPath{path:PathBuf,dev:u64,ino:u64,uid:u32}
+impl SocketPath{fn owned(path:&Path)->Result<Self>{let m=fs::symlink_metadata(path).map_err(|_|"cannot inspect bound runtime socket")?;
+    if !m.file_type().is_socket()||m.uid()!=unsafe{libc::geteuid()}{return Err("bound runtime socket ownership changed".into());}
+    Ok(Self{path:path.into(),dev:m.dev(),ino:m.ino(),uid:m.uid()})}}
+impl Drop for SocketPath{fn drop(&mut self){if fs::symlink_metadata(&self.path).is_ok_and(|m|m.file_type().is_socket()&&m.uid()==self.uid&&m.dev()==self.dev&&m.ino()==self.ino){let _=fs::remove_file(&self.path);}}}
 fn private_read(path:&Path)->Result<Vec<u8>>{
     let mut f=OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(path).map_err(|_|"cannot read private manager file")?;
     let meta=f.metadata().map_err(|_|"cannot stat manager file")?;
@@ -121,6 +145,7 @@ impl Owner{
             .or_else(||if self.store.devices.is_empty(){self.config.initial.map(|protocol|Choice{protocol,device:None,pairing:true})}else{None})
     }
     fn stop_backend(&mut self)->Result<()>{
+        self.menu_pending=None;self.menu_focus=0;
         let had_carplay=self.backend.is_some()&&self.status.protocol==Some(Protocol::Carplay);
         if let Some(mut p)=self.backend.take(){p.end()?;}
         self.status.backend_pid=None;self.status.active=false;self.ready=None;self.seen_media=false;
@@ -187,7 +212,11 @@ impl Owner{
         if name=="forward_latency"&&v["sent"].as_u64().unwrap_or(0)>0||name=="bridge_stats"&&v["connected"]==true&&v["video_frames"].as_u64().unwrap_or(0)>0{self.seen_media=true;}
         if name=="stage"&&v["stage"]=="ConnectingBluetooth"{
             if let Some(address)=v["address"].as_str().filter(|s|mac(s)){
-                if self.status.pairing {self.status.target=Some(Device{protocol:Protocol::Carplay,address:address.to_uppercase(),name:"iPhone".into(),auto:true,last_used:0});}
+                if self.status.pairing {
+                    let current=self.store.devices.iter().find(|d|d.protocol==Protocol::Carplay&&d.address.eq_ignore_ascii_case(address)).cloned()
+                        .or_else(||self.status.target.as_ref().filter(|d|d.protocol==Protocol::Carplay&&d.address.eq_ignore_ascii_case(address)).cloned());
+                    self.status.target=Some(current.unwrap_or(Device{protocol:Protocol::Carplay,address:address.to_uppercase(),name:"iPhone".into(),auto:true,last_used:0}));
+                }
             }
         }
         if name=="target_selected"&&self.status.pairing&&self.status.protocol==Some(Protocol::Hicar){
@@ -241,6 +270,9 @@ impl Owner{
             ("自动连接：优先上次使用",json!({"op":"policy","mode":"last"})),("自动连接：每次选择",json!({"op":"policy","mode":"manual"})),
             (if self.store.paused{"恢复自动连接"}else{"暂停自动连接"},json!({"op":if self.store.paused{"resume"}else{"pause"}})),
             ("断开当前手机",json!({"op":"disconnect"})),("返回投屏",json!({"op":"menu","visible":false}))]{labels.push(label.into());commands.push(command);}
+        let state=if let Some(error)=&self.status.last_error{Some(format!("连接状态：{}",error.chars().filter(|c|!c.is_control()).take(96).collect::<String>()))}
+            else if self.status.pairing{Some("等待手机配对".into())}else if self.backend.is_some()&&!self.status.active{Some("正在连接".into())}else{None};
+        if let Some(state)=state{labels.push(state);commands.push(json!({"op":"status"}));}
         (labels,commands)
     }
     fn menu_input(&mut self,v:Value)->Result<()>{
@@ -257,6 +289,14 @@ impl Owner{
             Some("pair"|"disconnect") if self.menu_pending.is_none()&&self.status.active=>{self.menu_pending=Some(action);self.menu_focus=0;},
             _=>{self.menu_pending=None;self.menu_focus=0;let close=action["op"]=="connect";self.command(action)?;if close{self.status.menu_visible=false;self.menu_idle=false;}}
         }}Ok(())
+    }
+    fn record_stable_target(&mut self)->Result<()>{
+        if let Some(mut d)=self.status.target.clone(){
+            if let Some(current)=self.store.devices.iter().find(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address)){d.name=current.name.clone();d.auto=current.auto;}
+            d.last_used=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_|"invalid system clock")?.as_secs();
+            self.store.devices.retain(|v|!(v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address)));
+            if self.store.devices.len()<8{self.store.devices.push(d.clone());}self.store.last=Some(d.clone());self.status.target=Some(d);save(&self.config.state,&self.store)?;
+        }Ok(())
     }
     fn tick(&mut self)->Result<()>{
         let mut inputs=vec![];if let Some(mux)=&self.mux{for _ in 0..16{if let Some(v)=mux.try_input(){inputs.push(v);}else{break;}}}
@@ -283,9 +323,7 @@ impl Owner{
             self.stop_backend()?;self.retry_at=Instant::now()+Duration::from_secs(2);event("manager_backend_exited");
         }
         if !self.committed&&self.seen_media&&self.ready.is_some_and(|t|t.elapsed()>=Duration::from_secs(self.config.stable_seconds)){
-            if let Some(mut d)=self.status.target.clone(){d.last_used=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_|"invalid system clock")?.as_secs();
-                self.store.devices.retain(|v|!(v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address)));
-                if self.store.devices.len()<8{self.store.devices.push(d.clone());}self.store.last=Some(d.clone());self.status.target=Some(d);save(&self.config.state,&self.store)?;}
+            self.record_stable_target()?;
             if self.status.pairing&&self.status.protocol==Some(Protocol::Carplay){
                 self.bluetooth(&["--timeout","3","discoverable","off"])?;
                 self.bluetooth(&["--timeout","3","pairable","off"])?;
@@ -313,7 +351,7 @@ fn exchange(stream:&mut UnixStream)->Result<Value>{
 }
 fn serve(config:&Path)->Result<()>{
     let config:Config=serde_json::from_slice(&private_read(config)?).map_err(|_|"invalid manager configuration")?;
-    let mut owner=Owner::new(config)?;let parent=owner.config.socket.parent().ok_or("control parent missing")?;private_dir(parent)?;
+    let owner=Owner::new(config)?;let parent=owner.config.socket.parent().ok_or("control parent missing")?;private_dir(parent)?;
     let radio_path=owner.config.radio_lock.as_deref().unwrap_or(Path::new("/run/lock/carlink-radio.lock"));
     if !radio_path.is_absolute(){return Err("radio lock path must be absolute".into());}
     let radio=OpenOptions::new().read(true).write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(radio_path).map_err(|_|"cannot open radio ownership lock")?;
@@ -322,10 +360,16 @@ fn serve(config:&Path)->Result<()>{
     }
     let lock=OpenOptions::new().read(true).write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(parent.join("owner.lock")).map_err(|_|"cannot acquire manager lock")?;
     if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0{return Err("another connection manager owns this runtime".into());}
-    if owner.config.socket.exists(){return Err("control socket already exists; inspect its owner".into());}
+    // Move runtime ownership after the locks in drop order, including every
+    // startup-error path (for example a busy HTTP port after Mux::start).
+    let mut owner=owner;
+    clear_stale_socket(&owner.config.socket)?;
     private_dir(owner.config.live_socket.parent().ok_or("live parent missing")?)?;
-    if owner.config.live_socket.exists(){return Err("live socket already exists; stop its current owner first".into());}
-    let listener=UnixListener::bind(&owner.config.socket).map_err(|_|"cannot bind manager control")?;fs::set_permissions(&owner.config.socket,fs::Permissions::from_mode(0o600)).map_err(|_|"cannot secure manager control")?;
+    clear_stale_socket(&owner.config.live_socket)?;
+    if let Some(source)=&owner.config.source_socket{private_dir(source.parent().ok_or("source parent missing")?)?;clear_stale_socket(source)?;}
+    let listener=UnixListener::bind(&owner.config.socket).map_err(|_|"cannot bind manager control")?;
+    let _control_path=SocketPath::owned(&owner.config.socket)?;
+    fs::set_permissions(&owner.config.socket,fs::Permissions::from_mode(0o600)).map_err(|_|"cannot secure manager control")?;
     listener.set_nonblocking(true).map_err(|_|"cannot configure manager control")?;
     unsafe{libc::signal(libc::SIGTERM,stop as libc::sighandler_t);libc::signal(libc::SIGINT,stop as libc::sighandler_t);}
     match (&owner.config.source_socket,&owner.config.menu_library,&owner.config.menu_font){
@@ -340,8 +384,11 @@ fn serve(config:&Path)->Result<()>{
         if let Err(error)=owner.tick(){owner.status.last_error=Some(error);owner.retry_at=Instant::now()+Duration::from_secs(3);}
         thread::sleep(Duration::from_millis(30));
     }Ok(())})();
+    // Stop request workers before waiting on children, and release the source
+    // socket while radio/owner locks still protect its namespace.
+    drop(_web);
     let _=owner.stop_backend();if let Some(mut p)=owner.life.take(){let _=p.end();}
-    let _=fs::remove_file(&owner.config.socket);event("manager_stopped");result
+    owner.mux=None;event("manager_stopped");result
 }
 pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
     Some("run") if args.len()==3&&args[1]=="--config"=>serve(Path::new(&args[2])),
@@ -354,6 +401,41 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
     _=>Err("Usage: carlink manager run --config PRIVATE_JSON | ctl SOCKET JSON".into()),
 }}
 #[cfg(test)]mod tests{use super::*;
+    fn test_root(name:&str)->PathBuf{let p=std::env::temp_dir().join(format!("carlink-manager-{}-{name}",std::process::id()));fs::create_dir(&p).unwrap();p}
+    fn test_owner(root:&Path)->Owner{Owner::new(Config{schema:1,socket:root.join("control"),live_socket:root.join("live"),state:root.join("state"),carlife:vec![],carplay:vec![],hicar:vec![],devices:vec![],initial:None,bluetoothctl:None,radio_lock:None,media_socket:None,web_listen:None,source_socket:None,menu_library:None,menu_font:None,connect_seconds:30,stable_seconds:10,pair_seconds:120}).unwrap()}
+    #[test]fn stale_socket_cleanup_preserves_active_files_and_symlinks(){
+        let root=test_root("socket-paths");let path=root.join("socket");let listener=UnixListener::bind(&path).unwrap();
+        // Fill its pending queue as well: EAGAIN is still a live owner.
+        assert_eq!(unsafe{libc::listen(listener.as_raw_fd(),1)},0);
+        for _ in 0..8{assert!(clear_stale_socket(&path).is_err());assert!(path.exists());}
+        drop(listener);clear_stale_socket(&path).unwrap();assert!(!path.exists());
+        fs::write(&path,b"keep").unwrap();assert!(clear_stale_socket(&path).is_err());assert_eq!(fs::read(&path).unwrap(),b"keep");fs::remove_file(&path).unwrap();
+        let other=root.join("other");drop(UnixListener::bind(&other).unwrap());std::os::unix::fs::symlink(&other,&path).unwrap();
+        assert!(clear_stale_socket(&path).is_err());assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());assert!(other.exists());
+        fs::remove_file(path).unwrap();clear_stale_socket(&other).unwrap();fs::remove_dir(root).unwrap();
+    }
+    #[test]fn bound_socket_guard_cleans_startup_errors_and_preserves_replacements(){
+        let root=test_root("socket-guard");let path=root.join("control");
+        let failed=(||->Result<()>{let _listener=UnixListener::bind(&path).unwrap();let _path=SocketPath::owned(&path)?;Err("later startup stage failed".into())})();
+        assert!(failed.is_err());assert!(!path.exists());
+        let listener=UnixListener::bind(&path).unwrap();let guard=SocketPath::owned(&path).unwrap();fs::remove_file(&path).unwrap();fs::write(&path,b"replacement").unwrap();
+        drop(guard);assert_eq!(fs::read(&path).unwrap(),b"replacement");drop(listener);fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
+    }
+    #[test]fn repair_and_stable_commit_keep_current_user_device_fields(){
+        let root=test_root("device-fields");let mut owner=test_owner(&root);
+        let device=Device{protocol:Protocol::Carplay,address:"02:00:00:00:00:01".into(),name:"my phone".into(),auto:false,last_used:1};owner.store.devices.push(device.clone());
+        owner.status.protocol=Some(Protocol::Carplay);owner.status.pairing=true;owner.status.generation=1;
+        owner.ingest(1,json!({"event":"stage","stage":"ConnectingBluetooth","address":device.address})).unwrap();
+        assert_eq!(owner.status.target.as_ref().unwrap().name,"my phone");assert!(!owner.status.target.as_ref().unwrap().auto);
+        owner.store.devices[0].name="updated during connection".into();owner.store.devices[0].auto=true;owner.record_stable_target().unwrap();
+        assert_eq!(owner.status.target.as_ref().unwrap().name,"updated during connection");assert!(owner.status.target.as_ref().unwrap().auto);
+        let saved:Store=serde_json::from_slice(&private_read(&root.join("state")).unwrap()).unwrap();assert_eq!(saved.devices[0].name,"updated during connection");assert!(saved.devices[0].auto);
+        fs::remove_file(root.join("state")).unwrap();fs::remove_dir(root).unwrap();
+    }
+    #[test]fn stopping_a_session_revokes_its_pending_menu_confirmation(){
+        let root=test_root("menu-confirm");let mut owner=test_owner(&root);owner.menu_pending=Some(json!({"op":"pair","protocol":"hicar"}));owner.menu_focus=1;
+        owner.stop_backend().unwrap();assert!(owner.menu_pending.is_none());assert_eq!(owner.menu_focus,0);fs::remove_dir(root).unwrap();
+    }
     #[test]fn ordinary_offline_does_not_erase_pairing(){for s in ["Host is down","Connection timed out","No route to host","AirPlay session ended"]{assert!(!auth_mismatch(s));}assert!(auth_mismatch("org.bluez.Error.AuthenticationFailed"));}
     #[test]fn stale_generation_cannot_steal_active_backend(){
         let c=Config{schema:1,socket:"/tmp/cm/control".into(),live_socket:"/tmp/cm/live".into(),state:"/tmp/cm/missing-state".into(),carlife:vec![],carplay:vec![],hicar:vec![],devices:vec![],initial:None,bluetoothctl:None,radio_lock:None,media_socket:None,web_listen:None,source_socket:None,menu_library:None,menu_font:None,connect_seconds:30,stable_seconds:10,pair_seconds:120};
