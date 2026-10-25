@@ -79,3 +79,25 @@ R2 后续先迁移 DMSDP/HiSight 控制与媒体数据通路、AAC/PCM 和输入
 此前第 125 轮在手机 App 切换过程中出现多次 USB bulk `ESHUTDOWN`；换旧输出做对照后，再用新版固定前台，连接恢复稳定。今后台架固定让 CarLife HU 留在前台，通过投屏界面或媒体会话操作源播放器。此次连续 AAC 与 PCM 建立已验证，同手机兼任 HiCar 源和 CarLife HU 的扬声器路由继续采用既有独立 HU 验收安排。
 
 本轮测试后已恢复正式 `carlink` 服务，NRestarts=0、`end0` 管理可用，临时 Rust worker 已退出，手机亮屏超时设置已恢复。正式 USB 输出和开机路径继续保留原部署。
+
+## R2 第二段：HiSight RTSP 状态机
+
+`app/src/hicar/hisight.rs` 将 ANNOUNCE 加密协商、OPTIONS、能力应答、SETUP/PLAY、端口选择、保活回复和 TEARDOWN 迁入 Rust。生产 `session-worker` 复用已经认证的 HiChain 密钥，为每个 HiSight 实例分配独立代号；认证撤销会销毁对应状态，旧实例的清理请求不会关闭新实例。密钥和控制报文只经过现有私有 socketpair；普通日志只输出固定阶段名。视频继续在原通路中直通，不进入 JSON IPC。
+
+真实回归发现并修复了认证通道交接边界：手机正常结束 RFCOMM 认证后，已经建立的 TCP 媒体会话继续持有自己的密钥；关闭认证通道只撤销新连接授权。原候选版在约 60 秒后的 HiSight 保活报文处报 `stale HiSight session` 并退出，新增的原生 IPC 测试已在旧候选版复现。新认证代号和显式认证失败仍会销毁旧媒体会话。
+
+私有 Rust worker 在整个后端进程组收到 SIGTERM 时继续服务父进程的退出 IPC，让父进程先完成 RTSP TEARDOWN；父进程关闭接口或退出后，worker 读到 EOF 并清理密钥。父进程仍保留超时后的 SIGKILL 收尾。原生联测包含发送 SIGTERM 后继续处理加密请求及随后关闭接口的流程。
+
+Python `HiSightSession` 现在只负责低频控制 IPC 的适配，socket、视频接收、AAC 解码与输入仍逐段迁移。Rust 协商保留源端 SETUP 响应缺少双 CRLF、Content-Length 计算异常等已观察到的兼容行为，并为记录长度、队列及序列号设置边界。认证先关闭时，TEARDOWN 错误会被收尾逻辑吸收，继续释放媒体和输入连接。
+
+本轮同时把 CarLife 重试时钟与无线后端重连时钟分离。CarLife 进程连续短时退出时，以 1、2、4、8 秒退避，最长 8 秒；运行满 30 秒后恢复 500 ms 的普通恢复间隔。此策略给 USB 主机明确的脱离时间，减少快速重复枚举，保留当前无线会话。测试手机的旧 USB 会话曾需要重新打开 CarLife App，恢复结果另见[验证记录](validation.md)。
+
+| R2 部分 | 当前实现 |
+| --- | --- |
+| Nearby、FE36 协商、HiChain 认证、热点凭据协商 | Rust 状态机，原有持久化身份 |
+| HiSight RTSP 加密协商、端口、播放及退出 | 本轮迁入 Rust |
+| BlueZ 注册、Wi-Fi 与 TCP socket IO | Python 适配层，待移除 |
+| DMSDP 控制会话、音频服务控制、媒体与输入实时通路 | Python 在线实现；R1 Rust 编解码器待接入 |
+| AAC 解码与 PCM 输出 | 原生解码子进程，生命周期待接入 Rust |
+
+因此 R2 整体仍在进行。下一段先迁移 DMSDP 控制与音频服务状态，再把视频/音频/输入 IO 接到 Rust，最后移除 Python BlueZ 与进程胶水。每段以同一手机、同一身份和可回滚产物完成对照。

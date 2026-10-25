@@ -1,5 +1,19 @@
 # 验证与部署记录
 
+## 2026-10-25：R2 第二段，Rust HiSight 控制与退出修复
+
+当前部署源码 `0d29152d8319e66a1d46140a0876d33449fde7c1`，板上目录 `/opt/carlink/releases/r2-0d29152`；应用 SHA256 `de7f962fc87be7de15114a658189914b935e407e33475cb6cf1e9350c7fdd857`。通过 SSH 热部署，MFi 和 HiCar 身份文件校验保持一致，保留对应回滚目录。
+
+- [应用与接收端 40201394421](https://github.com/Aki894/CarLink/actions/runs/40201394421)成功。Rust 103 项测试、145 组 HiSight 对照和 10 组异常输入通过。
+- [完整构建 40201974697](https://github.com/Aki894/CarLink/actions/runs/40201974697)的 native、rust-interop、firmware 全部成功，镜像结构检查及上传完成。下载复验 ZIP SHA256 `ac183e06e437eb19f4b706380324a13e7b250ab652559010a41b272f1bf61d51`，内含 `CarLink-refresh-39459953269-0d29152d.img.xz` SHA256 `65578076652701788e22ce6a461a1af37087ea1b8061d159a2a67257ad4993cc`。
+- H3 四组测试全部通过：HiSight 对照、原生认证及私有 IPC、连接管理、原生菜单与复用器。包含认证通道正常结束后的加密保活、新认证代号撤销旧媒体、SIGTERM 后继续服务退出 IPC、最终 EOF 清理。菜单 PCM 合成测试最大间隔 25.7 ms。
+- 真实华为 HiCar → H3 → 华为 CarLife 持续观察 361.9 秒，2 秒采样，失败记录为 0；HiCar PID `26578`、CarLife PID `27027` 及代号均保持，USB 一直连接。ADB 点击应用列表后画面正常更新。随后切到 CarPlay，旧 HiCar 私有 worker 数量为 0，CarLife PID 仍为 `27027`。
+- 已切回 HiCar，恢复自动连接、30 秒生产连接窗口及手机原来的 10 分钟亮屏超时；临时诊断 wrapper 已移除。切回后保持同一 CarLife PID，新的 HiCar 后端和单个私有 worker 工作正常。
+- 初始候选 `2727997` 的真实回归发现约 60 秒后断流，日志和新增 H3 用例均复现 `stale HiSight session`。修复了认证通道结束时误销毁媒体状态，以及进程组停止时 worker 先退出、父进程无法完成 RTSP TEARDOWN 的顺序问题。
+- CarLife 连续短时退出采用 1、2、4、8 秒退避，并独立于无线重连计时。华为测试 App 在热部署或切换后台后仍可能留下旧 USB 会话，本轮通过重新打开 App 恢复；测试固定前台。手机锁屏会阻止发现确认，已使用用户授权解锁后继续测试。
+
+本轮完成 HiSight 控制迁移；R2 的 DMSDP、媒体/音频/输入实时 IO 和 BlueZ 适配仍按[迁移计划](hicar-rust.md)推进。独立 HU 音频及 Lexus USB/实体按键继续留在硬件验收项。产物、校验、回归及失败复现保存在私有 `.build/hicar-research/r2-hisight-exit-final/`、`r2-hisight-exit-firmware-final/` 和早期候选目录。
+
 ## 2026-10-25：R3 断线恢复、开机重连与三连返回键
 
 已部署源码 `4d2892037a4b4319784773a487ab5b16bdd71101`，应用 SHA256 为 `5becf8f8a23f4aa93c85d7eddd6d9ed169783ce8743c2e108920f7d210cf7f6f`。板上版本目录 `/opt/carlink/releases/r3-4d28920`，对应回滚目录 `/var/lib/carlink/manager/rollback-r3-4d28920`；MFi、HiCar 身份文件校验保持一致。
