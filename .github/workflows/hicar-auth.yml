@@ -128,4 +128,5 @@ jobs:
       driver_run_id: '39670639717'
       variant: main
       disable_onboard_wifi: true
+      hicar_native: true
     secrets: inherit

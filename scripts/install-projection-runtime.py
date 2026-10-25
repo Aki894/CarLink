@@ -67,7 +67,7 @@ def install(project, app, receiver, rootfs):
     receiver_files = checksums(receiver)
     if 'carlink' not in app_files:
         raise ValueError('Application binary missing from checksum manifest')
-    required = ['bin/openxplay-relay', 'bin/oxp-relay', 'probe.py', 'forward.py', 'supervisor.py', 'run-carplay.sh', 'run-carlink.sh', 'hicar/experiments/hicar/probe.py', 'hicar/receiver/forward.py', 'hicar/python/dbus_next/__init__.py', 'bin/carlink-audio', 'share/source/audio/SOURCE.json', 'share/source/audio/ffmpeg.tar.gz', 'share/licenses/audio/COPYING.LGPLv2.1', 'SOURCE.json',
+    required = ['lib/libcarlink_menu.so', 'share/fonts/NotoSansCJKsc-Regular.otf', 'share/source/menu/SOURCE.json', 'bin/openxplay-relay', 'bin/oxp-relay', 'probe.py', 'forward.py', 'supervisor.py', 'run-carplay.sh', 'run-carlink.sh', 'hicar/experiments/hicar/probe.py', 'hicar/receiver/forward.py', 'hicar/python/dbus_next/__init__.py', 'bin/carlink-audio', 'share/source/audio/SOURCE.json', 'share/source/audio/ffmpeg.tar.gz', 'share/licenses/audio/COPYING.LGPLv2.1', 'SOURCE.json',
                 'share/web/receiver/index.html', 'share/admin/index.html', 'share/source/relay.tar.gz',
                 'share/source/stream.tar.gz', 'share/licenses/relay/LICENSE',
                 'share/licenses/relay/LICENSE-GPL-3.0', 'share/licenses/relay/NOTICE',
@@ -75,12 +75,32 @@ def install(project, app, receiver, rootfs):
     for name in required:
         if name not in receiver_files or not (receiver / name).stat().st_size:
             raise ValueError('Missing receiver payload: ' + name)
+    if json.loads((receiver / 'share/source/menu/SOURCE.json').read_text()) != lock['menu']:
+        raise ValueError('Menu source lock mismatch')
+    armhf(receiver / 'lib/libcarlink_menu.so')
     audio_source = json.loads((receiver / 'share/source/audio/SOURCE.json').read_text())
     for key, value in lock['audio_transcoder'].items():
         if audio_source[key] != value:
             raise ValueError('Audio transcoder source lock mismatch: ' + key)
     for path in (app / 'carlink', receiver / 'bin/openxplay-relay', receiver / 'bin/oxp-relay', receiver / 'bin/carlink-audio'):
         armhf(path)
+    native_dir = os.environ.get('HICAR_NATIVE_DIR')
+    if native_dir:
+        native = Path(native_dir).resolve()
+        native_files = checksums(native)
+        for name in ('libcarlink_hichain.so', 'lib/libcrypto.so.3', 'lib/libmbedcrypto.so.7', 'lib/libcjson.so.1'):
+            if name not in native_files:
+                raise ValueError('Missing HiCar native runtime: ' + name)
+            armhf(native / name)
+        expected = json.loads((project / 'experiments/hicar/native/sources.json').read_text())
+        if json.loads((native / 'sources.json').read_text()) != expected:
+            raise ValueError('HiCar native source mismatch')
+        native_dest = rootfs / 'usr/local/lib/carlink/hicar-native'
+        if native_dest.exists():
+            shutil.rmtree(native_dest)
+        shutil.copytree(native, native_dest)
+        for item in native_dest.rglob('*'):
+            item.chmod(0o755 if item.is_dir() else 0o644)
     destination = (rootfs / 'usr/local/lib/carlink/carplay').resolve()
     if not destination.is_relative_to(rootfs):
         raise ValueError('Receiver destination escapes image root')

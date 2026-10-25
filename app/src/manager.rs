@@ -23,10 +23,14 @@ struct Config{schema:u32,socket:PathBuf,live_socket:PathBuf,state:PathBuf,carlif
     #[serde(default)]devices:Vec<Device>,#[serde(default)]initial:Option<Protocol>,#[serde(default)]bluetoothctl:Option<String>,
     #[serde(default)]radio_lock:Option<PathBuf>,
     #[serde(default)]media_socket:Option<PathBuf>,
+    #[serde(default)]web_listen:Option<std::net::SocketAddr>,
+    #[serde(default)]source_socket:Option<PathBuf>,#[serde(default)]menu_library:Option<PathBuf>,#[serde(default)]menu_font:Option<PathBuf>,
     #[serde(default="connect_seconds")]connect_seconds:u64,#[serde(default="stable_seconds")]stable_seconds:u64,#[serde(default="pair_seconds")]pair_seconds:u64}
 fn connect_seconds()->u64{30}fn stable_seconds()->u64{10}fn pair_seconds()->u64{120}
+#[derive(Default,Clone,Copy,PartialEq,Deserialize,Serialize)]
+#[serde(rename_all="lowercase")]enum Policy{#[default]Last,Favorite,Manual}
 #[derive(Default,Deserialize,Serialize)]
-struct Store{#[serde(default)]devices:Vec<Device>,#[serde(default)]last:Option<Device>,#[serde(default)]paused:bool}
+struct Store{#[serde(default)]devices:Vec<Device>,#[serde(default)]last:Option<Device>,#[serde(default)]paused:bool,#[serde(default)]policy:Policy,#[serde(default)]favorite:Option<Device>}
 fn private_dir(path:&Path)->Result<()>{
     fs::create_dir_all(path).map_err(|_|"cannot create private manager directory")?;
     let meta=fs::symlink_metadata(path).map_err(|_|"cannot inspect private manager directory")?;
@@ -48,13 +52,14 @@ fn save(path:&Path,store:&Store)->Result<()>{
 }
 #[derive(Clone,Serialize)]
 struct Status{schema:u32,generation:u64,protocol:Option<Protocol>,target:Option<Device>,active:bool,pairing:bool,paused:bool,
-    carlife_pid:Option<u32>,backend_pid:Option<u32>,usb_connected:bool,last_error:Option<String>}
+    carlife_pid:Option<u32>,backend_pid:Option<u32>,usb_connected:bool,menu_visible:bool,last_error:Option<String>}
 fn event(name:&str){println!("{}",json!({"event":name}));}
 struct Process{child:Child,pgid:i32,events:Receiver<Value>,generation:u64}
-fn spawn(args:&[String],generation:u64)->Result<Process>{
+fn spawn(args:&[String],generation:u64,source:Option<&Path>)->Result<Process>{
     if args.is_empty(){return Err("backend command is empty".into());}
     let mut cmd=Command::new(&args[0]);cmd.args(&args[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit());
     unsafe{cmd.pre_exec(||if libc::setpgid(0,0)==0{Ok(())}else{Err(std::io::Error::last_os_error())});}
+    if let Some(path)=source{cmd.env("CARLINK_LIVE_SOCKET",path);}
     let mut child=cmd.spawn().map_err(|_|"cannot start projection process")?;let pgid=child.id() as i32;
     let out=child.stdout.take().ok_or("missing child event stream")?;let (tx,rx)=mpsc::sync_channel(64);
     thread::spawn(move||{
@@ -90,7 +95,7 @@ impl Drop for Process{fn drop(&mut self){let _=self.end();}}
 #[derive(Clone)]struct Choice{protocol:Protocol,device:Option<Device>,pairing:bool}
 struct Owner{config:Config,store:Store,status:Status,life:Option<Process>,backend:Option<Process>,choice:Option<Choice>,
     started:Instant,ready:Option<Instant>,seen_media:bool,committed:bool,pair_deadline:Option<Instant>,repair_used:bool,
-    retry_at:Instant,tried:VecDeque<String>,last_auth:Option<Instant>,refusals:u8}
+    retry_at:Instant,tried:VecDeque<String>,last_auth:Option<Instant>,refusals:u8,mux:Option<crate::manager_menu::Mux>,menu_focus:usize,menu_pending:Option<Value>,menu_idle:bool}
 impl Owner{
     fn new(config:Config)->Result<Self>{
         if config.schema!=1||config.devices.len()>8||!(2..=120).contains(&config.connect_seconds)||!(1..=60).contains(&config.stable_seconds)||!(5..=120).contains(&config.pair_seconds){return Err("unsupported manager configuration".into());}
@@ -100,16 +105,17 @@ impl Owner{
         let mut store=if config.state.exists(){serde_json::from_slice::<Store>(&private_read(&config.state)?).map_err(|_|"invalid device store")?}else{Store::default()};
         if store.devices.len()>8{return Err("too many stored devices".into());}for d in &store.devices{d.validate()?;}
         if let Some(last)=&store.last{last.validate()?;if !store.devices.iter().any(|d|d.protocol==last.protocol&&d.address.eq_ignore_ascii_case(&last.address)){store.last=None;}}
-        for d in &config.devices{if !store.devices.iter().any(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address)){store.devices.push(d.clone());}}
+        for d in config.devices.iter().filter(|_|!config.state.exists()){if !store.devices.iter().any(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address)){store.devices.push(d.clone());}}
         if store.devices.len()>8{return Err("too many configured devices".into());}
         let paused=store.paused;
-        Ok(Self{config,store,status:Status{schema:1,generation:0,protocol:None,target:None,active:false,pairing:false,paused,carlife_pid:None,backend_pid:None,usb_connected:false,last_error:None},
-            life:None,backend:None,choice:None,started:Instant::now(),ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0})
+        Ok(Self{config,store,status:Status{schema:1,generation:0,protocol:None,target:None,active:false,pairing:false,paused,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,last_error:None},
+            life:None,backend:None,choice:None,started:Instant::now(),ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true})
     }
     fn automatic(&self)->Option<Choice>{
-        if self.store.paused{return None;}
+        if self.store.paused||self.store.policy==Policy::Manual{return None;}
+        if self.store.policy==Policy::Favorite {return self.store.favorite.as_ref().and_then(|d|self.store.devices.iter().find(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address))).filter(|d|d.auto&&!self.tried.contains(&d.address)).cloned().map(|d|Choice{protocol:d.protocol,device:Some(d),pairing:false});}
         let eligible=|d:&&Device|d.auto&&!self.tried.contains(&d.address);
-        let device=self.store.last.as_ref().filter(|d|d.auto&&!self.tried.contains(&d.address)).cloned()
+        let device=self.store.last.as_ref().and_then(|d|self.store.devices.iter().find(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address))).filter(|d|d.auto&&!self.tried.contains(&d.address)).cloned()
             .or_else(||self.store.devices.iter().filter(eligible).max_by_key(|d|d.last_used).cloned());
         device.map(|d|Choice{protocol:d.protocol,device:Some(d),pairing:false})
             .or_else(||if self.store.devices.is_empty(){self.config.initial.map(|protocol|Choice{protocol,device:None,pairing:true})}else{None})
@@ -125,7 +131,7 @@ impl Owner{
         }Ok(())
     }
     fn select(&mut self,choice:Choice)->Result<()>{
-        if choice.protocol==Protocol::Hicar&&(choice.device.is_none()||self.config.hicar.is_empty()){return Err("HiCar requires a selected device and configured backend".into());}
+        if choice.protocol==Protocol::Hicar&&((choice.device.is_none()&&!choice.pairing)||self.config.hicar.is_empty()){return Err("HiCar requires a selected target or explicit pairing window and configured backend".into());}
         self.stop_backend()?;self.status.generation=self.status.generation.checked_add(1).ok_or("generation exhausted")?;
         let mut args=if choice.protocol==Protocol::Carplay{self.config.carplay.clone()}else{self.config.hicar.clone()};
         if choice.pairing {args.extend(["--pair".into(),self.config.pair_seconds.to_string()]);}
@@ -134,7 +140,8 @@ impl Owner{
             let epoch=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_|"invalid system clock")?.as_secs();
             args.extend(["--sequence".into(),((epoch+self.status.generation)%256).to_string()]);
         }
-        let process=spawn(&args,self.status.generation)?;
+        if choice.protocol==Protocol::Hicar{if let Some(path)=&self.config.source_socket{if let Some(i)=args.iter().position(|v|v=="--live-socket"){args[i+1]=path.to_string_lossy().into_owned();}}}
+        let process=spawn(&args,self.status.generation,self.config.source_socket.as_deref())?;
         self.status.protocol=Some(choice.protocol);self.status.target=choice.device.clone();self.status.pairing=choice.pairing;
         self.status.backend_pid=Some(process.child.id());self.status.last_error=None;self.backend=Some(process);self.choice=Some(choice.clone());
         self.started=Instant::now();self.ready=None;self.seen_media=false;self.committed=false;self.repair_used=false;self.refusals=0;
@@ -183,12 +190,16 @@ impl Owner{
                 if self.status.pairing {self.status.target=Some(Device{protocol:Protocol::Carplay,address:address.to_uppercase(),name:"iPhone".into(),auto:true,last_used:0});}
             }
         }
+        if name=="target_selected"&&self.status.pairing&&self.status.protocol==Some(Protocol::Hicar){
+            if let Some(address)=v["address"].as_str().filter(|s|mac(s)){if self.status.target.is_none(){self.status.target=Some(Device{protocol:Protocol::Hicar,address:address.to_uppercase(),name:"Huawei".into(),auto:true,last_used:0});}}
+        }
         if name=="hisight_closed" {self.status.active=false;self.ready=None;self.started=Instant::now()-Duration::from_secs(22);}
         Ok(())
     }
     fn command(&mut self,v:Value)->Result<Value>{
         match v["op"].as_str().ok_or("missing control operation")?{
             "status"=>{},
+            "menu"=>{if self.mux.is_none(){return Err("car menu is not configured".into());}self.status.menu_visible=v["visible"].as_bool().ok_or("menu visibility required")?;self.menu_idle=false;self.menu_focus=0;self.menu_pending=None;},
             "devices"=>return Ok(json!({"ok":true,"devices":self.store.devices})),
             "remember"=>{let d:Device=serde_json::from_value(v["device"].clone()).map_err(|_|"invalid device record")?;d.validate()?;
                 self.store.devices.retain(|x|!(x.protocol==d.protocol&&x.address.eq_ignore_ascii_case(&d.address)));
@@ -198,8 +209,21 @@ impl Owner{
                 let d=self.store.devices.iter().find(|d|d.protocol==protocol&&d.address.eq_ignore_ascii_case(address)).cloned().ok_or("unknown target device")?;
                 self.tried.clear();self.select(Choice{protocol,device:Some(d),pairing:false})?;},
             "pair"=>{let protocol:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing protocol")?;
-                if protocol!=Protocol::Carplay{return Err("remember a HiCar target address before connecting in this first manager version".into());}
+                if self.store.devices.len()>=8{return Err("device store is full; forget a device first".into());}
                 self.select(Choice{protocol,device:None,pairing:true})?;},
+            "policy"=>{let mode:Policy=serde_json::from_value(v["mode"].clone()).map_err(|_|"invalid connection policy")?;
+                if mode==Policy::Favorite{let p:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing favorite protocol")?;let a=v["address"].as_str().ok_or("missing favorite target")?;
+                    self.store.favorite=Some(self.store.devices.iter().find(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)).cloned().ok_or("unknown favorite target")?);}
+                self.store.policy=mode;save(&self.config.state,&self.store)?;},
+            "forget"=>{if v["confirm"]!=true{return Err("forget requires explicit confirmation".into());}
+                let p:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing target protocol")?;let a=v["address"].as_str().ok_or("missing target")?;
+                if !self.store.devices.iter().any(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)){return Err("unknown target device".into());}
+                if self.status.target.as_ref().is_some_and(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)){self.stop_backend()?;self.choice=None;self.status.target=None;self.status.protocol=None;self.status.pairing=false;self.pair_deadline=None;}
+                if !self.store.devices.iter().any(|d|d.protocol!=p&&d.address.eq_ignore_ascii_case(a)){self.bluetooth(&["--timeout","5","remove",a])?;}
+                self.store.devices.retain(|d|!(d.protocol==p&&d.address.eq_ignore_ascii_case(a)));
+                if self.store.last.as_ref().is_some_and(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)){self.store.last=None;}
+                if self.store.favorite.as_ref().is_some_and(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)){self.store.favorite=None;}
+                self.store.paused=true;self.status.paused=true;save(&self.config.state,&self.store)?;},
             "repair"=>self.repair()?,
             "disconnect"=>{self.stop_backend()?;self.choice=None;self.status.protocol=None;self.status.target=None;self.status.pairing=false;self.pair_deadline=None;
                 self.store.paused=true;self.status.paused=true;save(&self.config.state,&self.store)?;},
@@ -209,7 +233,36 @@ impl Owner{
             "shutdown"=>STOP.store(true,Ordering::Relaxed),_=>return Err("unsupported manager operation".into()),
         }Ok(json!({"ok":true,"status":self.status}))
     }
+    fn menu_model(&self)->(Vec<String>,Vec<Value>){
+        if let Some(v)=&self.menu_pending{return (vec!["确认停止当前投屏并继续".into(),"取消".into()],vec![v.clone(),json!({"op":"menu_cancel"})]);}
+        let mut labels=vec![];let mut commands=vec![];
+        for d in &self.store.devices{labels.push(format!("{} · {}{}",d.name,if d.protocol==Protocol::Carplay{"CarPlay"}else{"HiCar"},if self.status.active&&self.status.target.as_ref().is_some_and(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address)){" · 已连接"}else{""}));commands.push(json!({"op":"connect","protocol":d.protocol,"address":d.address}));}
+        for (label,command) in [("添加 iPhone",json!({"op":"pair","protocol":"carplay"})),("添加华为 HiCar",json!({"op":"pair","protocol":"hicar"})),
+            ("自动连接：优先上次使用",json!({"op":"policy","mode":"last"})),("自动连接：每次选择",json!({"op":"policy","mode":"manual"})),
+            (if self.store.paused{"恢复自动连接"}else{"暂停自动连接"},json!({"op":if self.store.paused{"resume"}else{"pause"}})),
+            ("断开当前手机",json!({"op":"disconnect"})),("返回投屏",json!({"op":"menu","visible":false}))]{labels.push(label.into());commands.push(command);}
+        (labels,commands)
+    }
+    fn menu_input(&mut self,v:Value)->Result<()>{
+        if !self.status.menu_visible{return Ok(());}let (rows,actions)=self.menu_model();
+        let kind=v["type"].as_str().unwrap_or("");let mut chosen=None;
+        if kind=="key-press"||kind=="key"{match v["code"].as_u64(){
+            Some(3|5)=>self.menu_focus=self.menu_focus.saturating_sub(1),Some(4|6)=>self.menu_focus=(self.menu_focus+1).min(rows.len()-1),
+            Some(2)=>chosen=Some(self.menu_focus),Some(0|1)=>{if self.menu_pending.is_some(){self.menu_pending=None;self.menu_focus=0;}else{self.status.menu_visible=false;self.menu_idle=false;}},_=>{}}}
+        if kind=="menu-focus"{if let Some(i)=v["index"].as_u64().filter(|i|(*i as usize)<rows.len()){self.menu_focus=i as usize;}}
+        if kind=="menu-select"{chosen=v["index"].as_u64().map(|n|n as usize);}
+        if let Some(i)=chosen.filter(|i|*i<actions.len()){let action=actions[i].clone();match action["op"].as_str(){
+            Some("menu_cancel")=>{self.menu_pending=None;self.menu_focus=0;},
+            Some("pair"|"disconnect") if self.menu_pending.is_none()&&self.status.active=>{self.menu_pending=Some(action);self.menu_focus=0;},
+            _=>{self.menu_pending=None;self.menu_focus=0;let close=action["op"]=="connect";self.command(action)?;if close{self.status.menu_visible=false;self.menu_idle=false;}}
+        }}Ok(())
+    }
     fn tick(&mut self)->Result<()>{
+        let mut inputs=vec![];if let Some(mux)=&self.mux{for _ in 0..16{if let Some(v)=mux.try_input(){inputs.push(v);}else{break;}}}
+        for v in inputs{self.menu_input(v)?;}
+        if self.menu_idle&&self.status.active{self.status.menu_visible=false;self.menu_idle=false;}
+        if let Some(mux)=&self.mux{let (rows,_)=self.menu_model();self.menu_focus=self.menu_focus.min(rows.len()-1);mux.set_menu(rows,self.menu_focus,self.status.menu_visible)?;}
+
         if let Some(life)=self.life.as_mut(){for v in life.events.try_iter().take(16){if v["event"]=="carlife_state"{self.status.usb_connected=true;}if v["event"]=="session_error"{
             self.status.usb_connected=false;
             self.status.last_error=Some(v["detail"].as_str().unwrap_or("CarLife output failed").chars().take(256).collect());event("manager_carlife_error");
@@ -221,7 +274,7 @@ impl Owner{
             }
         }
         if self.life.is_none()&&Instant::now()>=self.retry_at {
-            let p=spawn(&self.config.carlife,0)?;self.status.carlife_pid=Some(p.child.id());self.life=Some(p);
+            let p=spawn(&self.config.carlife,0,None)?;self.status.carlife_pid=Some(p.child.id());self.life=Some(p);
         }
         if let Some(p)=self.backend.as_mut(){let generation=p.generation;let events=p.events.try_iter().take(64).collect::<Vec<_>>();
             for e in events{self.ingest(generation,e)?;}}
@@ -274,6 +327,10 @@ fn serve(config:&Path)->Result<()>{
     let listener=UnixListener::bind(&owner.config.socket).map_err(|_|"cannot bind manager control")?;fs::set_permissions(&owner.config.socket,fs::Permissions::from_mode(0o600)).map_err(|_|"cannot secure manager control")?;
     listener.set_nonblocking(true).map_err(|_|"cannot configure manager control")?;
     unsafe{libc::signal(libc::SIGTERM,stop as libc::sighandler_t);libc::signal(libc::SIGINT,stop as libc::sighandler_t);}
+    match (&owner.config.source_socket,&owner.config.menu_library,&owner.config.menu_font){
+        (Some(source),Some(library),Some(font))=>{private_dir(source.parent().ok_or("source parent missing")?)?;owner.mux=Some(crate::manager_menu::Mux::start(source,&owner.config.live_socket,library,font)?);owner.status.menu_visible=true;},
+        (None,None,None)=>{},_=>return Err("source socket, menu library and font must be configured together".into())}
+    let _web=owner.config.web_listen.map(|listen|crate::manager_web::start(listen,owner.config.socket.clone())).transpose()?;
     event("manager_started");let result=(||{while !STOP.load(Ordering::Relaxed){
         for _ in 0..4{match listener.accept(){Ok((mut stream,_))=>{
             let response=exchange(&mut stream).and_then(|v|owner.command(v)).unwrap_or_else(|e|json!({"ok":false,"error":e}));
@@ -298,7 +355,7 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
 #[cfg(test)]mod tests{use super::*;
     #[test]fn ordinary_offline_does_not_erase_pairing(){for s in ["Host is down","Connection timed out","No route to host","AirPlay session ended"]{assert!(!auth_mismatch(s));}assert!(auth_mismatch("org.bluez.Error.AuthenticationFailed"));}
     #[test]fn stale_generation_cannot_steal_active_backend(){
-        let c=Config{schema:1,socket:"/tmp/cm/control".into(),live_socket:"/tmp/cm/live".into(),state:"/tmp/cm/missing-state".into(),carlife:vec![],carplay:vec![],hicar:vec![],devices:vec![],initial:None,bluetoothctl:None,radio_lock:None,media_socket:None,connect_seconds:30,stable_seconds:10,pair_seconds:120};
+        let c=Config{schema:1,socket:"/tmp/cm/control".into(),live_socket:"/tmp/cm/live".into(),state:"/tmp/cm/missing-state".into(),carlife:vec![],carplay:vec![],hicar:vec![],devices:vec![],initial:None,bluetoothctl:None,radio_lock:None,media_socket:None,web_listen:None,source_socket:None,menu_library:None,menu_font:None,connect_seconds:30,stable_seconds:10,pair_seconds:120};
         let mut owner=Owner::new(c).unwrap();owner.status.generation=3;owner.status.protocol=Some(Protocol::Carplay);
         owner.ingest(2,json!({"event":"stage","stage":"WirelessActive"})).unwrap();assert!(!owner.status.active);
     }

@@ -8,6 +8,10 @@ mod input;
 mod auth;
 mod hicar;
 mod manager;
+#[cfg(unix)]
+mod manager_web;
+#[cfg(unix)]
+mod manager_menu;
 #[cfg(target_os = "linux")]
 mod usb_aio;
 use std::env;

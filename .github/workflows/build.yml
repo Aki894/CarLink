@@ -44,7 +44,7 @@ jobs:
       - name: Install ARM hard-float compiler and pinned Rust
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabihf qemu-user
+          sudo apt-get install -y gcc-arm-linux-gnueabihf qemu-user ffmpeg
           rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET"
       - name: Test and cross compile app
         env:
@@ -55,6 +55,7 @@ jobs:
           python3 scripts/test-hicar-rust.py app/target/debug/carlink
           python3 scripts/test-hicar-rust-session.py app/target/debug/carlink
           python3 scripts/test-manager.py app/target/debug/carlink
+          python3 scripts/test-manager-web.py app/target/debug/carlink
           python3 -c 'import json; d=json.load(open("/tmp/carlink-doctor.json")); assert d["schema_version"] == 1; assert d["aoa"]["status"] == "not_tested"'
           cargo +"$RUST_VERSION" build --release --locked --manifest-path app/Cargo.toml --target "$TARGET"
           mkdir -p dist/app

@@ -376,13 +376,55 @@ class Advertisement(ServiceInterface):
         self.stop.set()
 
 
+class PeerSelection:
+    """One transport peer per explicitly bounded enrollment attempt.
+
+    Agent requests can validate candidates but cannot select one. Only an actual
+    FE35/FE36 socket takes the selection, shared by both profiles and the agent.
+    HiChain still authenticates the selected phone before any network offer.
+    """
+    def __init__(self, adapter, selected=None, pair_seconds=0, clock=None):
+        if pair_seconds and not 5 <= pair_seconds <= 120:
+            raise ValueError('pairing window must be 5..120 seconds')
+        self.prefix = adapter + '/dev_'
+        self.selected = selected
+        self.clock = clock or time.monotonic
+        self.deadline = self.clock() + pair_seconds if pair_seconds else None
+        if selected is not None and self.address(selected) is None:
+            raise ValueError('selected phone must belong to the configured adapter')
+
+    def address(self, device):
+        if not isinstance(device, str) or not device.startswith(self.prefix):
+            return None
+        parts = device[len(self.prefix):].split('_')
+        if len(parts) != 6 or any(len(part) != 2 for part in parts):
+            return None
+        if any(char not in '0123456789abcdefABCDEF' for part in parts for char in part):
+            return None
+        return ':'.join(parts).upper()
+
+    def allows(self, device, select=False):
+        address = self.address(device)
+        if address is None:
+            return False
+        if self.selected is not None:
+            return device == self.selected
+        if self.deadline is None or self.clock() >= self.deadline:
+            return False
+        if select:
+            self.selected = device
+            log('target_selected', address=address)
+        return True
+
+
 class PeerAgent(ServiceInterface):
     def __init__(self, peer_path):
         super().__init__('org.bluez.Agent1')
-        self.peer_path = peer_path
+        self.selection = peer_path if isinstance(peer_path, PeerSelection) else PeerSelection(
+            peer_path.rsplit('/dev_', 1)[0], selected=peer_path)
 
     def check(self, device):
-        if device != self.peer_path:
+        if not self.selection.allows(device):
             raise DBusError('org.bluez.Error.Rejected', 'not the selected test phone')
 
     @method()
@@ -419,13 +461,14 @@ class PeerAgent(ServiceInterface):
 
 class Profile(ServiceInterface):
     def __init__(self, stop, capture_dir, peer_path=None, control_summary=None,
-                 decode_control=True):
+                 decode_control=True, selection=None):
         super().__init__('org.bluez.Profile1')
         self.stop, self.capture_dir = stop, capture_dir
         self.tasks = {}
         self.sockets = {}
         self.sequence = 0
         self.peer_path = peer_path
+        self.selection = selection
         self.control_summary = control_summary
         self.decode_control = decode_control
         self.business_channel = None
@@ -442,7 +485,8 @@ class Profile(ServiceInterface):
     @method()
     def NewConnection(self, device: 'o', fd: 'h', properties: 'a{sv}'):
         if (self.stop.is_set() or len(self.tasks) >= 4 or device in self.tasks
-                or (self.peer_path and device != self.peer_path)):
+                or (self.peer_path and device != self.peer_path)
+                or (self.selection is not None and not self.selection.allows(device))):
             os.close(fd)
             raise DBusError('org.bluez.Error.Rejected', 'probe connection limit')
         try:
@@ -450,6 +494,9 @@ class Profile(ServiceInterface):
         except Exception:
             os.close(fd)
             raise
+        if self.selection is not None and not self.selection.allows(device, select=True):
+            sock.close()
+            raise DBusError('org.bluez.Error.Rejected', 'pairing window expired')
         self.sequence += 1
         session = self.sequence
         try:
@@ -532,8 +579,9 @@ async def run(args):
         return False
     bus.add_message_handler(property_trace)
     peer_path = args.adapter + '/dev_' + args.peer.upper().replace(':', '_') if args.peer else None
-    profile = Profile(stop, args.capture_dir, peer_path)
-    business_profile = Profile(stop, args.capture_dir, peer_path, decode_control=False)
+    selection = PeerSelection(args.adapter, peer_path, args.pair) if peer_path or args.pair else None
+    profile = Profile(stop, args.capture_dir, peer_path, selection=selection)
+    business_profile = Profile(stop, args.capture_dir, peer_path, decode_control=False, selection=selection)
     if args.network_offer:
         from network_wire import Resource
         profile.resource = business_profile.resource = Resource(args.network_offer)
@@ -660,7 +708,7 @@ async def run(args):
             settings = mgmt_settings(controller_index)
             restore_connectable = not bool(settings & 2)
             restore_bondable = not bool(settings & 16)
-            bus.export(ROOT + '/agent', PeerAgent(peer_path))
+            bus.export(ROOT + '/agent', PeerAgent(selection))
             intro = await bus.introspect('org.bluez', '/org/bluez')
             agent_manager = bus.get_proxy_object('org.bluez', '/org/bluez', intro).get_interface(
                 'org.bluez.AgentManager1')
@@ -764,7 +812,9 @@ def main():
     parser.add_argument('--tx-power', type=int, default=0, help='requested advertising power in dBm')
     parser.add_argument('--allow-incoming', action='store_true',
                         help='temporarily enable BR/EDR incoming connections; restore on exit')
-    parser.add_argument('--peer', help='selected phone Bluetooth address; required for --allow-incoming')
+    parser.add_argument('--peer', help='selected phone Bluetooth address; required outside an explicit pairing window')
+    parser.add_argument('--pair', type=int, default=0, metavar='SECONDS',
+                        help='managed-only enrollment window, 5..120 seconds; first transport peer is selected')
     parser.add_argument('--reply-control', action='store_true',
                         help='reply to channel negotiation and offer the FE36 HiCar business socket')
     parser.add_argument('--reply-identity', action='store_true', help='reply to the HiCar identity handshake')
@@ -794,10 +844,12 @@ def main():
     if not (args.adapter.startswith('/org/bluez/hci')
             and args.adapter[len('/org/bluez/hci'):].isdigit()):
         parser.error('adapter must be /org/bluez/hci followed by its numeric index')
-    if args.allow_incoming and not args.peer:
-        parser.error('--allow-incoming requires --peer')
-    if args.reply_identity and not (args.reply_control and args.peer):
-        parser.error('--reply-identity requires --reply-control and --peer')
+    if args.pair and not (args.managed and 5 <= args.pair <= 120):
+        parser.error('--pair requires --managed and a window of 5..120 seconds')
+    if args.allow_incoming and not (args.peer or args.pair):
+        parser.error('--allow-incoming requires --peer or an explicit --pair window')
+    if args.reply_identity and not (args.reply_control and (args.peer or args.pair)):
+        parser.error('--reply-identity requires --reply-control and --peer or an explicit --pair window')
     if args.auth_library and not args.reply_identity:
         parser.error('--auth-library requires --reply-identity')
     if args.network_interface and not args.auth_library:
@@ -810,9 +862,7 @@ def main():
         parts = args.peer.split(':')
         if len(parts) != 6 or any(len(part) != 2 for part in parts):
             parser.error('peer must be a six-byte colon-separated Bluetooth address')
-        try:
-            bytes.fromhex(''.join(parts))
-        except ValueError:
+        if any(char not in '0123456789abcdefABCDEF' for part in parts for char in part):
             parser.error('peer must contain hexadecimal bytes')
     try:
         beacon(args.model, args.sequence)

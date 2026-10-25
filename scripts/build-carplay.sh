@@ -77,6 +77,11 @@ cp "$root"/experiments/hicar/*.py "$root/experiments/hicar/requirements.txt" "$o
 cp "$root/receiver/forward.py" "$root/receiver/probe.py" "$out/hicar/receiver/"
 python3 -m pip install --disable-pip-version-check --no-compile --no-deps --require-hashes \
     --target "$out/hicar/python" -r "$root/experiments/hicar/requirements.txt"
+bash "$root/scripts/build-menu.sh"
+mkdir -p "$out/lib"
+cp -a "$root/dist/menu/lib/." "$out/lib/"
+cp -a "$root/dist/menu/share/." "$out/share/"
+cp "$root/dist/menu/menu-validation.txt" "$root/dist/menu/menu.elf.txt" "$out/share/source/menu/"
 bash "$root/scripts/build-audio.sh"
 cp -a "$root/dist/audio/bin/." "$out/bin/"
 cp -a "$root/dist/audio/share/." "$out/share/"

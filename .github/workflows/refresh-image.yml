@@ -11,6 +11,9 @@ on:
       driver_run_id:
         type: string
         default: ''
+      hicar_native:
+        type: boolean
+        default: false
       variant:
         type: string
         default: main
@@ -97,6 +100,11 @@ jobs:
           path: dist/driver
           run-id: ${{ inputs.driver_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        if: inputs.hicar_native
+        with:
+          name: hicar-auth-armv7-experimental
+          path: dist/hicar-auth
       - name: Install image inspection tools and test archive guards
         run: |
           sudo apt-get update
@@ -123,6 +131,7 @@ jobs:
             DRIVER_VARIANT="$DRIVER_VARIANT" DISABLE_ONBOARD_WIFI="$DISABLE_ONBOARD_WIFI" REFRESH_COMMIT="$GITHUB_SHA" \
             APP_RUN_ID="$APP_RUN_ID" APP_COMMIT="$APP_COMMIT" \
             APPLICATION_DIR="$GITHUB_WORKSPACE/dist/app" CARPLAY_DIR="$GITHUB_WORKSPACE/dist/carplay" \
+            HICAR_NATIVE_DIR="${{ inputs.hicar_native && format('{0}/dist/hicar-auth', github.workspace) || '' }}" \
             SOURCE_REPOSITORY="$GITHUB_REPOSITORY" RUNTIME_PACKAGES_DIR="$GITHUB_WORKSPACE/dist/runtime-packages" \
             bash scripts/refresh-image.sh dist/base dist/refreshed dist/driver
           sudo chown -R "$(id -u):$(id -g)" dist/refreshed

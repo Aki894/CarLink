@@ -30,5 +30,35 @@
       "repository": "https://github.com/OpenXPlay/OpenXPlay-Stream.git",
       "commit": "356a3f56c0e0b4e839b91387bf2b8cfa0b0a8537"
     }
+  },
+  "menu": {
+    "license": "MIT AND CC0-1.0 AND OFL-1.1",
+    "dependencies": [
+      {
+        "name": "minih264e.h",
+        "url": "https://raw.githubusercontent.com/lieff/minih264/b0baea7a80ef9d12da97301dd1099b8791b5ba43/minih264e.h",
+        "sha256": "661afe7802b4e1174e8389632f3ee437b903e036a9c91a7f035830947c6a7aae"
+      },
+      {
+        "name": "stb_truetype.h",
+        "url": "https://raw.githubusercontent.com/nothings/stb/003501f6d7a8668ce8b6d875e34dd97ad0d5d5b5/stb_truetype.h",
+        "sha256": "ecd30b05e0dd4fea3a13c26810dd9e1992dc379049482c393d5a19e6b5090aab"
+      },
+      {
+        "name": "NotoSansCJKsc-Regular.otf",
+        "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/523d033d6cb47f4a80c58a35753646f5c3608a78/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+        "sha256": "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b"
+      },
+      {
+        "name": "OFL.txt",
+        "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/523d033d6cb47f4a80c58a35753646f5c3608a78/LICENSE",
+        "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+      },
+      {
+        "name": "stb-LICENSE",
+        "url": "https://raw.githubusercontent.com/nothings/stb/003501f6d7a8668ce8b6d875e34dd97ad0d5d5b5/LICENSE",
+        "sha256": "bebfe904b14301657e4e5d655c811d51fd31b97c455b9cc2d8600d6bac6cff63"
+      }
+    ]
   }
 }

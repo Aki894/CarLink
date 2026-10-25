@@ -1,11 +1,12 @@
 import asyncio
 import contextlib
 import io
+import os
 import socket
 import unittest
 import xml.etree.ElementTree as ET
 
-from probe import Advertisement, FE35, PeerAgent, Profile, beacon, observe, service_record, close_tcp_streams
+from probe import Advertisement, FE35, PeerAgent, PeerSelection, Profile, beacon, observe, service_record, close_tcp_streams
 from dbus_next import DBusError
 
 
@@ -49,6 +50,98 @@ class BeaconTests(unittest.TestCase):
             agent.RequestConfirmation('/org/bluez/hci0/dev_00_11_22_33_44_66', 123456)
         with self.assertRaises(DBusError):
             agent.AuthorizeService(selected, 'unsupported-service')
+
+
+class PairWindowTests(unittest.TestCase):
+    adapter = '/org/bluez/hci0'
+    first = adapter + '/dev_00_11_22_33_44_55'
+    second = adapter + '/dev_00_11_22_33_44_66'
+
+    def test_agent_candidates_do_not_lock_out_the_transport_peer(self):
+        now = [0.0]
+        selection = PeerSelection(self.adapter, pair_seconds=5, clock=lambda: now[0])
+        agent = PeerAgent(selection)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            agent.RequestConfirmation(self.first, 123456)
+            agent.AuthorizeService(self.second, FE35)
+            self.assertIsNone(selection.selected)
+            self.assertTrue(selection.allows(self.second, select=True))
+        self.assertEqual(selection.selected, self.second)
+        self.assertEqual(output.getvalue().count('target_selected'), 1)
+        self.assertNotIn('123456', output.getvalue())
+        with self.assertRaises(DBusError):
+            agent.RequestAuthorization(self.first)
+        agent.RequestAuthorization(self.second)
+
+    def test_expired_window_cannot_enroll_even_the_previous_candidate(self):
+        now = [0.0]
+        selection = PeerSelection(self.adapter, pair_seconds=5, clock=lambda: now[0])
+        self.assertTrue(selection.allows(self.first))
+        now[0] = 5.0
+        self.assertFalse(selection.allows(self.first, select=True))
+        self.assertIsNone(selection.selected)
+        with self.assertRaises(DBusError):
+            PeerAgent(selection).RequestAuthorization(self.first)
+
+    def test_selected_phone_can_finish_authentication_after_enrollment_closes(self):
+        now = [0.0]
+        selection = PeerSelection(self.adapter, pair_seconds=5, clock=lambda: now[0])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(selection.allows(self.first, select=True))
+        now[0] = 500.0
+        self.assertTrue(selection.allows(self.first))
+        self.assertFalse(selection.allows(self.second, select=True))
+
+    def test_no_implicit_window_and_validated_adapter_path(self):
+        selection = PeerSelection(self.adapter)
+        self.assertFalse(selection.allows(self.first, select=True))
+        window = PeerSelection(self.adapter, pair_seconds=120)
+        for path in ('/org/bluez/hci1/dev_00_11_22_33_44_55',
+                     self.first + '/child', self.adapter + '/dev_00_11_ZZ_33_44_55',
+                     self.adapter + '/dev_00_11_22_33_44',
+                     self.adapter + '/dev_  _11_22_33_44_55', None):
+            with self.subTest(path=path):
+                self.assertFalse(window.allows(path, select=True))
+        self.assertIsNone(window.selected)
+        for seconds in (-1, 1, 4, 121):
+            with self.assertRaises(ValueError):
+                PeerSelection(self.adapter, pair_seconds=seconds)
+
+    def test_explicit_peer_stays_exclusive_without_enrollment_deadline(self):
+        selection = PeerSelection(self.adapter, selected=self.first, clock=lambda: 1e20)
+        self.assertTrue(selection.allows(self.first, select=True))
+        self.assertFalse(selection.allows(self.second, select=True))
+
+
+class PairProfileTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(os.name == 'posix', 'BlueZ transfers POSIX socket file descriptors')
+    async def test_profiles_share_selection_and_close_rejected_fds(self):
+        first = '/org/bluez/hci0/dev_00_11_22_33_44_55'
+        second = '/org/bluez/hci0/dev_00_11_22_33_44_66'
+        stop = asyncio.Event()
+        selection = PeerSelection('/org/bluez/hci0', pair_seconds=120)
+        control = Profile(stop, None, selection=selection)
+        business = Profile(stop, None, decode_control=False, selection=selection)
+        sockets = [socket.socketpair() for _ in range(3)]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                control.NewConnection(first, os.dup(sockets[0][0].fileno()), {})
+                rejected_fd = os.dup(sockets[1][0].fileno())
+                with self.assertRaises(DBusError):
+                    business.NewConnection(second, rejected_fd, {})
+                with self.assertRaises(OSError):
+                    os.fstat(rejected_fd)
+                business.NewConnection(first, os.dup(sockets[2][0].fileno()), {})
+                self.assertEqual(set(control.tasks), {first})
+                self.assertEqual(set(business.tasks), {first})
+                await control.close()
+                await business.close()
+        finally:
+            await control.close()
+            await business.close()
+            for pair in sockets:
+                for sock in pair:
+                    sock.close()
 
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):

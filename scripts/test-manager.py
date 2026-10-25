@@ -36,7 +36,11 @@ try:
     elif role=='carplay':
         args=sys.argv[3:];address=args[args.index('--iphone')+1] if '--iphone' in args else '02:00:00:00:00:01'
         for v in [dict(event='stage',stage='ConnectingBluetooth',address=address),dict(event='stage',stage='WirelessActive'),dict(event='forward_latency',sent=30)]:print(json.dumps(v),flush=True)
-    elif role=='hicar':print(json.dumps(dict(event='bridge_stats',active=True,connected=scenario!='no-hu',video_frames=20)),flush=True)
+    elif role=='hicar':
+        if scenario=='pair-hicar' and '--pair' in sys.argv:
+            for address in ['not-a-bluetooth-address','02:00:00:00:00:03','02:00:00:00:00:04']:
+                print(json.dumps(dict(event='target_selected',address=address)),flush=True)
+        print(json.dumps(dict(event='bridge_stats',active=True,connected=scenario!='no-hu',video_frames=20)),flush=True)
     while not stopping:time.sleep(.02)
 finally:
     record('stop')
@@ -71,7 +75,7 @@ def check(binary):
         (root / 'identity-private').write_bytes(b'synthetic persistent identity must remain untouched')
         initial_identity=(root / 'identity-private').read_bytes()
         (root/'scenario').write_text('no-live')
-        def ctl(**command):
+        def ctl(_ok=True, **command):
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
                 s.settimeout(12)
                 s.connect(str(root / 'control.sock'))
@@ -80,7 +84,7 @@ def check(binary):
                 while not data.endswith(b'\n'):
                     data += s.recv(32768)
             result=json.loads(data)
-            assert result.get('ok'), 'manager control command failed: '+command['op']
+            assert bool(result.get('ok'))==_ok, 'unexpected manager control result: '+command['op']
             return result
         def until(predicate, timeout=12):
             deadline=time.monotonic()+timeout
@@ -157,12 +161,79 @@ def check(binary):
             removed=[e for e in events() if e['event']=='remove'];assert len(removed)==2
             assert all(e['args'][-1]==cp['address'] for e in removed)
             assert not any(e['event']=='overlap' for e in events()), 'wireless backend overlap'
+            # Manual policy preserves the current session, then waits for a user
+            # after disconnect/resume and across a manager restart.
+            stable=until(lambda s:s['active'] and not s['pairing'])
+            ctl(op='policy',mode='manual')
+            assert ctl(op='status')['status']['backend_pid']==stable['backend_pid']
+            ctl(op='disconnect');ctl(op='resume')
+            time.sleep(2.3)
+            assert ctl(op='status')['status']['backend_pid'] is None, 'manual policy automatically selected a phone'
+            (root/'scenario').write_text('')
+            ctl(op='connect',protocol='hicar',address=hc['address'])
+            until(lambda s:s['protocol']=='hicar' and s['active'])
+            ctl(op='shutdown');assert p.wait(timeout=12)==0;p=None
+            p=subprocess.Popen([*runner,binary,'manager','run','--config',str(root/'config.json')],stdout=log,stderr=log)
+            until(lambda s:s['carlife_pid'] is not None)
+            time.sleep(2.3)
+            assert ctl(op='status')['status']['backend_pid'] is None, 'manual policy was lost at restart'
+            # A missing favorite never falls back to another registered phone.
+            (root/'scenario').write_text('offline')
+            ctl(op='policy',mode='favorite',protocol='carplay',address=cp['address'])
+            marker=len(events())
+            ctl(op='resume')
+            until(lambda s:s['protocol']=='carplay' and s['backend_pid'] is not None)
+            time.sleep(5)
+            attempts=[e for e in events()[marker:] if e['event']=='start' and e['role']!='carlife']
+            assert attempts and all(e['role']=='carplay' for e in attempts), 'favorite policy fell back to another phone'
+            (root/'scenario').write_text('')
+            ctl(op='connect',protocol='hicar',address=hc['address'])
+            chosen=until(lambda s:s['protocol']=='hicar' and s['active'])
+            time.sleep(2.3)
+            assert ctl(op='status')['status']['backend_pid']==chosen['backend_pid'], 'favorite stole the explicitly selected session'
+            # Unknown HiCar pairing creates a pending record only after a valid
+            # selected transport; stable delivered media is the persistence gate.
+            (root/'scenario').write_text('pair-hicar')
+            ctl(op='pair',protocol='hicar')
+            selected=until(lambda s:s['protocol']=='hicar' and s['active'] and s['target'] and s['target']['address']=='02:00:00:00:00:03')
+            assert selected['pairing']
+            assert not any(d['address']=='02:00:00:00:00:03' for d in ctl(op='devices')['devices']), 'pending target persisted before stable media'
+            paired=until(lambda s:s['active'] and not s['pairing'])
+            assert paired['target']['address']=='02:00:00:00:00:03', 'later candidate stole the pairing target'
+            store=json.loads((root/'devices.json').read_text())
+            assert store['last']['address']=='02:00:00:00:00:03'
+            assert len(store['devices'])==3 and any(d['protocol']=='hicar' and d['address']=='02:00:00:00:00:03' for d in store['devices'])
+            latest=next(e for e in reversed(events()) if e['event']=='start' and e['role']=='hicar')
+            assert '--pair' in latest['args'] and '--peer' not in latest['args']
+            before=len([e for e in events() if e['event']=='remove'])
+            ctl(_ok=False,op='forget',protocol='hicar',address='02:00:00:00:00:03')
+            assert len([e for e in events() if e['event']=='remove'])==before
+            ctl(op='forget',protocol='hicar',address='02:00:00:00:00:03',confirm=True)
+            removed=[e for e in events() if e['event']=='remove']
+            assert len(removed)==before+1 and removed[-1]['args']==['--timeout','5','remove','02:00:00:00:00:03']
+            remaining=ctl(op='devices')['devices']
+            assert {d['address'] for d in remaining}=={cp['address'],hc['address']}
+            # The initial config is a first-run seed, never a way to resurrect a
+            # device explicitly forgotten in the persistent store.
+            ctl(op='forget',protocol='carplay',address=cp['address'],confirm=True)
+            ctl(op='shutdown');assert p.wait(timeout=12)==0;p=None
+            p=subprocess.Popen([*runner,binary,'manager','run','--config',str(root/'config.json')],stdout=log,stderr=log)
+            until(lambda s:s['carlife_pid'] is not None)
+            remaining=ctl(op='devices')['devices']
+            assert len(remaining)==1 and remaining[0]['address']==hc['address'], 'forgotten config seed reappeared'
+            assert (root/'identity-private').read_bytes()==initial_identity
             ctl(op='shutdown');assert p.wait(timeout=12)==0;p=None
             starts=[e for e in events() if e['event']=='start' and e['role']=='carplay']
             assert any('--pair' in e['args'] and '--iphone' in e['args'] for e in starts)
             print(json.dumps(dict(connection_manager='passed',switches=7,usb_pid_preserved=True,
                 independent_usb_recovery=True,radio_overlap=False,offline_pairing_retained=True,
-                authentication_and_repeated_refusal_repaired=True,target_only=True,identity_unchanged=True)))
+                authentication_and_repeated_refusal_repaired=True,target_only=True,identity_unchanged=True,
+                manual_and_favorite_policy=True,hicar_enrollment_stability_gate=True,forget_confirmation_and_persistence=True)))
+        except BaseException:
+            log.flush()
+            print((root/'manager.log').read_text(encoding='utf-8',errors='replace')[-8000:],file=sys.stderr)
+            print(json.dumps(events()[-24:]),file=sys.stderr)
+            raise
         finally:
             if p and p.poll() is None:
                 p.terminate()
