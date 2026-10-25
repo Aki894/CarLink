@@ -41,7 +41,17 @@ try:
             for address in ['not-a-bluetooth-address','02:00:00:00:00:03','02:00:00:00:00:04']:
                 print(json.dumps(dict(event='target_selected',address=address)),flush=True)
         print(json.dumps(dict(event='bridge_stats',active=True,connected=scenario!='no-hu',video_frames=20)),flush=True)
-    while not stopping:time.sleep(.02)
+    usb_ready=False
+    while not stopping:
+        if role=='carlife':
+            current=(root/'scenario').read_text() if (root/'scenario').exists() else ''
+            ready=current not in ('no-live','no-hu')
+            if ready!=usb_ready:
+                event=(dict(event='carlife_state',detail='AwaitingVideoSource') if ready
+                       else dict(event='session_error',detail='fixture output disconnected'))
+                print(json.dumps(event),flush=True)
+                usb_ready=ready
+        time.sleep(.02)
 finally:
     record('stop')
     if listener:listener.close();(root/'live.sock').unlink(missing_ok=True)
@@ -103,18 +113,39 @@ def check(binary):
             p=subprocess.Popen([*runner,binary,'manager','run','--config',str(root/'config.json')],stdout=log,stderr=log)
             s=until(lambda s:s['protocol']=='carplay' and s['active'])
             assert not (root/'live.sock').exists(), 'fixture did not exercise pre-USB discovery'
+            # WirelessActive and forward.sent can describe data accepted by a
+            # mux before the HU exists. They must not commit successful use yet.
+            first_life=s['carlife_pid'];first_backend=s['backend_pid']
+            time.sleep(1.3)
+            before_usb=ctl(op='status')['status']
+            assert before_usb['active'] and not before_usb['usb_connected']
+            assert before_usb['backend_pid']==first_backend and before_usb['target']['last_used']==0
+            store=json.loads((root/'devices.json').read_text())
+            assert all(d['last_used']==0 for d in store['devices']) and store['last']['last_used']==0, 'pre-USB source updated successful-use history'
+            log.flush()
+            assert 'manager_stable_session' not in (root/'manager.log').read_text(), 'pre-USB source committed a stable session'
             (root/'scenario').write_text('')
-            first_life=s['carlife_pid']
+            after_usb=until(lambda s:s['usb_connected'] and s['active'] and s['target']['last_used']>0)
+            assert after_usb['carlife_pid']==first_life and after_usb['backend_pid']==first_backend, 'HU arrival restarted an existing process'
+            log.flush()
+            stable_before_hu_loss=(root/'manager.log').read_text().count('manager_stable_session')
+            assert stable_before_hu_loss==1, 'HU arrival did not commit exactly one stable session'
             duplicate=dict(config,socket=str(root/'second/control.sock'),live_socket=str(root/'second/live.sock'),state=str(root/'second/state.json'))
             (root/'duplicate.json').write_text(json.dumps(duplicate));(root/'duplicate.json').chmod(0o600)
             other=subprocess.run([*runner,binary,'manager','run','--config',str(root/'duplicate.json')],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
             assert other.returncode!=0, 'second runtime acquired the same radio'
             (root/'scenario').write_text('no-hu')
+            until(lambda s:not s['usb_connected'])
             ctl(op='connect',protocol='hicar',address=hc['address'])
             no_hu=until(lambda s:s['protocol']=='hicar' and s['active'])
             time.sleep(2.5)
-            assert ctl(op='status')['status']['backend_pid']==no_hu['backend_pid'], 'missing HU stole the wireless source'
+            no_hu_now=ctl(op='status')['status']
+            assert no_hu_now['backend_pid']==no_hu['backend_pid'], 'missing HU stole the wireless source'
+            assert not no_hu_now['usb_connected'] and no_hu_now['target']['last_used']==0
+            log.flush()
+            assert (root/'manager.log').read_text().count('manager_stable_session')==stable_before_hu_loss, 'missing HU committed a new successful source'
             (root/'scenario').write_text('')
+            until(lambda s:s['usb_connected'])
             for _ in range(3):
                 for protocol,device in [('hicar',hc),('carplay',cp)]:
                     ctl(op='connect',protocol=protocol,address=device['address'])
@@ -259,7 +290,7 @@ def check(binary):
             starts=[e for e in events() if e['event']=='start' and e['role']=='carplay']
             assert any('--pair' in e['args'] and '--iphone' in e['args'] for e in starts)
             print(json.dumps(dict(connection_manager='passed',switches=7,usb_pid_preserved=True,
-                independent_usb_recovery=True,radio_overlap=False,offline_pairing_retained=True,
+                independent_usb_recovery=True,pre_usb_success_not_committed=True,radio_overlap=False,offline_pairing_retained=True,
                 authentication_and_repeated_refusal_repaired=True,target_only=True,identity_unchanged=True,
                 manual_and_favorite_policy=True,current_auto_record_respected=True,hicar_enrollment_stability_gate=True,user_preferences_survive_repair_and_stability=True,forget_confirmation_and_persistence=True)))
         except BaseException:

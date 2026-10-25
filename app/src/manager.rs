@@ -290,6 +290,10 @@ impl Owner{
             _=>{self.menu_pending=None;self.menu_focus=0;let close=action["op"]=="connect";self.command(action)?;if close{self.status.menu_visible=false;self.menu_idle=false;}}
         }}Ok(())
     }
+    fn can_commit(&self)->bool{
+        !self.committed&&self.status.active&&self.status.usb_connected&&self.seen_media
+            &&self.ready.is_some_and(|t|t.elapsed()>=Duration::from_secs(self.config.stable_seconds))
+    }
     fn record_stable_target(&mut self)->Result<()>{
         if let Some(mut d)=self.status.target.clone(){
             if let Some(current)=self.store.devices.iter().find(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address)){d.name=current.name.clone();d.auto=current.auto;}
@@ -322,7 +326,7 @@ impl Owner{
         if self.backend.as_mut().is_some_and(|p|p.child.try_wait().ok().flatten().is_some()){
             self.stop_backend()?;self.retry_at=Instant::now()+Duration::from_secs(2);event("manager_backend_exited");
         }
-        if !self.committed&&self.seen_media&&self.ready.is_some_and(|t|t.elapsed()>=Duration::from_secs(self.config.stable_seconds)){
+        if self.can_commit(){
             self.record_stable_target()?;
             if self.status.pairing&&self.status.protocol==Some(Protocol::Carplay){
                 self.bluetooth(&["--timeout","3","discoverable","off"])?;
@@ -435,6 +439,20 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
     #[test]fn stopping_a_session_revokes_its_pending_menu_confirmation(){
         let root=test_root("menu-confirm");let mut owner=test_owner(&root);owner.menu_pending=Some(json!({"op":"pair","protocol":"hicar"}));owner.menu_focus=1;
         owner.stop_backend().unwrap();assert!(owner.menu_pending.is_none());assert_eq!(owner.menu_focus,0);fs::remove_dir(root).unwrap();
+    }
+    #[test]fn stable_source_is_remembered_only_with_a_connected_head_unit(){
+        let root=test_root("head-unit-gate");let mut owner=test_owner(&root);
+        let device=Device{protocol:Protocol::Hicar,address:"02:00:00:00:00:02".into(),name:"test phone".into(),auto:true,last_used:0};
+        owner.status.target=Some(device.clone());owner.store.devices.push(device);
+        owner.status.active=true;owner.seen_media=true;owner.ready=Some(Instant::now()-Duration::from_secs(owner.config.stable_seconds+1));
+        assert!(!owner.status.usb_connected);assert!(!owner.can_commit());
+        assert!(owner.status.active);assert!(owner.store.last.is_none());assert!(!root.join("state").exists());
+        // AwaitingVideoSource confirms the CarLife head-unit handshake, not
+        // merely a backend's successful write into the resident source mux.
+        owner.status.usb_connected=true;assert!(owner.can_commit());owner.record_stable_target().unwrap();owner.committed=true;
+        assert!(owner.store.last.is_some());assert!(root.join("state").exists());assert!(!owner.can_commit());
+        owner.committed=false;owner.status.usb_connected=false;assert!(!owner.can_commit());assert!(owner.status.active);
+        fs::remove_file(root.join("state")).unwrap();fs::remove_dir(root).unwrap();
     }
     #[test]fn ordinary_offline_does_not_erase_pairing(){for s in ["Host is down","Connection timed out","No route to host","AirPlay session ended"]{assert!(!auth_mismatch(s));}assert!(auth_mismatch("org.bluez.Error.AuthenticationFailed"));}
     #[test]fn stale_generation_cannot_steal_active_backend(){
