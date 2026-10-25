@@ -173,7 +173,12 @@ pub fn differential(v:&Value)->Result<Value>{
                         "metadata":{"operation":3,"message":inner.get("message").and_then(Value::as_u64),"backend":"hichain","native_code":code,
                         "replies":if replies.is_empty(){0}else{1},"results":session.results(),"key_ready":resource.authenticated}}))
                 },
-                "auth-close"=>{if command["generation"].as_u64()==Some(business.generation as u64){sight=None;business.close(&mut resource);auth_open=false;peer_seen=false;}Ok(value!({}))},
+                "auth-close"=>{if command["generation"].as_u64()==Some(business.generation as u64){
+                    // RFCOMM authentication can finish while the established
+                    // TCP media session is still alive. Its owned cipher key
+                    // lasts until HiSight closes or a new auth generation.
+                    business.close(&mut resource);auth_open=false;peer_seen=false;
+                }Ok(value!({}))},
                 "hisight-open"=>{
                     if !auth_open||!resource.authenticated||number(&command,"generation")?!=business.generation{return Err("unauthenticated or stale HiSight session".into());}
                     if sight.is_some(){return Err("HiSight session already active".into());}
@@ -195,7 +200,7 @@ pub fn differential(v:&Value)->Result<Value>{
             }})();
             match result{Ok(mut v)=>{v["ok"]=true.into();send(&mut socket,&v)?;if op=="close"{break;}},Err(error)=>{
                 // Protocol errors revoke authorization before any later network command.
-                if op=="auth"&&command["generation"].as_u64()==Some(business.generation as u64){sight=None;business.close(&mut resource);auth_open=false;peer_seen=false;}
+                if op=="auth"&&auth_open&&command["generation"].as_u64()==Some(business.generation as u64){sight=None;business.close(&mut resource);auth_open=false;peer_seen=false;}
                 if op.starts_with("hisight-")&&sight.as_ref().is_some_and(|(n,_)|command["session"].as_u64()==Some(*n as u64)){sight=None;}
                 send(&mut socket,&value!({"ok":false,"error":error}))?;
             }}

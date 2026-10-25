@@ -181,14 +181,35 @@ def authentication(binary, library, rust_library):
                 else:
                     raise AssertionError('stale authentication generation accepted')
                 assert offer.credentials() in n.respond(client_mac)
-                # Repeated identity is rejected and revokes resource authorization.
-                try:
-                    auth.receive(envelope(1, dict(deviceId=client_id)))
-                except AuthError:
-                    pass
+                if phase == 'bind':
+                    # Explicit authentication failure revokes the media key.
+                    try:
+                        auth.receive(envelope(1, dict(deviceId=client_id)))
+                    except AuthError:
+                        pass
+                    else:
+                        raise AssertionError('repeated identity accepted')
+                    assert auth.session_key is None
                 else:
-                    raise AssertionError('repeated identity accepted')
-                assert auth.session_key is None
+                    # Finishing RFCOMM is a transport handoff, not revocation
+                    # of already established TCP media. A stale auth command
+                    # after close must not tear down that media either.
+                    peer_cipher = Cipher(auth.session_key, 65001)
+                    try:
+                        auth.close()
+                        try:
+                            w.call(dict(op='auth', generation=auth.generation, envelope='{}'))
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError('closed auth generation accepted')
+                        encrypted = peer_cipher.encrypt(message('GET_PARAMETER * RTSP/1.0', 9, b'his_version\r\n'))
+                        sight.receive(len(encrypted).to_bytes(4, 'big') + encrypted)
+                        assert b'his_version: 1.0' in peer_cipher.decrypt(sight.pending[-1][4:])
+                    finally:
+                        peer_cipher.close()
+                    replacement = RustAuth(w)
+                    replacement.close()
                 try:
                     sight.receive(b'')
                 except ValueError:
@@ -199,7 +220,8 @@ def authentication(binary, library, rust_library):
                 assert n.respond(client_mac) is None
                 auth.close()
                 n.close()
-                results.append(dict(phase=phase, keys_match=True, stale_auth_revoked=True))
+                results.append(dict(phase=phase, keys_match=True, stale_auth_revoked=True,
+                    media_survives_completed_auth_channel=phase == 'auth'))
                 assert identity.read_bytes() == original
             finally:
                 if auth:
