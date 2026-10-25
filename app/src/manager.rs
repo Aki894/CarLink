@@ -179,6 +179,7 @@ impl Owner{
     }
     fn select(&mut self,choice:Choice)->Result<()>{
         if choice.protocol==Protocol::Hicar&&((choice.device.is_none()&&!choice.pairing)||self.config.hicar.is_empty()){return Err("HiCar requires a selected target or explicit pairing window and configured backend".into());}
+        self.status.active=false;self.show_recovery_menu();
         self.stop_backend()?;self.status.generation=self.status.generation.checked_add(1).ok_or("generation exhausted")?;
         let mut args=if choice.protocol==Protocol::Carplay{self.config.carplay.clone()}else{self.config.hicar.clone()};
         if choice.pairing {args.extend(["--pair".into(),self.config.pair_seconds.to_string()]);}
@@ -213,7 +214,7 @@ impl Owner{
             if Instant::now()>=until{let _=child.kill();let _=child.wait();break false;}thread::sleep(Duration::from_millis(20));};
         if !success{return Err("Bluetooth control failed".into());}Ok(())
     }
-    fn show_recovery_menu(&mut self){let explicit=self.status.menu_visible&&!self.menu_idle;self.status.menu_visible=true;self.menu_idle=!explicit;self.menu_pending=None;self.menu_focus=0;}
+    fn show_recovery_menu(&mut self){let explicit=self.status.menu_visible&&!self.menu_idle;self.status.menu_visible=true;self.menu_idle=!explicit;self.menu_pending=None;self.menu_focus=0;if let Some(mux)=&self.mux{let (rows,_)=self.menu_model();let _=mux.set_menu(rows,0,true);}}
     fn source_lost(&mut self){self.status.active=false;self.ready=None;self.seen_media=false;self.show_recovery_menu();self.started=Instant::now()-Duration::from_secs(self.config.connect_seconds.saturating_sub(8));}
     fn mark_active(&mut self)->Result<()>{
         if self.wireless_ready&&(self.mux.is_none()||self.source_ready){
@@ -373,6 +374,7 @@ impl Owner{
         if let Some(p)=self.backend.as_mut(){let generation=p.generation;let events=p.events.try_iter().take(64).collect::<Vec<_>>();
             for e in events{self.ingest(generation,e)?;}}
         if self.backend.as_mut().is_some_and(|p|p.child.try_wait().ok().flatten().is_some()){
+            self.source_lost();
             if let Some(d)=&self.status.target{if !self.tried.contains(&d.address){self.tried.push_back(d.address.clone());}}
             self.stop_backend()?;self.retry_at=Instant::now()+Duration::from_secs(2);event("manager_backend_exited");
         }
