@@ -130,6 +130,11 @@ pub fn differential(v:&Value)->Result<Value>{
     pub fn run(fd:i32)->Result<()>{
         if fd<3{return Err("session worker requires a private socket fd".into());}
         let mut socket=unsafe{UnixStream::from_raw_fd(fd)};socket.peer_addr().map_err(|_|"IPC fd is not a connected Unix socket")?;
+        // The adapter owns graceful RTSP teardown. Group SIGTERM must reach the
+        // adapter first while this private worker still services its IPC. EOF
+        // from a dead parent exits the loop; the owner can still SIGKILL a
+        // stalled native call after its bounded shutdown deadline.
+        unsafe{libc::signal(libc::SIGTERM,libc::SIG_IGN);}
         let config=read(&mut socket)?.ok_or("missing private worker configuration")?;
         let identity=Identity::load(Path::new(text(&config,"identity")?))?;let crypto=Crypto::load()?;
         let model=text(&config,"model")?;let own=identity.wire_id(model,text(&config,"address")?,&crypto)?;

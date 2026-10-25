@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import random
+import signal
 import socket
 import struct
 import subprocess
@@ -166,6 +167,9 @@ def authentication(binary, library, rust_library):
                 announce = message('ANNOUNCE * RTSP/1.0', 1, b'encrypt_list=aes128ctr')
                 sight.receive(len(announce).to_bytes(4, 'big') + announce)
                 assert sight.encrypted
+                # The owner gets a group stop signal before requesting RTSP
+                # teardown. Its child must remain available until private EOF.
+                w.process.send_signal(signal.SIGTERM)
                 peer_cipher = Cipher(auth.session_key, 65001)
                 try:
                     encrypted = peer_cipher.encrypt(message('GET_PARAMETER * RTSP/1.0', 2, b'his_version\r\n'))
