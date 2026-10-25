@@ -261,8 +261,8 @@ fn touch_row(x:f64,y:f64,focus:usize,count:usize)->Option<usize>{
         p.discard_media();assert_eq!(p.output.len(),1);assert_eq!(p.output.front().unwrap().offset,3);
     }
     #[test]fn full_output_accept_queue_never_blocks_connect(){
-        let path=std::env::temp_dir().join(format!("carlink-menu-full-{}",std::process::id()));let server=UnixListener::bind(&path).unwrap();let start=Instant::now();let mut held=vec![];let mut full=false;
-        for _ in 0..1024{match connect_output(&path){Ok(s)=>held.push(s),Err(_)=>{full=true;break;}}}
+        let path=std::env::temp_dir().join(format!("carlink-menu-full-{}",std::process::id()));let server=UnixListener::bind(&path).unwrap();assert_eq!(unsafe{libc::listen(server.as_raw_fd(),1)},0);let start=Instant::now();let mut held=vec![];let mut full=false;
+        for _ in 0..8{match connect_output(&path){Ok(s)=>held.push(s),Err(_)=>{full=true;break;}}}
         assert!(full);assert!(start.elapsed()<Duration::from_secs(2));drop(held);drop(server);fs::remove_file(path).unwrap();
     }
     fn recv(s:&mut UnixStream)->Frame {let mut h=[0u8;4];s.read_exact(&mut h).unwrap();let n=u32::from_le_bytes(h)as usize;assert!((12..=MAX_FRAME).contains(&n));let mut b=vec![0;n];s.read_exact(&mut b).unwrap();Frame{kind:b[0],flags:b[1],pts:u64::from_le_bytes(b[4..12].try_into().unwrap()),payload:b[12..].to_vec()}}
@@ -272,19 +272,19 @@ fn touch_row(x:f64,y:f64,focus:usize,count:usize)->Option<usize>{
         let root=std::env::temp_dir().join(format!("carlink-menu-ci-{}",std::process::id()));fs::create_dir(&root).unwrap();
         let source=root.join("source");let live=root.join("live");
         let mux=Mux::start(&source,&live,Path::new(&lib),Path::new(&font)).unwrap();
-        mux.set_menu(vec!["杩炴帴 iPhone".into(),"杩炴帴鍗庝负".into()],1,true).unwrap();
+        mux.set_menu(vec!["\u{8fde}\u{63a5} iPhone".into(),"\u{8fde}\u{63a5}\u{534e}\u{4e3a}".into()],1,true).unwrap();
         // Discovery/input socket exists before HU; the late HU can recover.
         let server=UnixListener::bind(&live).unwrap();let(mut hu,_)=server.accept().unwrap();hu.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let menu=until(&mut hu,2);assert_eq!(menu.flags&1,1);assert!(menu.payload.len()>200);
         // Local menu works while no phone has connected at all.
         for down in [true,false]{hu.write_all(&feedback(json!({"type":"touch","contacts":[{"id":0,"x":0.5,"y":0.2,"down":down}]})).wire()).unwrap();}
-        let deadline=Instant::now()+Duration::from_secs(3);loop{if let Some(v)=mux.try_input(){assert_eq!(v["type"],"menu-select");assert_eq!(v["index"],0);assert_eq!(v["menu_rows"],json!(["连接 iPhone","连接华为"]));break;}assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(10));}
+        let deadline=Instant::now()+Duration::from_secs(3);loop{if let Some(v)=mux.try_input(){assert_eq!(v["type"],"menu-select");assert_eq!(v["index"],0);assert_eq!(v["menu_rows"],json!(["\u{8fde}\u{63a5} iPhone","\u{8fde}\u{63a5}\u{534e}\u{4e3a}"]));break;}assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(10));}
         let mut upstream=UnixStream::connect(&source).unwrap();upstream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         upstream.write_all(&configure().wire()).unwrap();upstream.write_all(&Frame::new(4,1,vec![]).wire()).unwrap();
         upstream.write_all(&Frame::new(3,0,vec![7;256]).wire()).unwrap();assert_eq!(until(&mut hu,3).payload,vec![7;256]);
         hu.write_all(&feedback(json!({"type":"key-press","code":6})).wire()).unwrap();
-        let input_deadline=Instant::now()+Duration::from_secs(3);let input=loop{if let Some(v)=mux.try_input(){break v;}assert!(Instant::now()<input_deadline);thread::sleep(Duration::from_millis(10));};assert_eq!(input["code"],6);assert_eq!(input["menu_rows"],json!(["连接 iPhone","连接华为"]));
-        mux.set_menu(vec!["杩炴帴 iPhone".into()],0,false).unwrap();thread::sleep(Duration::from_millis(100));
+        let input_deadline=Instant::now()+Duration::from_secs(3);let input=loop{if let Some(v)=mux.try_input(){break v;}assert!(Instant::now()<input_deadline);thread::sleep(Duration::from_millis(10));};assert_eq!(input["code"],6);assert_eq!(input["menu_rows"],json!(["\u{8fde}\u{63a5} iPhone","\u{8fde}\u{63a5}\u{534e}\u{4e3a}"]));
+        mux.set_menu(vec!["\u{8fde}\u{63a5} iPhone".into()],0,false).unwrap();thread::sleep(Duration::from_millis(100));
         let key=vec![0,0,0,1,0x65,0xff,0xab,0xcd];upstream.write_all(&Frame::new(2,1,key.clone()).wire()).unwrap();
         let deadline=Instant::now()+Duration::from_secs(5);loop{let f=recv(&mut hu);if f.kind==2 && f.payload==key{break;}assert!(Instant::now()<deadline);}
         hu.write_all(&feedback(json!({"type":"touch","contacts":[{"id":0,"x":0.5,"y":0.4,"down":true}]})).wire()).unwrap();
