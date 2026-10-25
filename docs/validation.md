@@ -1,5 +1,18 @@
 # 验证与部署记录
 
+## 2026-10-25：R3 断线恢复、开机重连与三连返回键
+
+已部署源码 `4d2892037a4b4319784773a487ab5b16bdd71101`，应用 SHA256 为 `5becf8f8a23f4aa93c85d7eddd6d9ed169783ce8743c2e108920f7d210cf7f6f`。板上版本目录 `/opt/carlink/releases/r3-4d28920`，对应回滚目录 `/var/lib/carlink/manager/rollback-r3-4d28920`；MFi、HiCar 身份文件校验保持一致。
+
+- [应用与接收端构建 40192610690](https://github.com/Aki894/CarLink/actions/runs/40192610690)成功，两个产物的 GitHub ZIP 摘要和文件清单均校验通过。
+- [完整固件构建 40193164958](https://github.com/Aki894/CarLink/actions/runs/40193164958)的 native、rust-interop、firmware 全部成功，镜像结构检查与上传完成。下载后再次校验 ZIP 和镜像清单：`CarLink-refresh-39459953269-4d289203.img.xz` SHA256 `531ede4205c340002fadc9f93245ca25e58fe7143c24a5d7384e31011a81858f`。本轮通过 SSH 热部署应用，保留原有系统。
+- H3 运行当前 `test-manager.py` 和 `test-manager-menu-control.py` 均通过：开机偏好与暂停清除、九次协议切换、三连返回、断线回菜单、自动尝试另一协议、CarLife PID 保持及无线后端无重叠。菜单 PCM 合成测试最大间隔 29.8 ms。
+- 实际华为 CarLife 端已显示新菜单和 HiCar 桌面。向 HiCar 后端注入 SIGTERM 后，菜单恢复，随后自动接上现场 iPhone；CarLife PID 保持 `3714`。
+- 整机重启前明确设为暂停，重启后 `paused=false`，先尝试已保存的 CarPlay，再轮询 HiCar。系统启动耗时 22.816 秒。华为本轮出现连接确认，经确认后恢复 HiCar 画面及 USB 输出；手机无确认的冷启动重连还需继续观察。
+- 同一华为同时承担 HiCar 手机端和 CarLife 车机端时，本轮切到系统 HiCar 设置再返回后，出现 `USB bulk write: Cannot send after transport endpoint shutdown (os error 108)`，管理器持续重建 CarLife 输出。完全停止并重新打开华为 CarLife App 后，循环停止；HiCar 后端 PID `5500` 保持，CarLife PID `6762` 持续超过两分钟且 `usb_connected=true`。保留此复现条件继续观察测试 App 的旧 USB 会话恢复。
+
+投屏期间连续按三次返回键打开菜单，相邻按键间隔不超过 350 ms；普通返回因此最多延后 350 ms。Lexus 实体触控板的原始返回键消息待实车验证。H3 测试、下载回执、镜像校验记录保存在私有 `.build/hicar-research/r3-recovery-final/` 和 `r3-recovery-firmware-final/`。
+
 状态截至 2026-10-25。这里汇总已完成的检查，日常运行见[运行说明](live-forwarding.md)。
 
 下表保留正式部署的 CarPlay/CarLife 基线。最新 HiCar 实验已接入 CarLife 视频、AAC/PCM 和 UIBC，79 项测试通过；[完整构建 40105347479](https://github.com/Aki894/CarLink/actions/runs/40105347479)成功，镜像已下载并校验 ZIP 与压缩镜像清单。实测和产物摘要见 [HiCar 构建与实测](hicar.md)。下一阶段按 [Rust 迁移计划](hicar-rust.md)推进；HiCar 当前仍手动实验运行。
