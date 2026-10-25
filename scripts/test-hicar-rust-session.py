@@ -84,7 +84,9 @@ def transcript(binary):
 
 
 def authentication(binary, library, rust_library):
-    from rust_session import Worker, AuthSession as RustAuth, Negotiator as RustNegotiator
+    from rust_session import Worker, AuthSession as RustAuth, Negotiator as RustNegotiator, HiSightSession
+    from hisight import message
+    from cipher import Cipher
     from identity import Identity
     from auth_wire import JsonStream, AuthError
     offer = Offer('CarLink', '02:00:00:00:00:01', 'synthetic-password')
@@ -115,6 +117,12 @@ def authentication(binary, library, rust_library):
                 client_mac = Frame(33, 0, b'', pack_tlv(2, b'02:00:00:00:00:02'))
                 assert n.respond(network) is None and n.respond(client_mac) is None
                 auth = RustAuth(w)
+                try:
+                    HiSightSession(w, auth.generation)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError('HiSight opened before authentication')
                 envelope = lambda op, data: (dict(version='14.2.0.400', oper_type=op, synctime=0,
                     trace_id='synthetic', data=json.dumps(data)) if phase == 'auth' else
                     dict(version='A_0', discover_type=1, oper_type=op, usb_connection=False, data=json.dumps(data)))
@@ -143,6 +151,28 @@ def authentication(binary, library, rust_library):
                 assert len(auth.session_key) == (32 if phase == 'bind' else 16)
                 assert n.respond(network) is not None
                 assert offer.credentials() in n.respond(client_mac)
+                sight = HiSightSession(w, auth.generation)
+                initial = sight.initial()
+                assert initial[4:].startswith(b'ANNOUNCE * RTSP/1.0')
+                old_token = sight.session
+                sight.close()
+                sight = HiSightSession(w, auth.generation)
+                try:
+                    w.call(dict(op='hisight-close', session=old_token))
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError('stale HiSight cleanup accepted')
+                announce = message('ANNOUNCE * RTSP/1.0', 1, b'encrypt_list=aes128ctr')
+                sight.receive(len(announce).to_bytes(4, 'big') + announce)
+                assert sight.encrypted
+                peer_cipher = Cipher(auth.session_key, 65001)
+                try:
+                    encrypted = peer_cipher.encrypt(message('GET_PARAMETER * RTSP/1.0', 2, b'his_version\r\n'))
+                    sight.receive(len(encrypted).to_bytes(4, 'big') + encrypted)
+                    assert b'his_version: 1.0' in peer_cipher.decrypt(sight.pending[-1][4:])
+                finally:
+                    peer_cipher.close()
                 # A stale command must not revoke a newer active authentication.
                 try:
                     w.call(dict(op='auth', generation=auth.generation + 1, envelope='{}'))
@@ -159,6 +189,13 @@ def authentication(binary, library, rust_library):
                 else:
                     raise AssertionError('repeated identity accepted')
                 assert auth.session_key is None
+                try:
+                    sight.receive(b'')
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError('revoked HiSight generation still active')
+                sight.close()
                 assert n.respond(client_mac) is None
                 auth.close()
                 n.close()

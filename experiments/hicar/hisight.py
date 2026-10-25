@@ -65,6 +65,9 @@ class Session:
         return self.pack(message('ANNOUNCE * RTSP/1.0', 1,
             b'encrypt_description: encrypt_list=aes128ctr;version=1\r\n'), plain=True)
 
+    def close(self):
+        self.cipher.close()
+
     def receive(self, data):
         self.buffer.extend(data)
         events, plaintexts = [], []
@@ -172,11 +175,11 @@ class Session:
 
 async def graceful_close(sock, session, log, timeout=1.0):
     """Finish RTSP while the authenticated transport and media are still alive."""
-    record = session.teardown()
-    if record is None:
-        return
     loop = asyncio.get_running_loop()
     try:
+        record = session.teardown()
+        if record is None:
+            return
         async with asyncio.timeout(timeout):
             await loop.sock_sendall(sock, record)
             log('hisight_teardown_sent')
@@ -192,12 +195,18 @@ async def graceful_close(sock, session, log, timeout=1.0):
                 session.pending.clear()
             log('hisight_teardown_done', acknowledged=session.teardown_acknowledged,
                 peer_teardown=session.peer_teardown)
-    except (OSError, ProtocolError, UnicodeError, ValueError, asyncio.TimeoutError) as error:
+    except (OSError, ProtocolError, UnicodeError, ValueError, RuntimeError, asyncio.TimeoutError) as error:
         log('hisight_teardown_stopped', error=type(error).__name__)
 
 
-async def receive(sock, key, capture_dir, log, sink=None, continuous=False):
-    session = Session(key)
+async def receive(sock, key, capture_dir, log, sink=None, continuous=False,
+                  rust_worker=None, auth_generation=None):
+    if rust_worker:
+        from rust_session import HiSightSession
+        session = HiSightSession(rust_worker, auth_generation)
+        log('rust_hisight_ready')
+    else:
+        session = Session(key)
     raw = plain = None
     loop = asyncio.get_running_loop()
     total = 0
@@ -271,7 +280,7 @@ async def receive(sock, key, capture_dir, log, sink=None, continuous=False):
                 await asyncio.wait_for(input_writer.wait_closed(), 1)
             except (OSError, asyncio.TimeoutError):
                 pass
-        session.cipher.close()
+        session.close()
         for stream in (raw, plain):
             if stream:
                 stream.close()

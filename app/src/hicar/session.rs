@@ -139,6 +139,7 @@ pub fn differential(v:&Value)->Result<Value>{
         let mut resource=Resource::new(Offer::parse(&config["offer"])?);resource.data_port=Some(resource.offer.port+1);
         let mut channels:BTreeMap<u32,Negotiator>=BTreeMap::new();let mut next=0u32;
         let mut business=Business{native:None,generation:0};let mut auth_open=false;let mut peer_seen=false;
+        let mut sight:Option<(u32,super::super::hisight::Session)>=None;let mut next_sight=0u32;
         send(&mut socket,&value!({"ok":true,"ready":true,"wire_identity_sha256":hex(&crypto.sha256(own.as_bytes())?)}))?;
         while let Some(command)=read(&mut socket)?{
             let op=text(&command,"op")?;let result:Result<Value>=(||{match op {
@@ -150,7 +151,7 @@ pub fn differential(v:&Value)->Result<Value>{
                         "pending":resource.pending().iter().map(|(k,v)|value!([k,hex(v)])).collect::<Vec<_>>(),"credentials_sent":resource.credentials_sent}))},
                 "close-channel"=>{channels.remove(&number(&command,"channel")?);Ok(value!({}))},
                 "auth-open"=>{if auth_open{return Err("business authentication already active".into());}
-                    business.generation=business.generation.checked_add(1).ok_or("auth generation exhausted")?;business.close(&mut resource);peer_seen=false;auth_open=true;
+                    business.generation=business.generation.checked_add(1).ok_or("auth generation exhausted")?;sight=None;business.close(&mut resource);peer_seen=false;auth_open=true;
                     Ok(value!({"generation":business.generation}))},
                 "auth"=>{
                     if !auth_open||number(&command,"generation")?!=business.generation{return Err("stale authentication session".into());}
@@ -172,12 +173,30 @@ pub fn differential(v:&Value)->Result<Value>{
                         "metadata":{"operation":3,"message":inner.get("message").and_then(Value::as_u64),"backend":"hichain","native_code":code,
                         "replies":if replies.is_empty(){0}else{1},"results":session.results(),"key_ready":resource.authenticated}}))
                 },
-                "auth-close"=>{if command["generation"].as_u64()==Some(business.generation as u64){business.close(&mut resource);auth_open=false;peer_seen=false;}Ok(value!({}))},
+                "auth-close"=>{if command["generation"].as_u64()==Some(business.generation as u64){sight=None;business.close(&mut resource);auth_open=false;peer_seen=false;}Ok(value!({}))},
+                "hisight-open"=>{
+                    if !auth_open||!resource.authenticated||number(&command,"generation")?!=business.generation{return Err("unauthenticated or stale HiSight session".into());}
+                    if sight.is_some(){return Err("HiSight session already active".into());}
+                    let mut key=business.native.as_ref().and_then(|s|s.key_for_bridge()).ok_or("missing authenticated media key")?;
+                    let session=super::super::hisight::Session::new(&key);wipe(&mut key);let session=session?;
+                    next_sight=next_sight.checked_add(1).ok_or("HiSight generation exhausted")?;
+                    let initial=session.initial()?;sight=Some((next_sight,session));Ok(value!({"session":next_sight,"initial":hex(&initial)}))
+                },
+                "hisight-receive"|"hisight-play"|"hisight-teardown"|"hisight-close"=>{
+                    let token=number(&command,"session")?;
+                    let (_,session)=sight.as_mut().filter(|(n,_)|*n==token).ok_or("stale HiSight session")?;
+                    if op=="hisight-close"{sight=None;return Ok(value!({}));}
+                    let (events,plaintexts)=if op=="hisight-receive"{session.receive(&unhex(text(&command,"data")?)?,command["capture"]==true)?}else{(vec![],vec![])};
+                    if op=="hisight-play"{session.request("PLAY")?;}
+                    let teardown=if op=="hisight-teardown"{session.teardown()?}else{None};
+                    Ok(value!({"events":events,"plaintexts":plaintexts.iter().map(|v|hex(v)).collect::<Vec<_>>(),"pending":session.pending().iter().map(|v|hex(v)).collect::<Vec<_>>(),"teardown":teardown.map(|v|hex(&v)),"state":session.state()}))
+                },
                 "close"=>Ok(value!({"closed":true})),_=>Err("unknown session command".into()),
             }})();
             match result{Ok(mut v)=>{v["ok"]=true.into();send(&mut socket,&v)?;if op=="close"{break;}},Err(error)=>{
                 // Protocol errors revoke authorization before any later network command.
-                if op=="auth"&&command["generation"].as_u64()==Some(business.generation as u64){business.close(&mut resource);auth_open=false;peer_seen=false;}
+                if op=="auth"&&command["generation"].as_u64()==Some(business.generation as u64){sight=None;business.close(&mut resource);auth_open=false;peer_seen=false;}
+                if op.starts_with("hisight-")&&sight.as_ref().is_some_and(|(n,_)|command["session"].as_u64()==Some(*n as u64)){sight=None;}
                 send(&mut socket,&value!({"ok":false,"error":error}))?;
             }}
         }

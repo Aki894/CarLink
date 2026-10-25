@@ -5,6 +5,7 @@ pub mod media;
 pub mod crypto;
 pub mod identity;
 pub mod session;
+pub mod hisight;
 #[cfg(unix)]
 pub mod native;
 mod cli;

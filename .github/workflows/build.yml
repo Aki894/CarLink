@@ -68,6 +68,7 @@ jobs:
           cargo +"$RUST_VERSION" run --quiet --locked --manifest-path app/Cargo.toml -- doctor --json > /tmp/carlink-doctor.json
           python3 scripts/test-hicar-rust.py app/target/debug/carlink
           python3 scripts/test-hicar-rust-session.py app/target/debug/carlink
+          python3 scripts/test-hicar-rust-hisight.py app/target/debug/carlink
           python3 scripts/test-manager.py app/target/debug/carlink
           python3 scripts/test-manager-web.py app/target/debug/carlink
           python3 -c 'import json; d=json.load(open("/tmp/carlink-doctor.json")); assert d["schema_version"] == 1; assert d["aoa"]["status"] == "not_tested"'

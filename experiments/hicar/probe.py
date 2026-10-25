@@ -111,7 +111,8 @@ def log(event, **fields):
 
 async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                   decode_control=True, auth_session=None, resource=None, dmsdp=None, control=None,
-                  live_socket=None, audio_binary=None, continuous=False):
+                  live_socket=None, audio_binary=None, continuous=False,
+                  rust_worker=None, auth_generation=None):
     """Observe bounded records; managed sessions outlive the capture byte budget."""
     total = 0
     digest = hashlib.sha256()
@@ -215,8 +216,9 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                                     (control.device_info['remoteIp'], control.media_port)), 5)
                                 log('hisight_connected', port=control.media_port)
                                 await receive_hisight(media, bytes(control.cipher.key), capture_dir, log, sink,
-                                                       continuous=continuous)
-                            except (OSError, asyncio.TimeoutError) as error:
+                                                       continuous=continuous, rust_worker=rust_worker,
+                                                       auth_generation=auth_generation)
+                            except (OSError, ProtocolError, RuntimeError, asyncio.TimeoutError) as error:
                                 log('hisight_error', error=type(error).__name__)
                             finally:
                                 media.close()
@@ -696,7 +698,8 @@ async def run(args):
                                                        if control else None,
                                                        live_socket=args.live_socket,
                                                        audio_binary=args.audio_binary,
-                                                       continuous=args.managed))
+                                                       continuous=args.managed, rust_worker=rust_worker,
+                                                       auth_generation=rust_worker.auth_generation if rust_worker else None))
                     tcp_clients.add(task)
                     if control:
                         tcp_controls.add(task)

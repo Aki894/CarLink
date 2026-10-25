@@ -134,6 +134,18 @@ class HiSightTests(unittest.TestCase):
 
 
 class HiSightCloseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_revoked_rust_worker_does_not_interrupt_cleanup(self):
+        class Revoked:
+            def teardown(self):
+                raise ProtocolError('stale HiSight session')
+        receiver, peer = socket.socketpair()
+        events = []
+        try:
+            await graceful_close(receiver, Revoked(), lambda event, **fields: events.append(event))
+            self.assertEqual(events, ['hisight_teardown_stopped'])
+        finally:
+            receiver.close(); peer.close()
+
     async def test_encrypted_teardown_ack_and_keepalive(self):
         receiver, peer = socket.socketpair()
         receiver.setblocking(False); peer.setblocking(False)

@@ -26,6 +26,7 @@ class Worker:
         self.lock = threading.Lock()
         self.process = None
         self.closed = False
+        self.auth_generation = None
         try:
             # Only the child's one IPC descriptor survives exec. CLI diagnostic
             # output cannot become protocol data or expose the key in our logs.
@@ -114,6 +115,7 @@ class AuthSession:
     def __init__(self, worker):
         self.worker = worker
         self.generation = worker.call(dict(op='auth-open'))['generation']
+        worker.auth_generation = self.generation
         self.backend = self  # Preserve only the existing media adapter contract.
         self.session_key = None
         self.closed = False
@@ -133,9 +135,61 @@ class AuthSession:
 
     def close(self):
         self.session_key = None
+        if self.worker.auth_generation == self.generation:
+            self.worker.auth_generation = None
         if not self.closed:
             self.closed = True
             try:
                 self.worker.call(dict(op='auth-close', generation=self.generation))
             except (ValueError, RuntimeError, OSError):
                 pass  # A dead child has already dropped the native session.
+
+
+class HiSightSession:
+    """Low-volume RTSP IPC only; compressed video never crosses this channel."""
+    def __init__(self, worker, generation):
+        self.worker = worker
+        self.closed = False
+        self.pending = []
+        self.on_plaintext = None
+        self.encrypted = False
+        self.media_endpoint = self.input_endpoint = self.setup_sequence = None
+        self.peer_teardown = self.teardown_acknowledged = False
+        ready = worker.call(dict(op='hisight-open', generation=generation))
+        self.session = ready['session']
+        self.initial_record = bytes.fromhex(ready['initial'])
+
+    def initial(self):
+        return self.initial_record
+
+    def update(self, result):
+        for name, value in result['state'].items():
+            setattr(self, name, value)
+        self.pending.extend(bytes.fromhex(p) for p in result['pending'])
+        plaintexts = [bytes.fromhex(p) for p in result['plaintexts']]
+        if self.on_plaintext:
+            for payload in plaintexts:
+                self.on_plaintext(payload)
+        return result['events'], plaintexts
+
+    def receive(self, data):
+        return self.update(self.worker.call(dict(op='hisight-receive', session=self.session,
+            data=data.hex(), capture=self.on_plaintext is not None)))
+
+    def request(self, method, headers=None):
+        if method != 'PLAY':
+            raise ProtocolError('unsupported Rust HiSight adapter request')
+        self.update(self.worker.call(dict(op='hisight-play', session=self.session)))
+
+    def teardown(self):
+        result = self.worker.call(dict(op='hisight-teardown', session=self.session))
+        self.update(result)
+        return bytes.fromhex(result['teardown']) if result['teardown'] else None
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            try:
+                self.worker.call(dict(op='hisight-close', session=self.session))
+            except (ValueError, RuntimeError, OSError):
+                pass

@@ -130,6 +130,7 @@ impl Process{
 impl Drop for Process{fn drop(&mut self){let _=self.end();}}
 #[derive(Clone)]struct Choice{protocol:Protocol,device:Option<Device>,pairing:bool}
 struct Owner{config:Config,store:Store,status:Status,life:Option<Process>,backend:Option<Process>,choice:Option<Choice>,
+    life_started:Instant,life_retry_at:Instant,life_failures:u8,
     started:Instant,ready:Option<Instant>,seen_media:bool,committed:bool,pair_deadline:Option<Instant>,repair_used:bool,
     retry_at:Instant,tried:VecDeque<String>,last_auth:Option<Instant>,refusals:u8,mux:Option<crate::manager_menu::Mux>,menu_focus:usize,menu_pending:Option<Value>,menu_idle:bool,wireless_ready:bool,source_ready:bool}
 impl Owner{
@@ -147,7 +148,7 @@ impl Owner{
         if boot.is_some()&&store.boot_id!=boot{store.paused=false;store.boot_id=boot;}
         let paused=store.paused;
         Ok(Self{config,store,status:Status{schema:1,generation:0,protocol:None,target:None,active:false,pairing:false,paused,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,last_error:None,last_stage:None},
-            life:None,backend:None,choice:None,started:Instant::now(),ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,wireless_ready:false,source_ready:false})
+            life:None,backend:None,choice:None,life_started:Instant::now(),life_retry_at:Instant::now(),life_failures:0,started:Instant::now(),ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,wireless_ready:false,source_ready:false})
     }
     fn automatic(&self)->Option<Choice>{
         if self.store.paused||self.store.policy==Policy::Manual{return None;}
@@ -363,13 +364,13 @@ impl Owner{
             self.status.last_error=Some(v["detail"].as_str().unwrap_or("CarLife output failed").chars().take(256).collect());event("manager_carlife_error");
         }}}
         if self.life.as_mut().is_some_and(|p|p.child.try_wait().ok().flatten().is_some()){
-            self.life=None;self.status.carlife_pid=None;self.status.usb_connected=false;self.retry_at=Instant::now()+Duration::from_millis(500);event("manager_carlife_restart");
+            self.life=None;self.status.carlife_pid=None;self.status.usb_connected=false;self.defer_carlife();event("manager_carlife_restart");
             if fs::symlink_metadata(&self.config.live_socket).is_ok_and(|m|m.file_type().is_socket()){
                 fs::remove_file(&self.config.live_socket).map_err(|_|"cannot clear terminated CarLife endpoint")?;
             }
         }
-        if self.life.is_none()&&Instant::now()>=self.retry_at {
-            let p=spawn(&self.config.carlife,0,None)?;self.status.carlife_pid=Some(p.child.id());self.life=Some(p);
+        if self.life.is_none()&&Instant::now()>=self.life_retry_at {
+            let p=spawn(&self.config.carlife,0,None)?;self.status.carlife_pid=Some(p.child.id());self.life=Some(p);self.life_started=Instant::now();
         }
         if let Some(p)=self.backend.as_mut(){let generation=p.generation;let events=p.events.try_iter().take(64).collect::<Vec<_>>();
             for e in events{self.ingest(generation,e)?;}}
@@ -396,6 +397,12 @@ impl Owner{
         if self.backend.is_none()&&!self.store.paused&&Instant::now()>=self.retry_at&&self.life.is_some(){
             if let Some(c)=self.automatic(){self.select(c)?;}else{self.tried.clear();self.retry_at=Instant::now()+Duration::from_secs(8);}
         }Ok(())
+    }
+    fn defer_carlife(&mut self){
+        // A failing HU must see a meaningful detach interval. Do not reset on
+        // initial negotiation: a broken session may fail immediately afterward.
+        self.life_failures=if self.life_started.elapsed()>=Duration::from_secs(30){0}else{self.life_failures.saturating_add(1)};
+        self.life_retry_at=Instant::now()+Duration::from_millis(500u64<<self.life_failures.min(4));
     }
 }
 fn auth_mismatch(s:&str)->bool{["AuthenticationFailed","AuthenticationRejected","AuthenticationCanceled","br-connection-key-missing","PIN or Key Missing"].iter().any(|p|s.contains(p))}
@@ -555,6 +562,13 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         owner.store.paused=true;owner.store.boot_id=Some("previous-boot".into());save(&owner.config.state,&owner.store).unwrap();
         let restarted=test_owner(&root);assert!(!restarted.store.paused);assert_eq!(restarted.automatic().unwrap().protocol,Protocol::Hicar);
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn usb_retry_backoff_is_bounded_and_independent_of_wireless(){
+        let root=test_root("usb-backoff");let mut owner=test_owner(&root);let wireless=owner.retry_at;
+        for expected in [1000,2000,4000,8000,8000,8000]{owner.life_started=Instant::now();let before=Instant::now();owner.defer_carlife();
+            let delay=owner.life_retry_at.duration_since(before).as_millis();assert!(delay>=expected&&delay<=expected+50);assert_eq!(owner.retry_at,wireless);}
+        owner.life_started=Instant::now()-Duration::from_secs(31);let before=Instant::now();owner.defer_carlife();
+        assert_eq!(owner.life_failures,0);assert!(owner.life_retry_at.duration_since(before)<Duration::from_millis(550));fs::remove_dir_all(root).unwrap();
     }
     #[test]fn ordinary_offline_does_not_erase_pairing(){for s in ["Host is down","Connection timed out","No route to host","AirPlay session ended"]{assert!(!auth_mismatch(s));}assert!(auth_mismatch("org.bluez.Error.AuthenticationFailed"));}
     #[test]fn stale_generation_cannot_steal_active_backend(){

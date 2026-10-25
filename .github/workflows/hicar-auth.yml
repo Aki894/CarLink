@@ -114,6 +114,7 @@ jobs:
           chmod +x .build/hicar-rust-arm/carlink
           export CARLINK_RUST_RUNNER="$(python3 -c 'import json,os; print(json.dumps(["qemu-arm","-L","/usr/arm-linux-gnueabihf","-E","LD_LIBRARY_PATH="+os.getcwd()+"/dist/hicar-auth/lib:/usr/arm-linux-gnueabihf/lib"]))')"
           python3 scripts/test-hicar-rust.py .build/hicar-rust-arm/carlink
+          python3 scripts/test-hicar-rust-hisight.py .build/hicar-rust-arm/carlink
           python3 scripts/test-hicar-rust-auth.py .build/hicar-rust-arm/carlink \
             .build/hicar-native-host/libcarlink_hichain.so dist/hicar-auth/libcarlink_hichain.so
           python3 scripts/test-hicar-rust-session.py .build/hicar-rust-arm/carlink \

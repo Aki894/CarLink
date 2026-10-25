@@ -17,6 +17,7 @@ fn codec(v:&Value)->Result<Value>{
     match string(v,"op")? {
         "uint"=>Ok(value!({"hex":hex(&super::wire::uint(bounded_u32(v,"value")?)?)})),
         "nearby-session"=>super::session::differential(v),
+        "hisight-session"=>super::hisight::differential(v),
         "crc"=>Ok(value!({"crc":super::wire::crc16(&bytes(v,"data")?)})),
         "tlv"=>Ok(value!({"hex":hex(&super::wire::tlv(bounded_u32(v,"tag")?,&bytes(v,"data")?)?)})),
         "tlvs"=>Ok(value!({"values":super::wire::tlvs(&bytes(v,"data")?)?.iter().map(|(t,p)|value!([t,hex(p)])).collect::<Vec<_>>()})),
