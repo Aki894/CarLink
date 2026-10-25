@@ -210,7 +210,7 @@ impl Owner{
                 self.tried.clear();self.select(Choice{protocol,device:Some(d),pairing:false})?;},
             "pair"=>{let protocol:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing protocol")?;
                 if self.store.devices.len()>=8{return Err("device store is full; forget a device first".into());}
-                self.select(Choice{protocol,device:None,pairing:true})?;},
+                self.select(Choice{protocol,device:None,pairing:true})?;self.menu_idle=true;},
             "policy"=>{let mode:Policy=serde_json::from_value(v["mode"].clone()).map_err(|_|"invalid connection policy")?;
                 if mode==Policy::Favorite{let p:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing favorite protocol")?;let a=v["address"].as_str().ok_or("missing favorite target")?;
                     self.store.favorite=Some(self.store.devices.iter().find(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)).cloned().ok_or("unknown favorite target")?);}
@@ -246,7 +246,7 @@ impl Owner{
     fn menu_input(&mut self,v:Value)->Result<()>{
         if !self.status.menu_visible{return Ok(());}let (rows,actions)=self.menu_model();
         if v["menu_rows"]!=json!(rows){return Ok(());}
-        let kind=v["type"].as_str().unwrap_or("");let mut chosen=None;
+        let kind=v["type"].as_str().unwrap_or("");if kind=="menu-error"{self.status.last_error=Some("local menu encoder failed".into());return Ok(());}let mut chosen=None;
         if kind=="key-press"||kind=="key"{match v["code"].as_u64(){
             Some(3|5)=>self.menu_focus=self.menu_focus.saturating_sub(1),Some(4|6)=>self.menu_focus=(self.menu_focus+1).min(rows.len()-1),
             Some(2)=>chosen=Some(self.menu_focus),Some(0|1)=>{if self.menu_pending.is_some(){self.menu_pending=None;self.menu_focus=0;}else{self.status.menu_visible=false;self.menu_idle=false;}},_=>{}}}

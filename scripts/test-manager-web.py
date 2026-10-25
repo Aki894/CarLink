@@ -13,6 +13,20 @@ import tempfile
 import time
 
 
+def parse_response(response):
+    assert response, 'HTTP peer closed without a reply'
+    assert b'\r\n\r\n' in response, 'HTTP reply header was truncated'
+    head,body=response.split(b'\r\n\r\n',1)
+    lines=head.decode('ascii').split('\r\n')
+    code=int(lines[0].split()[1])
+    headers=dict(line.split(': ',1) for line in lines[1:])
+    assert int(headers['Content-Length'])==len(body), 'HTTP reply body was truncated or oversized'
+    assert headers['Connection']=='close'
+    assert headers['Cache-Control']=='no-store'
+    assert headers['X-Content-Type-Options']=='nosniff'
+    return code,headers,body
+
+
 def check(binary):
     runner = json.loads(os.environ.get('CARLINK_RUST_RUNNER', '[]'))
     with tempfile.TemporaryDirectory(prefix='carlink-manager-web-') as directory:
@@ -46,19 +60,17 @@ def check(binary):
                 stream.settimeout(5);stream.sendall(request)
                 response=b''
                 while True:
-                    part=stream.recv(65536)
+                    try:
+                        part=stream.recv(65536)
+                    except ConnectionResetError:
+                        # A rejection can close with unread request data, which
+                        # Linux reports as RST after sending the error response.
+                        # Only a complete declared response qualifies as EOF.
+                        return parse_response(response)
                     if not part:break
                     response+=part
                     assert len(response)<=131072, 'unbounded HTTP response'
-            head,body=response.split(b'\r\n\r\n',1)
-            lines=head.decode('ascii').split('\r\n')
-            code=int(lines[0].split()[1])
-            headers=dict(line.split(': ',1) for line in lines[1:])
-            assert int(headers['Content-Length'])==len(body)
-            assert headers['Connection']=='close'
-            assert headers['Cache-Control']=='no-store'
-            assert headers['X-Content-Type-Options']=='nosniff'
-            return code,headers,body
+            return parse_response(response)
         def get(path,host=authority):
             return raw(f'GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n'.encode())
         def post(command,origin=None,host=authority,kind='application/json'):

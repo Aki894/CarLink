@@ -161,9 +161,27 @@ def check(binary):
             removed=[e for e in events() if e['event']=='remove'];assert len(removed)==2
             assert all(e['args'][-1]==cp['address'] for e in removed)
             assert not any(e['event']=='overlap' for e in events()), 'wireless backend overlap'
+            # Successful-use/favorite metadata contains historical copies. A
+            # later record edit disabling auto must take effect for both policies.
+            stable=until(lambda s:s['active'] and not s['pairing'])
+            ctl(op='policy',mode='favorite',protocol='carplay',address=cp['address'])
+            ctl(op='remember',device=dict(cp,auto=False))
+            ctl(op='remember',device=dict(hc,auto=False))
+            assert ctl(op='status')['status']['backend_pid']==stable['backend_pid'], 'record edit stole the active session'
+            ctl(op='disconnect')
+            for mode in ['favorite','last']:
+                if mode=='last':ctl(op='policy',mode='last')
+                marker=len(events())
+                ctl(op='resume')
+                time.sleep(2.3)
+                assert ctl(op='status')['status']['backend_pid'] is None, f'{mode} reused stale auto=true metadata'
+                assert not any(e['event']=='start' and e['role']!='carlife' for e in events()[marker:]), 'disabled device was briefly reconnected'
+                ctl(op='pause')
+            ctl(op='remember',device=cp);ctl(op='remember',device=hc)
+            ctl(op='resume')
+            stable=until(lambda s:s['active'] and not s['pairing'])
             # Manual policy preserves the current session, then waits for a user
             # after disconnect/resume and across a manager restart.
-            stable=until(lambda s:s['active'] and not s['pairing'])
             ctl(op='policy',mode='manual')
             assert ctl(op='status')['status']['backend_pid']==stable['backend_pid']
             ctl(op='disconnect');ctl(op='resume')
@@ -228,7 +246,7 @@ def check(binary):
             print(json.dumps(dict(connection_manager='passed',switches=7,usb_pid_preserved=True,
                 independent_usb_recovery=True,radio_overlap=False,offline_pairing_retained=True,
                 authentication_and_repeated_refusal_repaired=True,target_only=True,identity_unchanged=True,
-                manual_and_favorite_policy=True,hicar_enrollment_stability_gate=True,forget_confirmation_and_persistence=True)))
+                manual_and_favorite_policy=True,current_auto_record_respected=True,hicar_enrollment_stability_gate=True,forget_confirmation_and_persistence=True)))
         except BaseException:
             log.flush()
             print((root/'manager.log').read_text(encoding='utf-8',errors='replace')[-8000:],file=sys.stderr)
