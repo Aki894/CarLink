@@ -7,6 +7,7 @@ class MicrophoneTests(unittest.TestCase):
     def setUp(self):
         self.sent, self.requests = [], []
         self.mic = voice.Microphone(self.sent.append, self.requests.append)
+        self.mic.generation = 0
 
     def config(self, rate=16000, stream=1):
         self.mic.configure(stream, dict(codec='PCM_S16LE', sampleRate=rate, channels=1, frameMs=20))

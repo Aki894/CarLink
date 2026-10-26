@@ -14,7 +14,7 @@ class Microphone:
         self.send, self.request = send, request
         self.lock = threading.RLock()
         self.current = None
-        self.generation = 0
+        self.generation = time.monotonic_ns()
 
     def stop(self, stream=None):
         with self.lock:

@@ -184,12 +184,12 @@ impl Engine{
     fn stop_video(&mut self){self.stop_microphone();self.release_inputs();self.flush_input();self.video=None;self.video_bytes.clear();self.video_open=false;self.video_ended=true;self.input=None;self.input_queue.clear();self.contact=None;self.keys.clear();self.stop_audio();self.link.session(false);}
     fn command(&mut self,v:&Value)->Result<Value>{match string(v,"op")?{
         "microphone-start"=>{
-            self.stop_microphone();self.mic_generation=self.mic_generation.checked_add(1).ok_or("microphone generation exhausted")?;
+            self.stop_microphone();self.mic_generation=self.mic_generation.checked_add(1).ok_or("microphone generation exhausted")?.max(now_us());
             let remote=port(v,"port")?;let stream=v["session"].as_u64().filter(|id|*id<=u32::MAX as u64).ok_or("invalid microphone session")? as u32;
             self.uplink=Some(super::super::uplink::Uplink::new(&self.audio_binary,self.mic_generation,remote,stream)?);self.link.microphone(self.mic_generation,true);
         },
         "microphone-stop"=>self.stop_microphone(),
-        "audio-role"=>{let role=v["role"].as_u64().filter(|n|matches!(n,0|3)).ok_or("invalid call audio role")? as u8;if self.link.audio_role!=role{self.stop_audio();self.link.audio_role=role;self.link.audio(true);}},
+        "audio-role"=>{let role=v["role"].as_u64().filter(|n|*n==0||*n==3).ok_or("invalid call audio role")? as u8;if self.link.audio_role!=role{self.stop_audio();self.link.audio_role=role;self.link.audio(true);}},
         "set-video"=>{
             if self.video.is_some(){return Err("video transport already open".into());}
             let video=connect(self.local,self.peer,port(v,"media_port")?,Duration::from_secs(2))?;

@@ -88,9 +88,19 @@ if sys.byteorder != 'little':
 assert len(result.stdout) == 4410 * 2 * 2, len(result.stdout)
 assert max(map(abs, pcm)) > 8000
 assert all(pcm[i] == pcm[i + 1] for i in range(0, len(pcm), 2))
+mic = array.array('h', (int(8000*math.sin(2*math.pi*440*i/16000)) for i in range(8000)))
+if sys.byteorder != 'little': mic.byteswap()
+encoded = subprocess.run(['qemu-arm','-L','/usr/arm-linux-gnueabihf',str(out/'bin/carlink-audio'),
+    '-hide_banner','-loglevel','error','-f','s16le','-ar','16000','-ac','1','-i','pipe:0',
+    '-c:a','aac','-b:a','32000','-f','adts','pipe:1'],input=mic.tobytes(),stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True,timeout=30)
+assert encoded.stdout.startswith(b'\xff\xf1') and len(encoded.stdout)>500
+decoded = subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-f','aac','-i','pipe:0',
+    '-f','s16le','-ac','1','-ar','16000','pipe:1'],input=encoded.stdout,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True,timeout=30)
+assert len(decoded.stdout)>=16000 and any(decoded.stdout)
 (out / 'audio-validation.txt').write_text(
     'ARMv7 QEMU: pipe s16le 48000 Hz stereo -> 44100 Hz stereo passed\n'
-    'Output: 4410 frames, 17640 bytes, non-silent equal stereo channels\n')
+    'Output: 4410 frames, 17640 bytes, non-silent equal stereo channels\n'
+    'ARMv7 microphone PCM16 16000 mono -> AAC ADTS -> host decode passed\n')
 PY
 for name in LICENSE.md COPYING.LGPLv2.1; do
     cp "$source_dir/$name" "$out/share/licenses/audio/"
@@ -105,8 +115,8 @@ lock = json.loads((root / 'sources.lock.json').read_text())['audio_transcoder']
 manifest = dict(lock,
     project_commit=subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip(),
     binary='bin/carlink-audio',
-    components={'decoders': ['aac', 'pcm_s16le', 'opus'], 'encoders': ['pcm_s16le'],
-                'demuxers': ['aac', 'pcm_s16le', 'ogg'], 'muxers': ['pcm_s16le'],
+    components={'decoders': ['aac', 'pcm_s16le', 'opus'], 'encoders': ['pcm_s16le','aac'],
+                'demuxers': ['aac', 'pcm_s16le', 'ogg'], 'muxers': ['pcm_s16le','adts'],
                 'protocols': ['pipe']},
     source_instructions='Extract share/source/audio/ffmpeg.tar.gz. Run configure-audio.sh in its FFmpeg directory with the arm-linux-gnueabihf cross toolchain, then make ffmpeg. build-audio.sh reproduces and validates the full artifact from this pinned source.',
     attribution='FFmpeg https://ffmpeg.org/; LGPL-2.1-or-later. No GPL/nonfree/external codec components.')

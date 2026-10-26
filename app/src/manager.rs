@@ -361,7 +361,7 @@ impl Owner{
     fn menu_input(&mut self,v:Value)->Result<()>{
         if v["type"]=="call-state"{self.status.call_active=v["active"]==true;return Ok(());}
         if v["type"]=="open-menu"{self.status.menu_visible=true;self.menu_idle=false;self.menu_focus=0;self.menu_pending=None;return Ok(());}
-        if v["type"]=="source-state"{self.source_ready=v["active"]==true;if !self.source_ready&&self.status.active{self.source_lost();}self.mark_active()?;return Ok(());}
+        if v["type"]=="source-state"{self.source_ready=v["active"]==true;if !self.source_ready{self.status.call_active=false;if self.status.active{self.source_lost();}}self.mark_active()?;return Ok(());}
         if !self.status.menu_visible{return Ok(());}let (rows,actions)=self.menu_model();
         if v["menu_rows"]!=json!(rows){return Ok(());}
         let kind=v["type"].as_str().unwrap_or("");if kind=="menu-error"{self.status.last_error=Some("local menu encoder failed".into());return Ok(());}let mut chosen=None;
@@ -501,6 +501,14 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
     _=>Err("Usage: carlink manager run --config PRIVATE_JSON | ctl SOCKET JSON".into()),
 }}
 #[cfg(test)]mod tests{use super::*;
+    #[test]fn active_call_blocks_selection_and_source_loss_releases_protection(){
+        let root=test_root("call-guard");let mut owner=test_owner(&root);
+        owner.menu_input(json!({"type":"call-state","active":true})).unwrap();
+        assert!(owner.status.call_active);
+        assert_eq!(owner.select(Choice{protocol:Protocol::Carplay,device:None,pairing:true}).unwrap_err(),"finish the active call before switching phones");
+        assert!(owner.backend.is_none());owner.menu_input(json!({"type":"source-state","active":false})).unwrap();assert!(!owner.status.call_active);
+        fs::remove_dir(root).unwrap();
+    }
     fn test_root(name:&str)->PathBuf{let p=std::env::temp_dir().join(format!("carlink-manager-{}-{name}",std::process::id()));fs::create_dir(&p).unwrap();p}
     fn test_owner(root:&Path)->Owner{Owner::new(Config{schema:1,socket:root.join("control"),live_socket:root.join("live"),state:root.join("state"),carlife:vec![],carplay:vec![],hicar:vec![],devices:vec![],initial:None,bluetoothctl:None,radio_lock:None,media_socket:None,web_listen:None,source_socket:None,menu_library:None,menu_font:None,connect_seconds:30,stable_seconds:10,pair_seconds:120}).unwrap()}
     #[test]fn hicar_pair_menu_uses_persisted_pin_privately_and_cancel_preserves_policy(){

@@ -203,7 +203,7 @@ impl Worker {
     }
     fn output(&mut self,f:Frame){if self.hu.as_mut().is_some_and(|p|p.push(f).is_err()){self.hu=None;self.painted=None;self.presented=None;self.waiting_key=true;}}
     fn source(&mut self,f:Frame){if self.source.as_mut().is_some_and(|p|p.push(f).is_err()){self.lose_source();}}
-    fn lose_source(&mut self){self.back_frames.clear();self.back_last=None;self.back_first=None;let _=self.events.try_send(json!({"type":"call-state","active":false}));let _=self.events.try_send(json!({"type":"source-state","active":false}));self.source=None;self.source_active=false;self.source_key=None;self.waiting_key=true;self.touch=None;self.last_key=None;self.stop_source_media();}
+    fn lose_source(&mut self){self.back_frames.clear();self.back_last=None;self.back_first=None;let _=self.events.try_send(json!({"type":"source-state","active":false}));self.source=None;self.source_active=false;self.source_key=None;self.waiting_key=true;self.touch=None;self.last_key=None;self.stop_source_media();}
     fn stop_source_media(&mut self){
         if let Some(h)=self.hu.as_mut(){h.discard_media();}self.painted=None;
         for role in 0..4{self.output(Frame::new(5,role,vec![0]));}
