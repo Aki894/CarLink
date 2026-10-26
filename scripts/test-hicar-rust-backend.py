@@ -262,6 +262,9 @@ class Harness:
         return endpoint
 
     def close(self):
+        # An unused inherited media endpoint closes with its owner at shutdown;
+        # EOF is expected from this point, while prior queued failures remain.
+        self.stopping.set()
         if self.process.poll() is None:
             self.process.send_signal(signal.SIGTERM)
             try:
@@ -270,7 +273,6 @@ class Harness:
                 self.process.kill()
                 self.process.wait()
                 raise AssertionError('backend did not stop within six seconds')
-        self.stopping.set()
         for endpoint in self.sockets + [self.sight]:
             endpoint.close()
         for thread in self.threads:

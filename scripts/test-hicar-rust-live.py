@@ -171,6 +171,25 @@ def check(binary):
                 if resumed[0] == 2:
                     break
             assert resumed[1] == 1
+            # Valid RTP/PES and AES framing can still contain malformed ES.
+            # Reject it before CarLife, fence dependent pictures, and preserve
+            # the established phone session while awaiting a genuine IDR.
+            before_bad = rpc(ipc, dict(op='status'))['state']
+            malformed = (b'no-annexb-start-code', b'\0\0\0\1\xe5forbidden-bit',
+                         b'\0\0\0\1', b'garbage\0\0\1\x41predicted')
+            for sequence, es in enumerate(malformed, 4):
+                video.sendall(rtp_video(cipher, sequence, es))
+                until_frame(live, 6)
+            rejected = rpc(ipc, dict(op='status'))['state']
+            assert rejected['rejected'] == before_bad['rejected'] + len(malformed)
+            assert rejected['epoch_video_frames'] == before_bad['epoch_video_frames']
+            assert rejected['active'] and rejected['waiting_key']
+            video.sendall(rtp_video(cipher, 8, b'\0\0\0\1\x41after-malformed'))
+            time.sleep(.03)
+            assert rpc(ipc, dict(op='status'))['state']['epoch_video_frames'] == before_bad['epoch_video_frames']
+            video.sendall(rtp_video(cipher, 9, idr))
+            recovered = until_frame(live, 2)
+            assert recovered[1] == 1 and recovered[3].endswith(idr)
             feedback(live, dict(type='touch', contacts=[dict(x=.2, y=.3, down=True)]))
             feedback(live, dict(type='touch', contacts=[dict(x=.4, y=.6, down=True)]))
             feedback(live, dict(type='touch', contacts=[]))
@@ -193,7 +212,7 @@ def check(binary):
             status = rpc(ipc, dict(op='status'))['state']
             assert status['active'] and status['audio_frames'] == 1 and status['pcm_blocks'] >= 2
             assert status['input_events'] == 4
-            assert status['epoch_video_frames'] == 2
+            assert status['epoch_video_frames'] == 3
             # Datagram framing and selected source checks reject unexpected
             # senders independently of the connected TCP control session.
             udp.sendto(b'\xab\0\0wrong', ('127.0.0.1', audio_port))
@@ -297,7 +316,8 @@ def check(binary):
     print(json.dumps(dict(rust_media_io='passed', h264_passthrough=True, encrypted_video=True,
         udp_audio_native_process_pcm=True, touch_move_release=True, eof_source_inactive=True,
         carlife_reconnect_idr=True, audio_generation_isolated=True, clock_four_timestamp=True,
-        broken_feedback_release=True, input_reconnect=True, epoch_readiness=True, private_ipc_only=True)))
+        broken_feedback_release=True, input_reconnect=True, epoch_readiness=True,
+        malformed_annexb_recovery=True, private_ipc_only=True)))
 
 
 if __name__ == '__main__':

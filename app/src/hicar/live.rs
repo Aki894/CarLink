@@ -193,7 +193,7 @@ impl Engine{
         let Some((kind,_,record))=frame else{return;};if kind!=96{return;}
         let data=match decrypt(&self.crypto,&self.key,&record){Ok(v)=>v,Err(_)=>{self.invalid+=1;self.link.recover();return;}};
         if data.len()>MAX_VIDEO-1024{self.invalid+=1;self.link.recover();return;}
-        let units=nal_units(&data);let key=units.iter().any(|v|v.first().is_some_and(|v|v&31==5));
+        let Some(units)=nal_units(&data)else{self.invalid+=1;self.link.recover();return;};let key=units.iter().any(|v|v[0]&31==5);
         for unit in &units{let kind=unit[0]&31;if matches!(kind,7|8)&&unit.len()<=32768{let mut parameter=vec![0,0,0,1];parameter.extend(*unit);self.parameters[(kind-7) as usize]=Some(parameter);}}
         let frame=if key{match (&self.parameters[0],&self.parameters[1]){(Some(sps),Some(pps))=>{let mut out=sps.clone();out.extend(pps);out.extend(&data);out},_=>return,}}else{data};
         if frame.len()>MAX_VIDEO{self.invalid+=1;self.link.recover();return;}
@@ -219,6 +219,9 @@ impl Engine{
             let decoded=match decrypt(&self.crypto,&self.key,&bytes[3..n]){Ok(v)=>v,Err(_)=>{self.invalid+=1;continue;}};
             let frames=match self.audio.receive(&decoded){Ok(v)=>v,Err(_)=>{self.invalid+=1;continue;}};
             for frame in frames{
+                // Match the proven bridge sink: both video and PCM begin on
+                // local arrival time. RTP clock mapping remains diagnostic
+                // until source/HU cross-stream timing is independently tested.
                 let pts=now_us();let format=(frame.aac.rate,frame.aac.channels);
                 if self.decoder.as_ref().is_none_or(|d|(d.rate,d.channels)!=format){
                     self.decoder=None;match Decoder::new(&self.audio_binary,format.0,format.1,pts){Ok(d)=>{self.decoder=Some(d);self.link.audio(true);},Err(_)=>{self.invalid+=1;continue;}}
@@ -272,10 +275,18 @@ impl Engine{
         for fd in [self.video.as_ref().map(AsRawFd::as_raw_fd),self.link.socket.as_ref().map(AsRawFd::as_raw_fd),self.decoder.as_ref().filter(|d|d.pcm.len()<6*PCM).map(|d|d.output.as_raw_fd()),self.clock.as_ref().map(|c|c.socket.as_raw_fd())].into_iter().flatten(){fds.push(libc::pollfd{fd,events:libc::POLLIN,revents:0});}fds
     }
 }
-fn nal_units(data:&[u8])->Vec<&[u8]>{
+fn nal_units(data:&[u8])->Option<Vec<&[u8]>>{
     let mut starts=vec![];let mut pos=0;
     while pos+3<=data.len(){if data[pos..].starts_with(&[0,0,0,1]){starts.push((pos,4));pos+=4;}else if data[pos..].starts_with(&[0,0,1]){starts.push((pos,3));pos+=3;}else{pos+=1;}}
-    let mut out=vec![];for (index,(start,size)) in starts.iter().enumerate(){let end=starts.get(index+1).map(|v|v.0).unwrap_or(data.len());if start+size<end{out.push(&data[start+size..end]);}}out
+    let first=starts.first()?.0;
+    // Annex-B permits leading zero bytes, not arbitrary bytes before the
+    // first start code. RTP/PES validity and decryption alone do not establish
+    // a decodable access unit; never forward malformed ES into CarLife.
+    if data[..first].iter().any(|b|*b!=0){return None;}
+    let mut out=vec![];for (index,(start,size)) in starts.iter().enumerate(){
+        let end=starts.get(index+1).map(|v|v.0).unwrap_or(data.len());if start+size>=end{return None;}
+        let unit=&data[start+size..end];if unit[0]&128!=0||!(1..=23).contains(&(unit[0]&31)){return None;}out.push(unit);
+    }Some(out)
 }
 fn read_initial(socket:&mut UnixStream)->Result<Value>{
     socket.set_read_timeout(Some(Duration::from_secs(10))).map_err(|_|"private media timeout failed")?;
