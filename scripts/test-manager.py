@@ -67,6 +67,10 @@ def check(binary):
         hc = dict(protocol='hicar', address='02:00:00:00:00:02', name='test Huawei', auto=True, last_used=0)
         mock = root / 'backend.py'
         mock.write_text(MOCK)
+        hicar_identity = root/'hicar-identity.json'
+        hicar_identity.write_text(json.dumps(dict(schema=1, device_id='ab'*32,
+            pin='012345', name='CarLink')))
+        hicar_identity.chmod(0o600)
         bt = root / 'bluetoothctl'
         bt.write_text('#!' + sys.executable + '\n' +
             'import json,os,pathlib,sys\nroot=pathlib.Path(' + repr(str(root)) + ')\n' +
@@ -79,7 +83,7 @@ def check(binary):
         bt.chmod(0o700)
         config = dict(schema=1, socket=str(root / 'control.sock'), live_socket=str(root / 'live.sock'), state=str(root / 'devices.json'), radio_lock=str(root/'radio-owner.lock'), media_socket=str(root/'media.sock'),
             carlife=[sys.executable, str(mock), str(root), 'carlife'],
-            carplay=[sys.executable, str(mock), str(root), 'carplay'], hicar=[sys.executable, str(mock), str(root), 'hicar'],
+            carplay=[sys.executable, str(mock), str(root), 'carplay'], hicar=[sys.executable, str(mock), str(root), 'hicar', '--identity', str(hicar_identity)],
             devices=[cp, hc], initial='carplay', bluetoothctl=str(bt), connect_seconds=2, stable_seconds=1, pair_seconds=5)
         (root / 'config.json').write_text(json.dumps(config))
         (root / 'config.json').chmod(0o600)
