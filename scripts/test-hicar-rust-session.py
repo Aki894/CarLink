@@ -90,6 +90,7 @@ def authentication(binary, library, rust_library):
     from cipher import Cipher
     from identity import Identity
     from auth_wire import JsonStream, AuthError
+    from control_wire import Decoder as ControlDecoder, Messages, pack_frame
     offer = Offer('CarLink', '02:00:00:00:00:01', 'synthetic-password')
     model, address = '00040A00', '02:11:22:33:44:55'
     stored = Identity('AB' * 32, '012345')
@@ -97,6 +98,27 @@ def authentication(binary, library, rust_library):
     client_id = 'CD' * 32
     runner = json.loads(os.environ.get('CARLINK_RUST_RUNNER', '[]'))
     results = []
+    def rejected(worker, command, label):
+        try:
+            worker.call(command)
+        except ValueError:
+            return
+        raise AssertionError(label)
+
+    def control_text(start, sequence, **headers):
+        return ('\r\n'.join([start, 'CSeq: '+str(sequence)] +
+            [name+': '+str(value) for name, value in headers.items()])+'\r\n\r\n').encode('ascii')
+
+    def control_packet(packet, cipher=None):
+        frames = ControlDecoder().feed(packet)
+        assert len(frames) == 1
+        payload = frames[0].payload
+        if frames[0].marker == 0xab:
+            assert cipher is not None
+            payload = cipher.decrypt(payload)
+        texts = Messages().feed(payload)
+        assert len(texts) == 1
+        return texts[0]
     with tempfile.TemporaryDirectory(prefix='carlink-r2-') as directory:
         root = Path(directory)
         identity = root / 'identity.json'
@@ -118,6 +140,11 @@ def authentication(binary, library, rust_library):
                 client_mac = Frame(33, 0, b'', pack_tlv(2, b'02:00:00:00:00:02'))
                 assert n.respond(network) is None and n.respond(client_mac) is None
                 auth = RustAuth(w)
+                control_info = dict(deviceId=own, deviceName='CarLink', deviceType=4,
+                    bluetoothMac=address, btName='CarLink', localIp=offer.owner_ip,
+                    remoteIp=offer.client_ip, port=0, properties={'2003': model})
+                rejected(w, dict(op='dmsdp-open', generation=auth.generation,
+                    device_info=control_info, audio=True), 'DMSDP opened before authentication')
                 try:
                     HiSightSession(w, auth.generation)
                 except ValueError:
@@ -152,6 +179,43 @@ def authentication(binary, library, rust_library):
                 assert len(auth.session_key) == (32 if phase == 'bind' else 16)
                 assert n.respond(network) is not None
                 assert offer.credentials() in n.respond(client_mac)
+                # Exercise the actual authenticated private worker, rather
+                # than passing a synthetic key straight to the codec command.
+                control_open = dict(op='dmsdp-open', generation=auth.generation,
+                    device_info=control_info, audio=True)
+                first_control = w.call(control_open)
+                assert control_packet(bytes.fromhex(first_control['initial'])).start == 'OPTIONS * DMSDP/1.0'
+                rejected(w, control_open, 'duplicate DMSDP open accepted')
+                first_token = first_control['session']
+                assert w.call(dict(op='dmsdp-ports', session=first_token,
+                    ports=[40000, -1]))['state']['speaker']['ports'] == [40000, -1]
+                w.call(dict(op='dmsdp-close', session=first_token))
+                control_token = w.call(control_open)['session']
+                assert control_token != first_token
+                for op in ('dmsdp-close', 'dmsdp-heartbeat', 'dmsdp-stop-audio'):
+                    rejected(w, dict(op=op, session=first_token), 'stale DMSDP token accepted')
+                assert w.call(dict(op='dmsdp-ports', session=control_token,
+                    ports=[40002, -1]))['state']['speaker']['ports'] == [40002, -1]
+                negotiation = pack_frame(control_text('SET_PARAMETER * DMSDP/1.0', 1,
+                    CryptoVer=1, CryptoSwitch=222, CryptoAlg='aes128-ctr'))
+                for index, fragment in enumerate((negotiation[:5], negotiation[5:])):
+                    response = w.call(dict(op='dmsdp-receive', session=control_token,
+                        data=fragment.hex(), now_us=123456, capture=True))
+                    assert response['state']['negotiated'] is bool(index)
+                assert response['events'] == [dict(negotiated=True, cipher='aes128-ctr')]
+                assert control_packet(bytes.fromhex(response['pending'][0])).start == 'DMSDP/1.0 200 OK'
+                with_cipher = Cipher(auth.session_key)
+                try:
+                    heart = w.call(dict(op='dmsdp-heartbeat', session=control_token))
+                    assert control_packet(bytes.fromhex(heart['heartbeat']), with_cipher).start == 'GET_PARAMETER * DMSDP/1.0'
+                    keepalive = control_text('GET_PARAMETER * DMSDP/1.0', 31)
+                    wire = pack_frame(with_cipher.encrypt(keepalive), 0xab)
+                    response = w.call(dict(op='dmsdp-receive', session=control_token,
+                        data=wire.hex(), now_us=123457, capture=True))
+                    assert response['events'] == [dict(keepalive_received=True)]
+                    assert response['plaintexts'] == [keepalive.hex()]
+                finally:
+                    with_cipher.close()
                 sight = HiSightSession(w, auth.generation)
                 initial = sight.initial()
                 assert initial[4:].startswith(b'ANNOUNCE * RTSP/1.0')
@@ -210,10 +274,26 @@ def authentication(binary, library, rust_library):
                         encrypted = peer_cipher.encrypt(message('GET_PARAMETER * RTSP/1.0', 9, b'his_version\r\n'))
                         sight.receive(len(encrypted).to_bytes(4, 'big') + encrypted)
                         assert b'his_version: 1.0' in peer_cipher.decrypt(sight.pending[-1][4:])
+                        # DMSDP owns its established cipher after the successful
+                        # RFCOMM handoff, just as HiSight does.
+                        surviving = w.call(dict(op='dmsdp-heartbeat', session=control_token))
+                        assert surviving['state']['negotiated']
+                        dmsdp_cipher = Cipher(bytes(peer_cipher.key))
+                        try:
+                            request = control_text('GET_PARAMETER * DMSDP/1.0', 32)
+                            wire = pack_frame(dmsdp_cipher.encrypt(request), 0xab)
+                            received = w.call(dict(op='dmsdp-receive', session=control_token,
+                                data=wire.hex(), now_us=123458, capture=False))
+                            assert received['events'] == [dict(keepalive_received=True)]
+                            assert control_packet(bytes.fromhex(surviving['heartbeat']), dmsdp_cipher).start == 'GET_PARAMETER * DMSDP/1.0'
+                        finally:
+                            dmsdp_cipher.close()
                     finally:
                         peer_cipher.close()
                     replacement = RustAuth(w)
                     replacement.close()
+                rejected(w, dict(op='dmsdp-heartbeat', session=control_token),
+                    'DMSDP survived failed or replacement authentication')
                 try:
                     sight.receive(b'')
                 except ValueError:
@@ -225,7 +305,10 @@ def authentication(binary, library, rust_library):
                 auth.close()
                 n.close()
                 results.append(dict(phase=phase, keys_match=True, stale_auth_revoked=True,
-                    media_survives_completed_auth_channel=phase == 'auth'))
+                    media_survives_completed_auth_channel=phase == 'auth',
+                    dmsdp_authenticated_ipc=True, dmsdp_duplicate_preserves_original=True,
+                    dmsdp_stale_token_rejected=True,
+                    dmsdp_survives_completed_auth_channel=phase == 'auth'))
                 assert identity.read_bytes() == original
             finally:
                 if auth:
