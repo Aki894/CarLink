@@ -52,10 +52,11 @@ class Harness:
     address = '02:00:00:00:00:01'
     peer = '02:00:00:00:00:02'
 
-    def __init__(self, binary, base=None, pair_seconds=None, fail_ports=False):
+    def __init__(self, binary, base=None, pair_seconds=None, fail_ports=False, stall_prepare=False):
         self.base = free_ports() if base is None else base
         self.pair_seconds = pair_seconds
         self.fail_ports = fail_ports
+        self.stall_prepare = stall_prepare
         self.control_open = False
         self.sight = socket.socket()
         self.sight.bind(('127.0.0.1', 0))
@@ -144,6 +145,8 @@ class Harness:
             self.trace.append(('radio', operation))
             result = {'id': value['id'], 'ok': True}
             if operation == 'prepare':
+                if self.stall_prepare:
+                    continue
                 assert value['peer'] == (self.peer if self.pair_seconds is None else None)
                 assert value['pair_seconds'] == (self.pair_seconds or 0)
                 result.update(ready=True, address=self.address, offer={
@@ -280,6 +283,16 @@ class Harness:
 
 
 def run(binary):
+    preparing = Harness(binary, stall_prepare=True)
+    try:
+        preparing.wait(lambda: ('radio', 'prepare') in preparing.trace)
+        assert not preparing.event('ready')
+    finally:
+        preparing.close()
+    preparing.check()
+    assert preparing.process.returncode == 0
+    assert ('radio', 'close') in preparing.trace
+
     owner = Harness(binary)
     try:
         owner.authenticate()

@@ -106,7 +106,8 @@ impl Radio{
         let parsed=serde_json::from_slice(&bytes[..n as usize]).map_err(|_|"invalid radio private JSON".to_owned());wipe(&mut bytes[..n as usize]);Ok(Some(Packet{value:parsed?,fd:fds.pop()}))
     }
     fn call(&mut self,mut v:Value,timeout:Duration)->Result<Value>{self.next=self.next.checked_add(1).ok_or("radio request generation exhausted")?;v["id"]=self.next.into();self.send(&v)?;let until=Instant::now()+timeout;
-        loop{if let Some(packet)=self.receive()?{if packet.value["id"].as_u64()==Some(self.next){if packet.fd.is_some()||packet.value["ok"]!=true{return Err("radio operation rejected".into());}return Ok(packet.value);}if self.pending.len()>=8{return Err("radio event backlog exceeds limit".into());}self.pending.push_back(packet);}if Instant::now()>=until{return Err("radio operation timeout".into());}std::thread::sleep(Duration::from_millis(5));}}
+        loop{if STOP.load(Ordering::Relaxed)&&!self.closed{return Err("radio preparation interrupted".into());}
+            if let Some(packet)=self.receive()?{if packet.value["id"].as_u64()==Some(self.next){if packet.fd.is_some()||packet.value["ok"]!=true{return Err("radio operation rejected".into());}return Ok(packet.value);}if self.pending.len()>=8{return Err("radio event backlog exceeds limit".into());}self.pending.push_back(packet);}if Instant::now()>=until{return Err("radio operation timeout".into());}std::thread::sleep(Duration::from_millis(5));}}
     fn poll(&mut self)->Result<Option<Packet>>{if let Some(v)=self.pending.pop_front(){Ok(Some(v))}else{self.receive()}}
     fn close(&mut self){if !self.closed{self.closed=true;let _=self.call(json!({"op":"close"}),Duration::from_secs(7));finish(&mut self.child,Duration::from_millis(250));}}
 }
@@ -294,6 +295,6 @@ impl Owner{
     fn shutdown(&mut self){self.stop_projection();self.channels.clear();self.auth_close();self.worker.close();self.radio.close();event("stopped",self.epoch);}
 }
 impl Drop for Owner{fn drop(&mut self){self.shutdown();}}
-pub fn run(args:&[String])->Result<()>{let config=Config::parse(args)?;STOP.store(false,Ordering::Relaxed);unsafe{libc::signal(libc::SIGTERM,stop as *const () as libc::sighandler_t);libc::signal(libc::SIGINT,stop as *const () as libc::sighandler_t);}let mut owner=Owner::start(config)?;owner.run()}
+pub fn run(args:&[String])->Result<()>{let config=Config::parse(args)?;STOP.store(false,Ordering::Relaxed);unsafe{libc::signal(libc::SIGTERM,stop as *const () as libc::sighandler_t);libc::signal(libc::SIGINT,stop as *const () as libc::sighandler_t);}match Owner::start(config){Ok(mut owner)=>owner.run(),Err(_) if STOP.load(Ordering::Relaxed)=>Ok(()),Err(e)=>Err(e)}}
 }
 pub fn run(args:&[String])->Result<()>{#[cfg(unix)]{unix::run(args)}#[cfg(not(unix))]{let _=args;Err("HiCar backend requires Linux/Unix".into())}}

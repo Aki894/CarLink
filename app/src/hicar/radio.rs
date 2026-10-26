@@ -258,13 +258,21 @@ impl State{
 }
 
 #[derive(Serialize)]struct Offer{ssid:String,bssid:String,password:String,owner_ip:&'static str,client_ip:&'static str,frequency:u32,port:u16}
-struct Radio{bus:Bus,state:State,ipc:Ipc,c:Config,device:Option<String>,connection:Option<String>,previous:Option<String>,offer:Option<Offer>,agent:bool,profile:bool,business:bool,advertisement:bool,restore_connectable:bool,restore_bondable:bool,activated:bool}
+struct Radio{bus:Bus,state:State,ipc:Ipc,c:Config,device:Option<String>,connection:Option<String>,previous:Option<String>,offer:Option<Offer>,agent:bool,profile:bool,business:bool,advertisement:bool,restore_connectable:bool,restore_bondable:bool,activated:bool,startup_cancelled:bool,startup_close_id:Option<Value>}
 impl Radio{
     fn call(&mut self,d:&str,p:&str,i:&str,m:&str,a:Vec<Arg>,timeout:Duration)->Result<Vec<Arg>>{self.bus.call(&mut self.state,&mut self.ipc,d,p,i,m,a,timeout)}
     fn bluez(&mut self,p:&str,i:&str,m:&str,a:Vec<Arg>)->Result<Vec<Arg>>{self.call("org.bluez",p,i,m,a,Duration::from_secs(5))}
     fn nm(&mut self,p:&str,i:&str,m:&str,a:Vec<Arg>)->Result<Vec<Arg>>{self.call("org.freedesktop.NetworkManager",p,i,m,a,Duration::from_secs(5))}
     fn property(&mut self,d:&str,p:&str,i:&str,k:&str)->Result<Arg>{let mut result=self.call(d,p,PROPERTIES,"Get",vec![text(i),text(k)],Duration::from_secs(3))?;if result.len()!=1{return Err("missing D-Bus property".into());}Ok(result.remove(0))}
+    fn check_startup_cancel(&mut self)->Result<()>{
+        if let Some(command)=self.ipc.receive()?{
+            if command["op"]!="close"{return Err("radio operation before preparation completed".into());}
+            self.startup_cancelled=true;self.startup_close_id=command.get("id").cloned();self.state.closing=true;
+            return Err("radio preparation cancelled".into());
+        }Ok(())
+    }
     fn prepare(&mut self)->Result<String>{
+        self.check_startup_cancel()?;
         self.bus.bluez=self.bus.owner(&mut self.state,&mut self.ipc,"org.bluez")?;
         let p=self.c.adapter.clone();let powered=self.property("org.bluez",&p,"org.bluez.Adapter1","Powered")?;
         if powered.boolean()!=Some(true){return Err("Bluetooth adapter is powered off".into());}
@@ -272,7 +280,7 @@ impl Radio{
         // Receive only BlueZ's property changes, not application bus traffic.
         self.call("org.freedesktop.DBus","/org/freedesktop/DBus","org.freedesktop.DBus","AddMatch",vec![text("type='signal',sender='org.bluez',interface='org.freedesktop.DBus.Properties'")],Duration::from_secs(3))?;
         for name in ["org.bluez","org.freedesktop.NetworkManager"]{self.call("org.freedesktop.DBus","/org/freedesktop/DBus","org.freedesktop.DBus","AddMatch",vec![text(&format!("type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='{name}'"))],Duration::from_secs(3))?;}
-        if self.c.network{self.hotspot()?;}Ok(address)
+        if self.c.network{self.hotspot()?;}self.check_startup_cancel()?;Ok(address)
     }
     fn hotspot(&mut self)->Result<()>{
         let interface=self.c.interface.as_ref().ok_or("wireless interface required")?.clone();
@@ -303,8 +311,14 @@ impl Radio{
         // The adapter may still report the previous AP's type/channel, so the
         // exact address on this interface is required before listeners bind.
         let deadline=Instant::now()+Duration::from_secs(12);loop{
+            // Parent cancellation must reach cleanup before the manager's
+            // bounded group stop. Each external diagnostic has a 3s limit;
+            // check between them rather than waiting for the whole IP window.
+            self.check_startup_cancel()?;
             let info=command("iw",&["dev",&interface,"info"])?;let info=String::from_utf8_lossy(&info);
+            self.check_startup_cancel()?;
             let addresses:Value=serde_json::from_slice(&command("ip",&["-j","address"])?).map_err(|_|"invalid hotspot interface addresses")?;
+            self.check_startup_cancel()?;
             if info.contains("type AP")&&info.contains("(5745 MHz)")&&hotspot_ipv4_ready(&addresses,&interface){break;}
             if Instant::now()>=deadline{return Err("5 GHz hotspot IPv4 not ready".into());}std::thread::sleep(Duration::from_millis(100));
         }
@@ -353,7 +367,7 @@ pub fn run(fd:i32)->Result<()>{
     let until=Instant::now()+Duration::from_secs(15);let config=loop{if let Some(v)=ipc.receive()?{break v;}if Instant::now()>until{return Err("missing private radio configuration".into());}std::thread::sleep(Duration::from_millis(10));};
     let c:Config=serde_json::from_value(config.clone()).map_err(|_|"invalid radio configuration")?;validate(&c)?;
     let state=State{selection:Selection::new(&c)?,payload:beacon(&c.model,c.sequence)?,power:c.tx_power,instance:0,stopped:false,closing:false,slots:BTreeSet::new(),origin:Instant::now()};
-    let bus=Bus::open()?;let mut radio=Radio{bus,state,ipc,c,device:None,connection:None,previous:None,offer:None,agent:false,profile:false,business:false,advertisement:false,restore_connectable:false,restore_bondable:false,activated:false};
+    let bus=Bus::open()?;let mut radio=Radio{bus,state,ipc,c,device:None,connection:None,previous:None,offer:None,agent:false,profile:false,business:false,advertisement:false,restore_connectable:false,restore_bondable:false,activated:false,startup_cancelled:false,startup_close_id:None};
     let result=(||{
         let address=radio.prepare()?;radio.ipc.send(&json!({"id":config.get("id"),"ok":true,"ready":true,"address":address,"offer":radio.offer}),None)?;
         loop{
@@ -371,7 +385,13 @@ pub fn run(fd:i32)->Result<()>{
             let mut busfd=0;unsafe{(radio.bus.api.get_fd)(radio.bus.connection,&mut busfd);}
             let mut fds=[libc::pollfd{fd:radio.ipc.fd.as_raw_fd(),events:libc::POLLIN,revents:0},libc::pollfd{fd:busfd,events:libc::POLLIN,revents:0}];unsafe{libc::poll(fds.as_mut_ptr(),2,50);}
         }Ok(())
-    })();radio.cleanup();result
+    })();radio.cleanup();
+    if radio.startup_cancelled{
+        // Acknowledge only after temporary networking has been removed and
+        // the previous connection restored. EOF has no request to acknowledge.
+        if let Some(id)=radio.startup_close_id.take(){let _=radio.ipc.send(&json!({"id":id,"ok":true,"closed":true}),None);}
+        Ok(())
+    }else{result}
 }
 }
 pub fn run(fd:i32)->Result<()>{#[cfg(unix)]{linux::run(fd)}#[cfg(not(unix))]{let _=fd;Err("radio worker requires Linux/Unix".into())}}

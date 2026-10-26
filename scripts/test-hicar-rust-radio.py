@@ -299,7 +299,9 @@ if Path(sys.argv[0]).name=='ip':
     if state_path.exists():
         state=json.loads(state_path.read_text());state['polls']+=1
         state_path.write_text(json.dumps(state))
-        if state['polls']==1:
+        if os.environ.get('CARLINK_RADIO_DELAY_IP_FOREVER')=='1':
+            pass
+        elif state['polls']==1:
             addresses.append(dict(ifname='other0',addr_info=[dict(family='inet',local='192.168.49.1',prefixlen=24)]))
         else:
             addresses[0]['addr_info']=[dict(family='inet',local='192.168.49.1',prefixlen=16 if state['polls']==2 else 24)]
@@ -389,6 +391,43 @@ else:
             assert await asyncio.to_thread(process.wait,8)==0
             assert len(profiles.unregistered)==previous+2
             assert process.stdout.read()==b'' and process.stderr.read()==b''
+            process.stdout.close();process.stderr.close()
+            # Cancellation while NM is activated but its IPv4 never arrives
+            # must restore networking without waiting for the 12s IP deadline.
+            for explicit_close in (True,False):
+                ip_state.unlink(missing_ok=True)
+                network.activated.clear();connection.deleted=False;device.disconnected=False
+                parent,child=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET)
+                cancelled_env=dict(env,CARLINK_RADIO_DELAY_IP_FOREVER='1')
+                process=subprocess.Popen([*json.loads(os.environ.get('CARLINK_RUST_RUNNER','[]')),
+                    binary,'hicar','radio-worker',str(child.fileno())],pass_fds=(child.fileno(),),
+                    stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=cancelled_env)
+                child.close();channel=Channel(parent)
+                channel.send(dict(id=0,model='00040A00',sequence=7,network=True,interface='lo',
+                    manage_controller=False,peer='02:00:00:00:00:02'))
+                deadline=asyncio.get_running_loop().time()+6
+                while True:
+                    try:
+                        polls=json.loads(ip_state.read_text())['polls']
+                    except (FileNotFoundError,json.JSONDecodeError):
+                        polls=0
+                    if polls>=2:
+                        break
+                    assert process.poll() is None, 'radio exited before delayed-IP cancellation fixture'
+                    assert asyncio.get_running_loop().time()<deadline, 'radio did not reach delayed-IP wait'
+                    await asyncio.sleep(.02)
+                cancelled_at=asyncio.get_running_loop().time()
+                if explicit_close:
+                    reply=await asyncio.to_thread(channel.call,'close')
+                    assert reply['closed'] and connection.deleted and network.activated==[NM_NEW,NM_OLD]
+                else:
+                    channel.close();channel=None
+                assert await asyncio.to_thread(process.wait,7)==0
+                assert asyncio.get_running_loop().time()-cancelled_at<7
+                assert connection.deleted and device.disconnected and network.activated==[NM_NEW,NM_OLD]
+                assert process.stdout.read()==b'' and process.stderr.read()==b''
+                process.stdout.close();process.stderr.close()
+                if channel:channel.close();channel=None
         finally:
             if channel:channel.close()
             if process and process.poll() is None:process.kill();process.wait(timeout=3)
@@ -405,7 +444,7 @@ else:
         callback_dispatch_during_registration=True,scm_rights=True,peer_selection=True,
         unsaved_network_settings=True,network_restored=True,credentials_absent_from_argv=True,
         delayed_ipv4_readiness=True,no_ethernet_dependency=True,
-        cleanup=True,parent_eof_cleanup=True)))
+        cleanup=True,parent_eof_cleanup=True,startup_close_cleanup=True,startup_eof_cleanup=True)))
 
 
 if __name__=='__main__':
