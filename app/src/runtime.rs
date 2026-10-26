@@ -101,6 +101,7 @@ impl Endpoint {
                 log("hu_video_preference", &format!("{:?}", crate::carlife::video_hint(&message.payload).map_err(|e| e.to_string())?));
             }
             if let Some(live)=self.live.as_mut() {
+                live.microphone(&message);
                 if !live.accepts_input(){self.input=crate::input::Input::default();}
                 if let Some(config)=self.session.video_config().filter(|_|live.accepts_input()) {
                     match self.input.handle(&message,self.clock.elapsed().as_millis() as u64) {

@@ -11,7 +11,7 @@
 - 最终版本已验证断电后开机自启及 CarPlay 自动重连；固定 PIN 配对页经真实菜单点击显示，取消后按原策略恢复 CarPlay，CarLife PID `968` 与 USB 连接保持不变。配对不生成或轮换原有 PIN。
 - 补齐热点 IPv4 就绪等待、启动阶段取消清理、会话代际过滤、静态关键帧恢复，以及 AOA bulk 启用后 30 秒未完成初次 `VIDEO_START` 的 USB 握手恢复。成功连接后的静态/暂停会话不重启。
 
-本轮按用户要求交付台架版本。Lexus 先前的 80%/0% 连接问题、实体触控板映射，以及独立 HU 的 HiCar 音频/麦克风/通话，留待实车验收。公开文档不保存 PIN、身份或配对数据；本地回执在私有 `.build/hicar-research/rust-pin-final/`、`rust-pin-firmware-final/` 和 `rust-owner-release/`。详细架构与阶段记录见 [HiCar Rust 集成](hicar-rust.md)。
+本轮按用户要求交付台架版本。Lexus 先前的 80%/0% 连接问题、实体触控板映射，以及独立 HU 的 HiCar 可听音频，留待实车验收。麦克风/通话尚未实现，HiCar 多音源分流与混音仍需补齐，详见[完成情况核对](status-audit.md)。公开文档不保存 PIN、身份或配对数据；本地回执在私有 `.build/hicar-research/rust-pin-final/`、`rust-pin-firmware-final/` 和 `rust-owner-release/`。详细架构与阶段记录见 [HiCar Rust 集成](hicar-rust.md)。
 
 
 ## 2026-10-25：R2 第二段，Rust HiSight 控制与退出修复

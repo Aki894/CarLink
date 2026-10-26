@@ -114,7 +114,7 @@ def install(project, app, receiver, rootfs):
     if destination.exists():
         shutil.rmtree(destination)
     shutil.copytree(receiver, destination)
-    for name in ('bin/openxplay-relay', 'bin/oxp-relay', 'bin/carlink-audio', 'probe.py', 'forward.py', 'supervisor.py', 'run-carplay.sh', 'run-carlink.sh'):
+    for name in ('bin/openxplay-relay', 'bin/oxp-relay', 'bin/carlink-audio', 'probe.py', 'forward.py', 'voice.py', 'supervisor.py', 'run-carplay.sh', 'run-carlink.sh'):
         (destination / name).chmod(0o755)
     bindir = rootfs / 'usr/local/bin'
     bindir.mkdir(parents=True, exist_ok=True)

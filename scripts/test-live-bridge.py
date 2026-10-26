@@ -141,6 +141,41 @@ with tempfile.TemporaryDirectory(prefix='carlink-live-ci-') as directory:
                     if isinstance(event, tuple) and event[0] == 17:
                         keys.append(struct.unpack('<HB', event[-1]))
                 assert keys == [(3, 1), (3, 0)], keys
+                # Real CarLife VR PCM uplink -> bridge -> OXP microphone packets.
+                probe.send_json(source, {'type':'mic','stream':1,'request':{
+                    'codec':'PCM_S16LE','sampleRate':16000,'channels':1,'frameMs':20}})
+                while media.packet(hu)[1] != 0x10024:
+                    pass
+                mic_pcm = struct.pack('<h', 731) * 512
+                inner = struct.pack('>III', len(mic_pcm), 100, 0x58001) + mic_pcm
+                hu.sendall(struct.pack('>II', 5, len(inner)) + inner)
+                while True:
+                    event = probe.receive(source)
+                    if isinstance(event, tuple) and event[0] == 3:
+                        assert event[1] == 1 and event[-1] == mic_pcm[:640]
+                        break
+                probe.send_json(source, {'type':'mic','stream':1,'request':None})
+                while media.packet(hu)[1] != 0x10023:
+                    pass
+                # Calls have their own role; 16 kHz mono becomes HU stereo PCM.
+                probe.send_json(source, {'type':'audio-format','stream':1,'format':{
+                    'role':'TELEPHONY','codec':'PCM_S16LE','sampleRate':16000,'channels':1}})
+                def send_call():
+                    for seq in range(30):
+                        data = probe.HEADER.pack(2,1,0,0,seq,seq*20000,time.monotonic_ns()//1000) + bytes(mic_pcm[:640])
+                        source.sendall(struct.pack('<I',len(data))+data)
+                        time.sleep(.02)
+                    probe.send_json(source, {'type':'audio-format','stream':1,'format':None})
+                call_thread = threading.Thread(target=send_call)
+                call_thread.start()
+                call_seen = set()
+                while not {0x30001,0x30006,0x30002} <= call_seen:
+                    _, message_id, _, data = media.packet(hu)
+                    call_seen.add(message_id)
+                    if message_id == 0x30006:
+                        assert len(data) == 3528 and any(data)
+                call_thread.join(3)
+                assert not call_thread.is_alive()
     finally:
         for child in reversed(children):
             if child.poll() is None:
@@ -151,4 +186,4 @@ with tempfile.TemporaryDirectory(prefix='carlink-live-ci-') as directory:
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait(timeout=3)
-print('Synthetic OXP -> ARM audio resampler -> CarLife media + reverse touch passed')
+print('Synthetic OXP -> ARM audio resampler -> CarLife media, duplex calls, microphone stop and reverse touch passed')

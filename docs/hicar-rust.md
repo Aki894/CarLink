@@ -27,7 +27,7 @@ carlink manager
 | 阶段 | 当前实现 | 验证进度 |
 | --- | --- | --- |
 | R1：协议与认证基础 | 有界分帧、严格 JSON、Nearby/TLV/CRC、DMSDP/HiSight、RTP/ADTS、AES-CTR、时钟、UIBC、HiChain/HUKS FFI | 已完成差分、异常输入、截断、持久化及双向认证测试 |
-| R2：真实连接与媒体 | Rust 拥有 BlueZ、热点、TCP、认证、DMSDP/RTSP、音视频和输入生命周期 | 集成实现及 H3 台架回归已通过；独立 HU 音频、麦克风/通话与 Lexus 实车验收待完成 |
+| R2：真实连接与媒体 | Rust 拥有 BlueZ、热点、TCP、认证、DMSDP/RTSP、基础音视频和输入生命周期 | Rust 迁移及 H3 台架回归已完成；独立 HU 音频与 Lexus 待验收。麦克风/通话尚未实现，多音源分流待补齐，见[完成情况核对](status-audit.md) |
 | R3：统一产品管理 | 常驻 CarLife、协议互斥、设备记录、开机重连、菜单切换、断线回菜单、启动恢复 | 已接入并完成台架操作与断线恢复测试；真实触控板和实车场景继续验收 |
 
 源码检查、编译、镜像结构校验、开发板与实车验证分别记录。完整验收清单以 [验证记录](validation.md) 和 [连接管理设计](connection-management.md) 为准。
@@ -57,7 +57,7 @@ HiSight `left_move` 对应事件 2。确认、返回、主页及方向键保持�
 
 `c79c4ba` 的 H3 媒体、无线、原生 IPC、后端四组回归全部通过；PIN 版本复用同一后端实现。真实连接持续 361.0 秒，HiCar 后端 PID `867`、CarLife PID `32183` 保持不变，并完成应用网格点击。另一轮强制停止真实 HiCar 源后，车机实际渲染出 CarLink 菜单，CarLife PID `29631` 保持不变；恢复菜单不需要重建 USB 输出进程。随后切换 CarPlay，HiCar worker 数量归零，用户确认画面、声音和操作正常。最终 PIN 版本断电重启后自动连回 CarPlay，CarLife 握手和菜单显示恢复。
 
-当前台架使用同一台华为手机同时承担 HiCar 源与 CarLife HU。画面与输入可直接验证，音频存在同机 `AUDIO_DEVICE_OUT_PROXY` 路由影响。独立 HU 的可听音频、麦克风/通话，以及 Lexus 曾出现的 80%/0% 连接失败，保留为外部硬件验收项目。
+当前台架使用同一台华为手机同时承担 HiCar 源与 CarLife HU。画面与输入可直接验证，音频存在同机 `AUDIO_DEVICE_OUT_PROXY` 路由影响。独立 HU 的可听音频以及 Lexus 曾出现的 80%/0% 连接失败保留为外部硬件验收项目。麦克风/通话尚需实现协议与实时数据通路，另立功能阶段跟踪。
 
 ## 历史迁移证据
 

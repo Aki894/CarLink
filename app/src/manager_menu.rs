@@ -175,9 +175,11 @@ impl Pipe {
     }
 }
 fn valid(f:&Frame,reverse:bool)->bool{
-    if reverse{return f.kind==129 && f.flags==0 && f.payload.len()<=16384 && serde_json::from_slice::<Value>(&f.payload).is_ok();}
+    if reverse{return f.flags==0 && (f.kind==129 && f.payload.len()<=16384 && serde_json::from_slice::<Value>(&f.payload).is_ok()
+        ||f.kind==130&&(10..=16392).contains(&f.payload.len())&&f.payload.len()%2==0);}
     match f.kind {1=>f.flags==0&&f.payload==configure().payload,2=>f.flags<=3&&!f.payload.is_empty()&&f.payload.len()<=MENU_BYTES&&(f.payload.starts_with(&[0,0,1])||f.payload.starts_with(&[0,0,0,1])),
-        3=>f.flags<=3&&!f.payload.is_empty()&&f.payload.len()<=65536&&f.payload.len()%4==0,4=>f.flags<=1&&f.payload.is_empty(),5=>f.flags<=1&&f.payload.len()==1&&f.payload[0]<=1,6=>f.flags==0&&f.payload.is_empty(),_=>false}
+        3=>f.flags<=3&&!f.payload.is_empty()&&f.payload.len()<=65536&&f.payload.len()%4==0,4=>f.flags<=1&&f.payload.is_empty(),5=>f.flags<=3&&f.payload.len()==1&&f.payload[0]<=1,6=>f.flags==0&&f.payload.is_empty(),
+        7=>f.flags==0&&f.payload.len()<=1024&&serde_json::from_slice::<Value>(&f.payload).is_ok(),_=>false}
 }
 fn connect_output(path:&Path)->std::io::Result<UnixStream>{
     // AF_UNIX connect can otherwise block indefinitely when a stale listener's
@@ -204,7 +206,7 @@ impl Worker {
     fn lose_source(&mut self){self.back_frames.clear();self.back_last=None;self.back_first=None;let _=self.events.try_send(json!({"type":"source-state","active":false}));self.source=None;self.source_active=false;self.source_key=None;self.waiting_key=true;self.touch=None;self.last_key=None;self.stop_source_media();}
     fn stop_source_media(&mut self){
         if let Some(h)=self.hu.as_mut(){h.discard_media();}self.painted=None;
-        self.output(Frame::new(5,0,vec![0]));self.output(Frame::new(5,1,vec![0]));
+        for role in 0..4{self.output(Frame::new(5,role,vec![0]));}
         if !self.snapshot.visible{self.output(Frame::new(4,0,vec![]));}
     }
     fn request_key(&mut self){if self.last_key.is_none_or(|t|t.elapsed()>=Duration::from_millis(250)){self.last_key=Some(Instant::now());self.source(keyframe());}}
@@ -237,6 +239,7 @@ impl Worker {
     fn flush_backs(&mut self){let pending=std::mem::take(&mut self.back_frames);self.back_last=None;self.back_first=None;for f in pending{self.source(f);}}
     fn back_expired(&self,now:Instant)->bool{self.back_last.is_some_and(|t|now.duration_since(t)>=Duration::from_millis(350))||self.back_first.is_some_and(|t|now.duration_since(t)>=Duration::from_millis(900))}
     fn input(&mut self,f:Frame){
+        if f.kind==130{self.source(f);return;}
         let Ok(v)=serde_json::from_slice::<Value>(&f.payload)else{return;};
         if !self.snapshot.visible {
             let now=Instant::now();if self.back_expired(now){self.flush_backs();}

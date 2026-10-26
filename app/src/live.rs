@@ -30,8 +30,9 @@ fn decode(body: &[u8]) -> Result<Frame, String> {
         2 => f.flags <= 3 && !f.payload.is_empty() && f.payload.len() <= 512*1024 && (f.payload.starts_with(&[0,0,0,1]) || f.payload.starts_with(&[0,0,1])),
         3 => f.flags <= 3 && !f.payload.is_empty() && f.payload.len() <= 64*1024 && f.payload.len()%4 == 0,
         4 => f.flags <= 1 && f.payload.is_empty(),
-        5 => f.flags <= 1 && f.payload.len() == 1 && f.payload[0] <= 1,
+        5 => f.flags <= 3 && f.payload.len() == 1 && f.payload[0] <= 1,
         6 => f.flags==0 && f.payload.is_empty(),
+        7 => f.flags==0 && f.payload.len()<=1024 && serde_json::from_slice::<serde_json::Value>(&f.payload).is_ok(),
         _ => false,
     };
     if !valid { return Err("invalid live media kind, flags or payload".into()); }
@@ -49,8 +50,8 @@ pub struct LiveSource {
     input: Vec<u8>, output: VecDeque<Vec<u8>>, output_offset: usize,
     queue: VecDeque<Frame>, queued: usize,
     active: bool, configured: bool, playing: bool, waiting_key: bool,
-    audio_active: [bool; 2], audio_pending: VecDeque<Message>,
-    base_pts: Option<u64>, origin_ms: u32, last_ms: u32, stamps: [u32;3], generation: u64, warned_role: bool,
+    audio_active: [bool; 4], audio_pending: VecDeque<Message>, voice:crate::voice::Voice,
+    base_pts: Option<u64>, origin_ms: u32, last_ms: u32, stamps: [u32;5], generation: u64,
     report_at:Instant, video_dropped:u64, age_max_us:u64, audio_generation:u64, keyframe_at:Option<Instant>,
 }
 impl LiveSource {
@@ -62,11 +63,18 @@ impl LiveSource {
             std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600)).map_err(|e|e.to_string())?;
             listener.set_nonblocking(true).map_err(|e|e.to_string())?;
             Ok(Self {listener,peer:None,path:path.into(),input:Vec::new(),output:VecDeque::new(),output_offset:0,queue:VecDeque::new(),queued:0,
-                active:false,configured:false,playing:false,waiting_key:true,audio_active:[false;2],audio_pending:VecDeque::new(),base_pts:None,origin_ms:0,last_ms:0,stamps:[0;3],generation:0,warned_role:false,report_at:Instant::now(),video_dropped:0,age_max_us:0,audio_generation:0,keyframe_at:None})
+                active:false,configured:false,playing:false,waiting_key:true,audio_active:[false;4],audio_pending:VecDeque::new(),voice:crate::voice::Voice::default(),base_pts:None,origin_ms:0,last_ms:0,stamps:[0;5],generation:0,report_at:Instant::now(),video_dropped:0,age_max_us:0,audio_generation:0,keyframe_at:None})
         }
     }
     pub fn generation(&self)->[u64;2] { [self.generation,self.audio_generation] }
     pub fn accepts_input(&self)->bool {self.active && self.playing}
+    pub fn microphone(&mut self,message:&Message){
+        if !self.active || !self.playing{return;}
+        if let Some(wire)=self.voice.pcm(message){
+            if self.output.len()>=32{self.disconnect();return;}
+            self.output.push_back(wire);
+        }
+    }
     pub fn clock_floor(&mut self, ms:u32) {if self.base_pts.is_none(){self.origin_ms=self.last_ms.max(ms);}}
     pub fn heartbeat(&mut self, ms:u32)->u32 {self.stamps[0]=self.stamps[0].max(ms);self.last_ms=self.last_ms.max(ms);self.stamps[0]}
     pub fn feedback(&mut self,json:&str) {
@@ -80,6 +88,7 @@ impl LiveSource {
         self.output.push_back(wire(json));
     }
     pub fn reset(&mut self) {
+        self.voice.stop();
         self.queue.clear(); self.queued=0; self.audio_pending.clear(); self.base_pts=None; self.origin_ms=self.last_ms; self.waiting_key=true; self.generation=self.generation.wrapping_add(1);
         self.audio_generation=self.audio_generation.wrapping_add(1);
         self.stop_audio(); self.feedback("{\"type\":\"keyframe\",\"screen\":0}");
@@ -95,11 +104,12 @@ impl LiveSource {
     fn stop_role(&mut self, role:u8) {
         if self.audio_active[role as usize] {
             self.audio_active[role as usize]=false;
-            self.audio_pending.push_back(packet(if role==0 {Channel::Media}else{Channel::Tts},
-                if role==0 {0x30002}else{0x40002},self.last_ms,Vec::new()));
+            let (channel,_,_,stop)=audio_lane(role);
+            self.audio_pending.push_back(packet(channel,stop,self.last_ms,Vec::new()));
         }
+        if role==2{self.voice.speech(false);}if role==3{self.voice.call(false);}
     }
-    fn stop_audio(&mut self) { self.stop_role(0); self.stop_role(1); }
+    fn stop_audio(&mut self) { for role in 0..4{self.stop_role(role);} }
     pub fn set_playing(&mut self,value:bool) { if self.playing!=value { self.playing=value; self.reset(); } }
     pub fn set_audio_allowed(&mut self,value:bool) { if !value {
         self.queue.retain(|f|f.kind!=3);self.queued=self.queue.iter().map(|f|f.payload.len()).sum();
@@ -118,18 +128,27 @@ impl LiveSource {
             },
             4 => { let active=f.flags==1; if active!=self.active {self.active=active;self.reset();} },
             5 => {
+                if f.flags==2{self.voice.speech(f.payload[0]==1);}if f.flags==3{self.voice.call(f.payload[0]==1);}
                 if f.payload[0]==0 {
                     let role=f.flags;
                     self.queue.retain(|q|q.kind!=3 || q.flags!=role);
                     self.queued=self.queue.iter().map(|q|q.payload.len()).sum();
-                    self.audio_pending.retain(|m|m.channel!=if role==0{Channel::Media}else{Channel::Tts});
+                    self.audio_pending.retain(|m|m.channel!=audio_lane(role).0);
                     self.stop_role(role);
                 }
             },
             6 => self.recover_video(),
+            7 => {
+                let v:serde_json::Value=serde_json::from_slice(&f.payload).map_err(|_|"invalid microphone request")?;
+                let generation=v["generation"].as_u64().filter(|v|*v>0).ok_or("invalid microphone generation")?;
+                let active=v["active"].as_bool().ok_or("invalid microphone state")?;
+                if v["sample_rate"]!=16000||v["channels"]!=1{return Err("microphone requires 16000 Hz mono PCM16".into());}
+                if !self.active||!self.configured{return Ok(());}
+                self.voice.microphone(generation,active);
+            },
             _ => {
                 if !self.active || !self.configured || !self.playing {return Ok(());}
-                if f.kind==3 && f.flags>1 {if !self.warned_role {crate::runtime::log("live_audio_role_unsupported","VOICE/TELEPHONY require dedicated negotiation");self.warned_role=true;}return Ok(());}
+                if f.kind==3&&self.voice.call&&f.flags<2{return Ok(());}
                 let lane_count=self.queue.iter().filter(|q|q.kind==f.kind && (f.kind==2 || q.flags==f.flags)).count();
                 if self.queued+f.payload.len()>MAX_QUEUED || lane_count>=if f.kind==2{4}else{6} {
                     if f.kind==3{return Ok(());}
@@ -180,6 +199,7 @@ impl LiveSource {
             crate::runtime::log("live_latency",&format!("pending={} bytes={} age_max_ms={} video_dropped={}",self.queue.len(),self.queued,self.age_max_us/1000,self.video_dropped));
             self.report_at=Instant::now();self.age_max_us=0;
         }
+        if let Some(message)=self.voice.pop(){return Some(message);}
         if let Some(message)=self.audio_pending.pop_front(){return Some(message);}
         let f=self.queue.pop_front()?;self.queued-=f.payload.len();
         let age=if f.kind==2 && f.flags&2!=0 {monotonic_us().map(|now|now.saturating_sub(f.pts)).unwrap_or(0)}else{f.arrived.elapsed().as_micros() as u64};
@@ -195,17 +215,23 @@ impl LiveSource {
         self.stamps[lane]=timestamp;self.last_ms=self.last_ms.max(timestamp);
         if f.kind==2{return Some(packet(Channel::Video,0x20001,timestamp,f.payload));}
         if !audio_allowed{return None;}
-        let channel=if f.flags==0{Channel::Media}else{Channel::Tts};
-        let data_id=if f.flags==0{0x30006}else{0x40003};
+        let (channel,init_id,data_id,_)=audio_lane(f.flags);
         let data=packet(channel,data_id,timestamp,f.payload);
         if !self.audio_active[f.flags as usize] {
             self.audio_active[f.flags as usize]=true;
-            let init=packet(channel,if f.flags==0{0x30001}else{0x40001},timestamp,vec![8,0xc4,0xd8,2,16,2,24,16]);
+            if f.flags==3{self.stop_role(0);self.voice.call(true);}
+            if f.flags==2{self.voice.speech(true);}
+            let init=packet(channel,init_id,timestamp,vec![8,0xc4,0xd8,2,16,2,24,16]);
             self.audio_pending.push_back(init);self.audio_pending.push_back(data);return self.audio_pending.pop_front();
         }
         Some(data)
     }
 }
+fn audio_lane(role:u8)->(Channel,u32,u32,u32){match role {
+    0|3=>(Channel::Media,0x30001,0x30006,0x30002),
+    1=>(Channel::Tts,0x40001,0x40003,0x40002),
+    _=>(Channel::Vr,0x50002,0x50003,0x50004),
+}}
 fn packet(channel:Channel,id:u32,ms:u32,payload:Vec<u8>)->Message{Message{channel,id,timestamp_ms:Some(ms),reserved:0,payload}}
 impl Drop for LiveSource { fn drop(&mut self){ #[cfg(unix)] if std::fs::symlink_metadata(&self.path).map(|m|m.file_type().is_socket()).unwrap_or(false){let _=std::fs::remove_file(&self.path);} } }
 

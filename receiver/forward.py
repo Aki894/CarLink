@@ -22,11 +22,11 @@ VIDEO_BUDGET = .12
 AUDIO_BUDGET = .12
 AUDIO_DECODE_BUDGET = .5  # Compressed AirPlay audio arrives in bursts before PCM pacing.
 PCM_CHUNK = 3528  # 20 ms, 44100 Hz, stereo S16LE
-ROLES = {'MEDIA': 0, 'ALERT': 1}
+ROLES = {'MEDIA': 0, 'ALERT': 1, 'VOICE': 2, 'TELEPHONY': 3}
 
 
 def packet(kind, payload=b'', flags=0, pts=0):
-    if kind not in (1, 2, 3, 4, 5, 6) or not 0 <= flags <= 255 or not 0 <= pts < 1 << 64:
+    if kind not in (1, 2, 3, 4, 5, 6, 7) or not 0 <= flags <= 255 or not 0 <= pts < 1 << 64:
         raise ValueError('invalid live header')
     if len(payload) > (MAX_VIDEO if kind == 2 else 65536):
         raise ValueError('live payload too large')
@@ -94,6 +94,7 @@ class LiveLink:
         self.source_dropped = 0
         self.video_frames = self.video_bytes = 0
         self.report_at = time.monotonic()
+        self.microphone_request = None
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -112,6 +113,8 @@ class LiveLink:
     def session(self, active):
         with self.lock:
             self.active = active
+            if not active:
+                self.microphone_request = None
             self._clear()
             self._put(4, flags=int(active))
             if self.config:
@@ -133,6 +136,12 @@ class LiveLink:
             self.pending = deque(kept)
             self.size = sum(len(w) for _, w, _ in kept)
             self._put(5, bytes([int(active)]), flags=role)
+
+    def microphone(self, value):
+        import voice
+        with self.lock:
+            self.microphone_request = voice.request_bytes(value)
+            self._put(7, self.microphone_request)
 
     def recover_video(self):
         with self.lock:
@@ -198,6 +207,8 @@ class LiveLink:
                         self._put(4, flags=int(self.active))
                         if self.config:
                             self._put(1, self.config)
+                        if self.microphone_request:
+                            self._put(7, self.microphone_request)
                     self.feedback({'type': 'keyframe', 'screen': 0})
                     incoming = bytearray()
                     while not self.closed.is_set():
@@ -226,14 +237,22 @@ class LiveLink:
                             incoming.extend(data)
                             while len(incoming) >= 4:
                                 size = struct.unpack_from('<I', incoming)[0]
-                                if not LIVE.size <= size <= 4096:
+                                if not LIVE.size <= size <= 16404:
                                     raise ValueError('invalid live control length')
                                 if len(incoming) < size + 4:
                                     break
                                 kind, flags, reserved, _ = LIVE.unpack_from(incoming, 4)
-                                if kind != 129 or flags or reserved:
+                                if kind not in (129, 130) or flags or reserved:
                                     raise ValueError('invalid live control header')
-                                value = json.loads(incoming[16:4 + size])
+                                payload = incoming[16:4 + size]
+                                if kind == 130:
+                                    if len(payload) < 10 or len(payload) % 2:
+                                        raise ValueError('invalid microphone feedback')
+                                    value = dict(type='microphone-pcm', generation=struct.unpack_from('<Q', payload)[0], pcm=bytes(payload[8:]))
+                                else:
+                                    if size > 4096:
+                                        raise ValueError('oversized control JSON')
+                                    value = json.loads(payload)
                                 del incoming[:4 + size]
                                 self.feedback(value)
             except (OSError, EOFError, ValueError, TypeError):
@@ -369,6 +388,7 @@ class AudioDecoder:
 
 def run(args):
     import probe
+    import voice
     server = probe.listener(args.unix)
     link = None
     decoders, formats, retry_due = {}, {}, {}
@@ -385,9 +405,17 @@ def run(args):
             if not isinstance(hello, dict) or hello.get('type') != 'hello' or hello.get('role') != 'producer' or hello.get('version') != 0:
                 raise ValueError('invalid producer hello')
             control_lock = threading.Lock()
+            microphone = None
+
+            def send_microphone(data):
+                with control_lock:
+                    stream.sendall(data)
 
             def feedback(value):
                 try:
+                    if value.get('type') == 'microphone-pcm':
+                        microphone.feed(value['generation'], value['pcm'])
+                        return
                     with control_lock:
                         probe.control(stream, value)
                 except (OSError, ValueError, TypeError, KeyError):
@@ -398,8 +426,9 @@ def run(args):
                 decoders=[dict(codecString='avc1.64001F', hardware=False)],
                 displays={'0': dict(widthPx=args.width, heightPx=args.height, densityDpi=160,
                     refreshHz=30, frameRate='FPS_30', safeArea=dict(left=0, top=0, right=0, bottom=0))},
-                touch=10, keys=list(range(10)), audio=[], microphone=False, prefersH264=True))
+                touch=10, keys=list(range(10)), audio=[], microphone=True, prefersH264=True))
             link = LiveLink(args.live_socket, feedback)
+            microphone = voice.Microphone(send_microphone, link.microphone)
             link.start()
             parameters, video_format, active = b'', None, False
             while True:
@@ -422,6 +451,7 @@ def run(args):
                         if next_active == active:
                             continue
                         active = next_active
+                        microphone.stop()
                         generation[0] += 1
                         for decoder in decoders.values():
                             decoder.close()
@@ -433,6 +463,9 @@ def run(args):
                             feedback({'type': 'keyframe', 'screen': 0})
                         else:
                             parameters, video_format = b'', None
+                    elif kind == 'mic':
+                        if active:
+                            microphone.configure(message.get('stream'), message.get('request'))
                     elif kind == 'video-format' and message.get('screen') == 0:
                         fmt = message.get('format')
                         if fmt == video_format:
@@ -484,7 +517,7 @@ def run(args):
                     elif kind == 2 and ident in formats:
                         fmt = formats[ident]
                         if fmt.get('role') not in ROLES or fmt.get('codec') not in ('AAC_LC', 'PCM_S16LE', 'OPUS'):
-                            continue  # Phone/Siri microphone paths have separate protocol requirements.
+                            continue
                         role = ROLES[fmt['role']]
                         decoder = decoders.get(ident)
                         if decoder is not None and decoder.failed:

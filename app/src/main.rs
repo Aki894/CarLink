@@ -4,6 +4,7 @@ mod gadget;
 mod runtime;
 mod media;
 mod live;
+mod voice;
 mod input;
 mod auth;
 mod hicar;

@@ -1,6 +1,6 @@
 # R3 连接管理与设备菜单
 
-CarLink 使用一个 Rust 管理器保持 CarLife USB 常驻，并独占调度一个 CarPlay 或 HiCar 无线后端。切换手机时保留 USB 会话；已连接手机不会被后来上车的另一部手机抢占。R3 的菜单、网页、未知 HiCar 添加与策略代码已实现，当前正在进行完整构建和设备回归。
+CarLink 使用一个 Rust 管理器保持 CarLife USB 常驻，并独占调度一个 CarPlay 或 HiCar 无线后端。切换手机时保留 USB 会话；已连接手机不会被后来上车的另一部手机抢占。R3 的菜单、网页、未知 HiCar 添加与策略代码已实现，完整构建及既有台架回归已完成；真实触控板和多手机场景继续验收。
 
 ## 使用入口
 
@@ -40,7 +40,7 @@ carlink manager ctl /run/carlink-manager/control.sock '{"op":"resume"}'
 
 明确认证失配或连续三次连接拒绝时，只清理目标 iPhone 的旧 BlueZ 配对并开放有界重配窗口；普通离线保留记录。CarLife 故障单独恢复，已建立的无线源保留。每次切换增加代际，忽略旧后端回调。
 
-验证入口：`scripts/test-manager.py`（生命周期、策略、配对和遗忘）、`scripts/test-manager-web.py`（真实 HTTP 边界）、`scripts/test-manager-menu.py` 与 Rust `manager_menu::`（H.264 实际解码、菜单焦点、PCM 透传、关键帧恢复、USB 重连）。台架、完整固件与 Lexus 实车结果记入 [validation.md](validation.md)。R3 通过后继续 R2 媒体链路迁移，Python 过渡层在迁移结束后移除。
+验证入口：`scripts/test-manager.py`（生命周期、策略、配对和遗忘）、`scripts/test-manager-web.py`（真实 HTTP 边界）、`scripts/test-manager-menu.py` 与 Rust `manager_menu::`（H.264 实际解码、菜单焦点、PCM 透传、关键帧恢复、USB 重连）。台架、完整固件与 Lexus 实车结果记入 [validation.md](validation.md)。HiCar 的 R2 运行链路已迁入 Rust，Python HiCar 实验代码仅保留为参考与测试；CarPlay 仍使用其独立 Python 媒体桥接。当前缺口见[完成情况核对](status-audit.md)。
 
 ## 断连、启动与返回键入口（2026-10-25）
 
