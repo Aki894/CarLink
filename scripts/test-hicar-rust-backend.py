@@ -52,8 +52,11 @@ class Harness:
     address = '02:00:00:00:00:01'
     peer = '02:00:00:00:00:02'
 
-    def __init__(self, binary):
-        self.base = free_ports()
+    def __init__(self, binary, base=None, pair_seconds=None, fail_ports=False):
+        self.base = free_ports() if base is None else base
+        self.pair_seconds = pair_seconds
+        self.fail_ports = fail_ports
+        self.control_open = False
         self.sight = socket.socket()
         self.sight.bind(('127.0.0.1', 0))
         self.sight.listen()
@@ -75,8 +78,10 @@ class Harness:
         self.sockets.extend((radio, session, media))
         fds = (child_radio.fileno(), child_session.fileno(), child_media.fileno())
         args = [str(Path(binary).resolve()), 'hicar', 'run', '--test-mode',
-                '--peer', self.peer, '--test-listen-ip', '127.0.0.1',
+                '--test-listen-ip', '127.0.0.1',
                 '--test-base-port', str(self.base)]
+        args.extend(('--peer', self.peer) if pair_seconds is None else
+                    ('--pair', str(pair_seconds)))
         for name, fd in zip(('radio', 'session', 'media'), fds):
             args.extend((f'--test-{name}-fd', str(fd)))
         self.process = subprocess.Popen(args, pass_fds=fds, stdout=subprocess.PIPE,
@@ -139,7 +144,8 @@ class Harness:
             self.trace.append(('radio', operation))
             result = {'id': value['id'], 'ok': True}
             if operation == 'prepare':
-                assert value['peer'] == self.peer and value['pair_seconds'] == 0
+                assert value['peer'] == (self.peer if self.pair_seconds is None else None)
+                assert value['pair_seconds'] == (self.pair_seconds or 0)
                 result.update(ready=True, address=self.address, offer={
                     'ssid': 'CarLink', 'bssid': self.address, 'password': '12345678',
                     'owner_ip': '127.0.0.1', 'client_ip': '127.0.0.1',
@@ -159,7 +165,8 @@ class Harness:
             length, = struct.unpack('!I', exact(endpoint, 4))
             assert 0 < length <= 262144
             value = json.loads(exact(endpoint, length))
-            result = dict(handler(value), ok=True)
+            result = dict(handler(value))
+            result.setdefault('ok', True)
             data = json.dumps(result).encode()
             endpoint.sendall(struct.pack('!I', len(data)) + data)
             if value.get('op') == 'close':
@@ -179,7 +186,14 @@ class Harness:
             return {'metadata': {'key_ready': True}, 'key': bytes(range(16)).hex()}
         if operation == 'dmsdp-open':
             assert value['generation'] == 1
+            assert not self.control_open
+            self.control_open = True
             return {'session': 2, 'initial': b'INIT'.hex()}
+        if operation == 'dmsdp-ports' and self.fail_ports:
+            return {'ok': False, 'error': 'synthetic rejected ports'}
+        if operation == 'dmsdp-close':
+            assert value['session'] == 2 and self.control_open
+            self.control_open = False
         if operation == 'dmsdp-receive':
             valid = bytes.fromhex(value['data']) == b'VALID'
             return {'events': [{'valid': True}] if valid else [], 'pending': [],
@@ -202,6 +216,7 @@ class Harness:
         self.trace.append(('media', operation))
         if operation == 'init':
             assert value['key'] == bytes(range(16)).hex()
+            assert value['audio_binary'] == '/usr/local/lib/carlink/carplay/bin/carlink-audio'
             return {'ready': True, 'audio_ports': [50102, -1], 'state': {}}
         if operation == 'set-video':
             self.video.set()
@@ -291,6 +306,49 @@ def run(binary):
     assert ('session', 'close') in owner.trace and ('radio', 'close') in owner.trace
     assert owner.trace.index(('radio', 'prepare')) < owner.trace.index(('session', 'init')) < owner.trace.index(('radio', 'activate'))
 
+    # The backend closed the accepted control transport first. Its local port
+    # remains in TIME_WAIT after the synthetic client closes; bind must still
+    # work immediately when the user switches back from the other protocol.
+    if sys.platform.startswith('linux'):
+        deadline = time.monotonic() + 2
+        while True:
+            records = Path('/proc/net/tcp').read_text().splitlines()[1:]
+            time_wait = any(int(row.split()[1].split(':')[1], 16) == owner.base + 2
+                            and row.split()[3] == '06' for row in records)
+            if time_wait or time.monotonic() >= deadline:
+                break
+            time.sleep(.02)
+        assert time_wait, 'restart fixture must create a real server-port TIME_WAIT'
+    restarted = Harness(binary, base=owner.base, pair_seconds=17)
+    try:
+        restarted.wait(lambda: bool(restarted.event('ready')))
+        restarted.authenticate()
+        restarted.wait(lambda: bool(restarted.event('target_selected')))
+        assert restarted.event('target_selected')[-1]['address'] == restarted.peer
+        assert restarted.process.poll() is None
+    finally:
+        restarted.close()
+    restarted.check()
+    assert restarted.process.returncode == 0
+
+    # A private DMSDP token acquired before later initialization fails must be
+    # explicitly revoked even though the channel never reached the owned list.
+    partial = Harness(binary, fail_ports=True)
+    try:
+        partial.authenticate()
+        with socket.create_connection(('127.0.0.1', partial.base + 2), 2) as control:
+            control.settimeout(3)
+            assert control.recv(1) == b''
+        partial.wait(lambda: ('session', 'dmsdp-close') in partial.trace)
+        partial.wait(lambda: ('media', 'close') in partial.trace)
+        assert not partial.control_open
+        assert partial.trace.index(('session', 'dmsdp-open')) < partial.trace.index(('session', 'dmsdp-ports')) < partial.trace.index(('session', 'dmsdp-close'))
+        assert partial.process.poll() is None
+    finally:
+        partial.close()
+    partial.check()
+    assert partial.process.returncode == 0
+
     owner = Harness(binary)
     try:
         owner.authenticate()
@@ -312,7 +370,7 @@ def run(binary):
         owner.close()
     owner.check()
     assert owner.process.returncode == 0
-    print('PASS: Rust backend private workers, auth EOF, duplicate control, media EOF, valid-message deadline and bounded cleanup')
+    print('PASS: Rust backend private workers, auth EOF, duplicate control, media EOF, TIME_WAIT restart, numeric pairing window, partial-init cleanup, valid-message deadline and bounded cleanup')
 
 
 if __name__ == '__main__':

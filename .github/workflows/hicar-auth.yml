@@ -116,6 +116,7 @@ jobs:
           python3 scripts/test-hicar-rust.py .build/hicar-rust-arm/carlink
           python3 scripts/test-hicar-rust-hisight.py .build/hicar-rust-arm/carlink
           python3 scripts/test-hicar-rust-dmsdp.py .build/hicar-rust-arm/carlink
+          python3 scripts/test-hicar-rust-radio.py .build/hicar-rust-arm/carlink --contracts-only
           python3 scripts/test-hicar-rust-auth.py .build/hicar-rust-arm/carlink \
             .build/hicar-native-host/libcarlink_hichain.so dist/hicar-auth/libcarlink_hichain.so
           python3 scripts/test-hicar-rust-session.py .build/hicar-rust-arm/carlink \
