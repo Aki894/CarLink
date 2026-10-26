@@ -1,5 +1,19 @@
 # 验证与部署记录
 
+## 2026-10-26：Rust HiCar 完整后端与固定 PIN 台架交付
+
+交付提交 `a47a9f0cdf307ff1f17518e8c90049821fee528d`，部署目录 `/opt/carlink/releases/r2-a47a9f0`；通过 SSH 更新运行程序并保留回滚目录，MFi/HiCar 身份文件校验保持一致。生产 HiCar 使用 `carlink hicar run`，由 Rust 管理无线、认证、DMSDP/RTSP、媒体和输入，Python 保留作参考与测试。
+
+- [应用构建 40281149701](https://github.com/Aki894/CarLink/actions/runs/40281149701) 成功；[完整构建 40281831497](https://github.com/Aki894/CarLink/actions/runs/40281831497) 的 native、rust-interop、firmware 全部成功，镜像结构/依赖/校验和检查及上传完成。
+- 镜像 `CarLink-refresh-39459953269-a47a9f0c.img.xz` SHA256 `8a7f3149996e263a87779b5f820992b7ed5acee73066a9d70102d60f022e4a74`；下载的固件 ZIP 为 436,560,040 字节，SHA256 `28ccd87aa9c9afa802a88279782984c7dc2094bbf3f30d7744d0906317c9dcb0`，GitHub artifact 摘要及内部镜像摘要均匹配。
+- H3 已通过媒体、无线、原生私有 IPC、后端四组回归；真实 HiCar → H3 → 华为 CarLife 运行 361.0 秒，采样失败为 0，HiCar/CarLife 进程保持不变，应用网格点击有反馈。
+- 强制停止真实 HiCar 源后，实际画面返回 CarLink 菜单，CarLife PID `29631` 和 USB 连接保持不变。切到 CarPlay 后 HiCar worker 为 0，用户确认画面、音乐和操作均正常。
+- 最终版本已验证断电后开机自启及 CarPlay 自动重连；固定 PIN 配对页经真实菜单点击显示，取消后按原策略恢复 CarPlay，CarLife PID `968` 与 USB 连接保持不变。配对不生成或轮换原有 PIN。
+- 补齐热点 IPv4 就绪等待、启动阶段取消清理、会话代际过滤、静态关键帧恢复，以及 AOA bulk 启用后 30 秒未完成初次 `VIDEO_START` 的 USB 握手恢复。成功连接后的静态/暂停会话不重启。
+
+本轮按用户要求交付台架版本。Lexus 先前的 80%/0% 连接问题、实体触控板映射，以及独立 HU 的 HiCar 音频/麦克风/通话，留待实车验收。公开文档不保存 PIN、身份或配对数据；本地回执在私有 `.build/hicar-research/rust-pin-final/`、`rust-pin-firmware-final/` 和 `rust-owner-release/`。详细架构与阶段记录见 [HiCar Rust 集成](hicar-rust.md)。
+
+
 ## 2026-10-25：R2 第二段，Rust HiSight 控制与退出修复
 
 当前部署源码 `0d29152d8319e66a1d46140a0876d33449fde7c1`，板上目录 `/opt/carlink/releases/r2-0d29152`；应用 SHA256 `de7f962fc87be7de15114a658189914b935e407e33475cb6cf1e9350c7fdd857`。通过 SSH 热部署，MFi 和 HiCar 身份文件校验保持一致，保留对应回滚目录。

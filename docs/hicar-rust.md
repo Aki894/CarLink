@@ -1,103 +1,73 @@
 # HiCar Rust 迁移与 CarLink 集成
 
-2026-10-24 决策：第一版无线 HiCar 协议和 CarLife 桥接已有真实手机对照，下一阶段开始迁移 Rust。Python 接收器冻结为可运行的协议参考，产品能力逐步集中到 Rust 主程序。保留鸿蒙 4.2 范围与既有身份、密钥、MFi 和 Ethernet 管理方式。
+更新：2026-10-26。目标手机范围为鸿蒙 4.2。HiCar 的发现、认证、控制与媒体通路已接入 `carlink hicar run`；Python 实验代码保留为协议参考和差分测试基准，生产 HiCar 后端不再依赖 Python。
 
-## 目标结构
+## 当前架构
 
 ```text
-carlink 主程序
-  ├─ CarLife USB 输出、输入路由、本地设备菜单
-  ├─ ConnectionManager / RadioManager / DeviceStore
-  ├─ HiCar 后端：发现、认证、会话、媒体、输入
-  └─ CarPlay 后端适配：管理现有 OpenXPlay 进程
-
-原生库：现有 Linux HiChain / HUKS C 后端
-音频：现有 ARMv7 原生 AAC → PCM 解码器
+carlink manager
+  ├─ 常驻 CarLife USB 输出与车机菜单
+  ├─ DeviceStore / 目标选择 / 自动重连 / 单无线后端仲裁
+  ├─ CarPlay：独立 OpenXPlay 接收端及其输出适配
+  └─ carlink hicar run
+       ├─ radio-worker：BlueZ、FE35/FE36、5 GHz 热点、RFCOMM fd
+       ├─ session-worker：Nearby、HiChain/HUKS、DMSDP、HiSight RTSP
+       └─ media-worker：H.264 直通、AAC 接收、时钟、UIBC
+            └─ ARMv7 原生 carlink-audio：AAC → 44.1 kHz 双声道 PCM
 ```
 
-HiCar 原生接入主程序；CarPlay 保留独立 OpenXPlay，由统一后端接口管理。认证库通过 Rust FFI 复用既有 C ABI，检查结构大小、回调线程与对象生命周期。先保留现有音频子进程，优先去掉 Python 热路径和进程间媒体复制。
+三个 HiCar worker 都由同一 Rust 可执行文件启动，通过继承的私有 Unix socket 通信。控制与统计使用有界 JSON IPC，压缩视频和实时音频不经过 JSON IPC。radio 使用 `SOCK_SEQPACKET` 与 `SCM_RIGHTS` 传递 RFCOMM 描述符；session 通过已验证的 HiChain/HUKS C ABI 处理认证；media 直接把媒体送入 CarLink 源复用器，再由常驻 CarLife 进程输出。
 
-当前应用工具链与声明版本均为 Rust 1.90。R1 固定引入 serde、serde_json、libloading 和 Unix libc；Cargo.lock、依赖源码归档、许可证及 SHA256 清单随应用打包。加密通过按需加载的 OpenSSL EVP 和既有 HiChain/HUKS C ABI 调用。保留 H.264 直通和有界音频解码。
+默认 AAC 解码器为镜像自带的 `/usr/local/lib/carlink/carplay/bin/carlink-audio`。H.264 保持直通，不进行板上视频转码。CarPlay 保留独立 OpenXPlay 适配路径，连接策略由同一 manager 仲裁，任何时刻只由一个无线后端持有资源。
 
-## 三个实施批次
+工具链固定为 Rust 1.90，依赖锁定在 `Cargo.lock`。本地修改源码，ARMv7 应用、原生库和固件均由 GitHub Actions 构建；源码归档、许可证、ABI 与 SHA256 检查随产物交付。
 
-| 批次 | 代码范围与目标 | 验收 |
+## 阶段状态
+
+| 阶段 | 当前实现 | 验证进度 |
 | --- | --- | --- |
-| R1：协议与认证适配 | 新增 `app/src/hicar/`；迁移 Nearby/TLV/CRC、认证 JSON、DMSDP/HiSight、RTP/ADTS、时钟、UIBC；封装 HiChain FFI | 将 Python 的正向、错误、截断、乱序和重连案例转为 Rust 测试；交叉认证和既有身份加载通过 |
-| R2：实际会话与媒体 | BlueZ 发现及 FE35/FE36、认证、热点/TCP、保活和退出；视频直达 CarLife，AAC 经现有解码器输出 PCM，Remote Touch 回传 | 同一手机、同一身份对照 Python/Rust；首配、可信重连、音画、操作、暂停/恢复与退出；记录 CPU/RSS/队列年龄 |
-| R3：统一产品运行 | 连接管理器、无线资源独占、设备记录、CarLife 长驻、CarPlay 后端适配、菜单、按钮、自启和固件 | 两手机同时在场、添加与双向切换、失败回退、常电待机、冷启动；独立 HU 音频和 Lexus 实车验收 |
+| R1：协议与认证基础 | 有界分帧、严格 JSON、Nearby/TLV/CRC、DMSDP/HiSight、RTP/ADTS、AES-CTR、时钟、UIBC、HiChain/HUKS FFI | 已完成差分、异常输入、截断、持久化及双向认证测试 |
+| R2：真实连接与媒体 | Rust 拥有 BlueZ、热点、TCP、认证、DMSDP/RTSP、音视频和输入生命周期 | 集成实现及 H3 台架回归已通过；独立 HU 音频、麦克风/通话与 Lexus 实车验收待完成 |
+| R3：统一产品管理 | 常驻 CarLife、协议互斥、设备记录、开机重连、菜单切换、断线回菜单、启动恢复 | 已接入并完成台架操作与断线恢复测试；真实触控板和实车场景继续验收 |
 
-R1 交付可独立验证的协议模块与 FFI 测试；R2 替换实验接收链路；R3 替换正式启动入口。每批保留可回滚版本，源码、完整镜像与硬件结果分别记录。
+源码检查、编译、镜像结构校验、开发板与实车验证分别记录。完整验收清单以 [验证记录](validation.md) 和 [连接管理设计](connection-management.md) 为准。
 
-## 迁移必须保留的协议事实
+## 生命周期与恢复约束
 
-- 认证身份按 model ID 与稳定 BR MAC 派生，继续加载原持久化身份/HUKS；PAKE 首配与 STS 重连分别处理。
-- TCP 按记录边界拆包；HiSight 使用已验证的 AES-CTR 封装；控制、音频和视频分别管理代次。
-- DMSDP 在 SSRC 高位携带用途信息，真实流编号为 `ssrc & 0xfff`。序号/乱序按真实编号维护；解码器按协商代次与格式恢复。
-- CarLife 视频心跳独立调度，连续 PCM 和等待关键帧期间仍需发送。
-- HiSight `left_move` 对应事件 2；确认、返回、主页和方向键保持按下/抬起成对。长时间直接触摸的点击识别保留专项回归，Lexus 以焦点导航为主。
-- 停止、格式变化、重连和切换均清理旧队列，异步回调携带会话代号。
+- **身份与认证**：保留已有 schema-1 私有身份和 HUKS 持久化数据。HUKS 使用原硬件种子，签名身份按 model ID 和稳定 BR MAC 派生。认证失败或新认证代际撤销旧授权；正常 RFCOMM 认证通道 EOF 保留已建立的 TCP 投屏会话。
+- **会话代际**：DMSDP/HiSight 使用独立 token，后端事件携带 `session_epoch`。迟到的旧关闭或旧就绪事件不改变新会话。视频结束立即发送失活状态；只有新会话送出可解码的真实 IDR 后才隐藏恢复菜单。
+- **控制与媒体**：DMSDP 包含设备发现、扬声器服务、心跳和时钟协商；扬声器 SETUP 成功即进入音频就绪。RTSP 包含加密协商、能力、SETUP/PLAY、端口和 TEARDOWN。退出先停止媒体和控制，再清理认证与无线资源。
+- **热点就绪**：NetworkManager 接受激活请求后，继续等待目标无线网卡同时进入 AP/5745 MHz，并取得 `192.168.49.1/24`。旧 AP 的模式/频率不足以触发 TCP 监听启动。此检查不依赖 `end0` 载波或电脑地址。
+- **启动取消**：等待热点 IP 期间检查私有关闭请求或父进程 EOF。取消后删除临时 NetworkManager 连接、恢复此前网络，完成清理后才回复关闭成功，避免切换协议时遗留热点。
+- **USB 初始握手**：从实际 AOA bulk ENABLE 起，等待首次真正的 `VIDEO_START`，启用时间上限 30 秒；USB suspend 不计时。超时经现有错误、清理和 manager 退避路径重新枚举。握手完成后，静态画面、暂停或源未播放不重新触发该超时。
+- **USB 退避**：连续失败按 1、2、4、8 秒退避，最高 8 秒；成功握手并满足稳定条件后恢复正常重试间隔。USB 与无线重试时钟独立。
+- **启动配置**：新镜像首次运行从随附示例创建私有 manager 配置。MFi 身份检查限于 CarPlay 启动，不阻止 HiCar 或车机菜单启动。认证、配对数据和厂商资料不提交到仓库。
 
-## 台架与待验收项
+## 协议行为与输入
 
-单台华为同时作为 HiCar 信源和 CarLife HU 已反馈桌面显示、点击和左右滑动。AudioFlinger 显示 CarLife 的 44.1 kHz 播放轨进入 `AUDIO_DEVICE_OUT_PROXY`；实际扬声器出声由独立 HU 或实车验证。
+DMSDP SSRC 用途按实测的 `ssrc & 0xfff` 区分。媒体队列有界，停止、格式变化、断线和协议切换都清理旧代际数据。CarLife 视频心跳使用独立期限，连续 PCM、静态画面或等待关键帧均不抑制心跳。
 
-继续跟进：无人操作发现/重连、测试应用退出恢复、长时稳定性、独立 HU 音画同步、麦克风/通话，以及 Lexus USB 兼容性和真实触控板输入。按[连接管理设计](connection-management.md)统一收敛。
+HiSight `left_move` 对应事件 2。确认、返回、主页及方向键保持按下/抬起配对；触摸释放和反馈连接中断有专门回归。Lexus 日常操作以焦点导航为主，物理触控板的返回键映射仍需实车确认。
 
-## R1 完成记录（2026-10-25）
+新增设备使用保存在私有身份中的固定六位 PIN，适合无屏盒子。提交 `a47a9f0` 已加入独立配对页，顶部显示固定配对码、手机操作提示和取消入口。真实 CarLife 画面已验证“添加 → 确认停止旧投屏 → 显示 PIN → 取消”，取消后自动恢复 CarPlay，CarLife PID `968` 与 USB 连接保持不变。PIN 不进入普通日志、公开状态或设备列表；界面只读使用原身份文件。日常已配对重连沿用现有身份和密钥。
 
-R1 已完成，源码位于 `app/src/hicar/`：有界增量帧解析、严格 JSON、Nearby/TLV/CRC、DMSDP/HiSight、RTP/ADTS、时钟、UIBC、AES-CTR 与 HiChain/HUKS FFI。认证回调限定在线程内；私有文件拒绝符号链接并检查权限，密钥只输出长度和哈希。新增命令为 `carlink hicar codec`、`auth-worker`、`identity-check`，正常 CarLife 启动不会加载认证库。
+## 当前集成验证
 
-- 提交 `d047e42` 的 [应用构建](https://github.com/Aki894/CarLink/actions/runs/40110088101)通过 73 项 Rust 单测和 1,700 项 Python/Rust 对照。
-- [完整构建](https://github.com/Aki894/CarLink/actions/runs/40110351064)的 native、rust-interop、firmware 全部成功，镜像验证与产物上传完成。
-- H3 上重复通过 1,700 项对照和 Rust/Python 双向混合绑定、持久化后认证、Rust 自互通与错误 PIN 拒绝。使用临时密钥目录，不覆盖真实配对。
-- 实际已有身份文件已由 Rust 只读加载，硬件种子和派生身份与 Python 一致，文件校验值保持不变。
+当前交付提交为 `a47a9f0`：[应用构建 40281149701](https://github.com/Aki894/CarLink/actions/runs/40281149701) 与 [完整构建 40281831497](https://github.com/Aki894/CarLink/actions/runs/40281831497) 均成功。完整构建包含 native、Rust interop 和 firmware，镜像检查、产物上传、下载后 ZIP 与镜像 SHA256 校验均完成。运行时应用 SHA256 为 `c3dd04d3b79149e992333eca928586a24ed470b995af7f3488d9d1dd6816c3e4`。
 
-R2 接入真实 BlueZ、Wi-Fi/TCP 会话和媒体桥接；R3 再统一双协议连接管理。当前 HiCar 无线会话继续由 Python 实验接收器运行，R1 二进制用于协议与认证验证。
+`c79c4ba` 的 H3 媒体、无线、原生 IPC、后端四组回归全部通过；PIN 版本复用同一后端实现。真实连接持续 361.0 秒，HiCar 后端 PID `867`、CarLife PID `32183` 保持不变，并完成应用网格点击。另一轮强制停止真实 HiCar 源后，车机实际渲染出 CarLink 菜单，CarLife PID `29631` 保持不变；恢复菜单不需要重建 USB 输出进程。随后切换 CarPlay，HiCar worker 数量归零，用户确认画面、声音和操作正常。最终 PIN 版本断电重启后自动连回 CarPlay，CarLife 握手和菜单显示恢复。
 
-## R2 第一段：真实连接状态迁移（2026-10-25）
+当前台架使用同一台华为手机同时承担 HiCar 源与 CarLife HU。画面与输入可直接验证，音频存在同机 `AUDIO_DEVICE_OUT_PROXY` 路由影响。独立 HU 的可听音频、麦克风/通话，以及 Lexus 曾出现的 80%/0% 连接失败，保留为外部硬件验收项目。
 
-新增 `app/src/hicar/session.rs`，将 Nearby 通道协商、FE36 端点响应、ResourceManager、热点凭据协商、业务身份握手及 HiChain 会话接入 Rust。`hicar session-worker FD` 通过继承的私有 Unix socket 与过渡适配器通信，读取既有身份文件及 HUKS 库；使用原持久化硬件种子初始化 HUKS，再按 model/MAC 派生签名身份。认证完成前不发送热点凭据，认证失败撤销授权，过期会话代次不影响新会话。
+## 历史迁移证据
 
-临时适配器为 `experiments/hicar/rust_session.py`，由探针的 `--rust-session-binary` 显式启用。BlueZ 注册、socket 读写与帧边界、DMSDP/HiSight 控制及媒体目前仍在 Python；会话密钥只通过私有 IPC 交给现有媒体适配器，不进入 argv、stdout 或普通日志。正式开机服务保持原部署。
+以下记录对应迁移中间版本，便于回溯问题与比较行为；当前生产入口采用上述完整 Rust 后端。
 
-实机修正了一处 R1 测试样本盲点：鸿蒙 4.2 请求中的 `version` 是手机版本 `14.2.0.400`，且省略 `discover_type`；设备响应才使用 `A_0`/`discover_type=1`。Rust 现在区分两者，并增加相同字段形状的合成回归。
-
-验证记录：
-
-- [应用构建 40127257815](https://github.com/Aki894/CarLink/actions/runs/40127257815)：76 项 Rust 单测、1,700 项基础协议对照、184 组连接状态对照及 3 组损坏 IPC 测试通过。
-- H3 与 CI QEMU 均通过私有 IPC 下的 Rust/Python 首配、持久化后 STS 重连、密钥一致、重复身份拒绝、认证前凭据隔离及过期代次检查；合成身份文件保持不变。
-- 最终版本实机使用原配对完成操作 17/18 的 STS 认证，随后建立 TCP 4005/4006/4007、HiSight 视频和输入通道。用户确认 HiCar 桌面显示、画面操作正常。
-- [完整构建 40127675093](https://github.com/Aki894/CarLink/actions/runs/40127675093)的 native、rust-interop、firmware 均成功，镜像校验与上传完成；artifact `12573769397` 已下载，ZIP SHA256 `7c8b6779482e0b56aed9d9c451ef39343c4bd40568744fd55834e04eb7484eb6`，包内镜像 SHA256 `e8c27a72f03d2a140fc8a44d2a5089cb2c1993ca817c1eba9ddf193f6c96c211`。
-
-R2 后续先迁移 DMSDP/HiSight 控制与媒体数据通路、AAC/PCM 和输入，再移除过渡适配器的 BlueZ 与网络管理。新增真实首配、重复重连与独立 HU 音频验收；R3 继续负责双协议统一仲裁与开机集成。
-
-### 最终台架采样与稳定性边界
-
-第 127 轮使用最终 `01bd418` 应用同时承担 Rust 认证后端和 CarLife USB 输出，未使用临时首包规范化代码。约 115 秒媒体采样记录 2,179 个视频单元、4,558 帧 AAC、4,861 个 PCM 块（571 个含非零数据）和 442 次输入，音频丢包/重复/拒绝计数均为 0。用户确认保持 CarLife 前台时新版一分钟内稳定。日志中无 USB 写错误，记录一次退出码 0 的 CarLife 输出进程退出及自动拉起；长时间和多次重连回归继续保留。
-
-此前第 125 轮在手机 App 切换过程中出现多次 USB bulk `ESHUTDOWN`；换旧输出做对照后，再用新版固定前台，连接恢复稳定。今后台架固定让 CarLife HU 留在前台，通过投屏界面或媒体会话操作源播放器。此次连续 AAC 与 PCM 建立已验证，同手机兼任 HiCar 源和 CarLife HU 的扬声器路由继续采用既有独立 HU 验收安排。
-
-本轮测试后已恢复正式 `carlink` 服务，NRestarts=0、`end0` 管理可用，临时 Rust worker 已退出，手机亮屏超时设置已恢复。正式 USB 输出和开机路径继续保留原部署。
-
-## R2 第二段：HiSight RTSP 状态机
-
-`app/src/hicar/hisight.rs` 将 ANNOUNCE 加密协商、OPTIONS、能力应答、SETUP/PLAY、端口选择、保活回复和 TEARDOWN 迁入 Rust。生产 `session-worker` 复用已经认证的 HiChain 密钥，为每个 HiSight 实例分配独立代号；认证撤销会销毁对应状态，旧实例的清理请求不会关闭新实例。密钥和控制报文只经过现有私有 socketpair；普通日志只输出固定阶段名。视频继续在原通路中直通，不进入 JSON IPC。
-
-真实回归发现并修复了认证通道交接边界：手机正常结束 RFCOMM 认证后，已经建立的 TCP 媒体会话继续持有自己的密钥；关闭认证通道只撤销新连接授权。原候选版在约 60 秒后的 HiSight 保活报文处报 `stale HiSight session` 并退出，新增的原生 IPC 测试已在旧候选版复现。新认证代号和显式认证失败仍会销毁旧媒体会话。
-
-私有 Rust worker 在整个后端进程组收到 SIGTERM 时继续服务父进程的退出 IPC，让父进程先完成 RTSP TEARDOWN；父进程关闭接口或退出后，worker 读到 EOF 并清理密钥。父进程仍保留超时后的 SIGKILL 收尾。原生联测包含发送 SIGTERM 后继续处理加密请求及随后关闭接口的流程。
-
-Python `HiSightSession` 现在只负责低频控制 IPC 的适配，socket、视频接收、AAC 解码与输入仍逐段迁移。Rust 协商保留源端 SETUP 响应缺少双 CRLF、Content-Length 计算异常等已观察到的兼容行为，并为记录长度、队列及序列号设置边界。认证先关闭时，TEARDOWN 错误会被收尾逻辑吸收，继续释放媒体和输入连接。
-
-本轮同时把 CarLife 重试时钟与无线后端重连时钟分离。CarLife 进程连续短时退出时，以 1、2、4、8 秒退避，最长 8 秒；运行满 30 秒后恢复 500 ms 的普通恢复间隔。此策略给 USB 主机明确的脱离时间，减少快速重复枚举，保留当前无线会话。测试手机的旧 USB 会话曾需要重新打开 CarLife App，恢复结果另见[验证记录](validation.md)。
-
-| R2 部分 | 当前实现 |
+| 里程碑 | 证据与保留结论 |
 | --- | --- |
-| Nearby、FE36 协商、HiChain 认证、热点凭据协商 | Rust 状态机，原有持久化身份 |
-| HiSight RTSP 加密协商、端口、播放及退出 | 本轮迁入 Rust |
-| BlueZ 注册、Wi-Fi 与 TCP socket IO | Python 适配层，待移除 |
-| DMSDP 控制会话、音频服务控制、媒体与输入实时通路 | Python 在线实现；R1 Rust 编解码器待接入 |
-| AAC 解码与 PCM 输出 | 原生解码子进程，生命周期待接入 Rust |
+| R1，`d047e42`，2026-10-25 | [应用 40110088101](https://github.com/Aki894/CarLink/actions/runs/40110088101)：73 项 Rust 测试、1,700 项 Python/Rust 对照；[完整构建 40110351064](https://github.com/Aki894/CarLink/actions/runs/40110351064) 成功。H3 通过绑定、持久化、STS、Rust 自互通和错误 PIN 拒绝；真实私有身份只读加载。 |
+| R2 认证状态迁移 | [应用 40127257815](https://github.com/Aki894/CarLink/actions/runs/40127257815)：76 项 Rust 测试、1,700 项基础对照、184 项连接状态对照、3 组 IPC 测试；[完整构建 40127675093](https://github.com/Aki894/CarLink/actions/runs/40127675093) 成功。真实鸿蒙 4.2 消息允许 `version=14.2.0.400` 和省略 `discover_type`，回复仍使用 `A_0`/`discover_type=1`。 |
+| 原生认证台架，`01bd418` | 127 秒窗口中约 115 秒媒体活动，记录 2,179 个视频访问单元、4,558 帧 AAC、4,861 个 PCM 块，音频丢包/重复/拒绝为 0。随后保持 CarLife 前台的对照恢复稳定，记录了测试 App 切后台造成 USB `ESHUTDOWN` 的影响。 |
+| HiSight RTSP 迁移 | 修复正常 RFCOMM EOF 错误撤销投屏密钥的问题，保留观察到的 SETUP 报文长度兼容边界。私有 worker 在组 SIGTERM 时保留父进程完成 TEARDOWN 所需的 IPC 服务，父进程 EOF 后退出，超时由拥有者收尾。 |
 
-因此 R2 整体仍在进行。下一段先迁移 DMSDP 控制与音频服务状态，再把视频/音频/输入 IO 接到 Rust，最后移除 Python BlueZ 与进程胶水。每段以同一手机、同一身份和可回滚产物完成对照。
+台架测试期间保留 Ethernet SSH，部署使用独立版本目录和回滚记录；真实身份、配对数据与原始抓包留在私有目录。
