@@ -19,6 +19,7 @@ pub struct Endpoint {
     live_generation: [u64;2],
     clock: Instant,
     playing: bool,
+    handshake_complete: bool,
     audio_on: bool,
     audio_allowed: bool,
     hu_muted: bool,
@@ -36,7 +37,7 @@ impl Endpoint {
     pub fn with_media(media: Option<TestMedia>) -> Self {
         let session = media.as_ref().map_or_else(Session::new, |m| Session::with_video_source(m.config()));
         Self { decoder: Decoder::new(Limits::default()), session, media, live: None, transport_ready: true, live_generation: [0;2], clock: Instant::now(),
-            playing: false, audio_on: false, audio_allowed: true, hu_muted: false, epochs: [0; 2], last_video: Duration::ZERO,
+            playing: false, handshake_complete: false, audio_on: false, audio_allowed: true, hu_muted: false, epochs: [0; 2], last_video: Duration::ZERO,
             first_header: Vec::with_capacity(8), input: crate::input::Input::default() }
     }
 
@@ -55,6 +56,9 @@ impl Endpoint {
     pub fn transport_ready(&mut self, ready:bool) {
         if self.transport_ready!=ready {self.transport_ready=ready;if let Some(live)=self.live.as_mut(){live.set_playing(ready && self.playing);}self.sync_live_epoch();}
     }
+    /// VIDEO_START completed this USB negotiation. PAUSE and a silent/static
+    /// source preserve the established connection rather than rearming it.
+    pub fn handshake_complete(&self)->bool {self.handshake_complete}
 
     fn music_status(&self) -> Result<Vec<u8>, String> {
         Message::command(ids::MODULE_STATUS, vec![8,1,18,4,8,3,16,self.audio_on as u8])
@@ -127,6 +131,7 @@ impl Endpoint {
                         if !self.playing { self.stop_audio(&mut packets)?; }
                     },
                     Event::AwaitingVideoSource => {
+                        self.handshake_complete=true;
                         if let Some(live)=self.live.as_mut(){self.playing=true;live.set_playing(self.transport_ready);}
                         if let Some(media) = self.media.as_mut().filter(|_| !self.playing) {
                             self.epochs[0] += 1;
@@ -293,6 +298,24 @@ pub fn tcp(address: SocketAddr, duration: Duration, media: Option<TestMedia>, li
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn usb_handshake_requires_start_and_remains_complete_when_paused(){
+        let mut endpoint=Endpoint::new();
+        for (id,payload) in [
+            (ids::HU_PROTOCOL_VERSION,vec![8,4,16,1]),
+            (ids::VIDEO_INIT,vec![8,0xa0,6,16,0xe0,3,24,30]),
+            (ids::VIDEO_PAUSE,vec![]),
+        ] {endpoint.receive(&Message::command(id,payload).unwrap().encode().unwrap()).unwrap();}
+        assert!(!endpoint.handshake_complete());
+        let mut start_and_pause=Message::command(ids::VIDEO_START,vec![]).unwrap().encode().unwrap();
+        start_and_pause.extend(Message::command(ids::VIDEO_PAUSE,vec![]).unwrap().encode().unwrap());
+        endpoint.receive(&start_and_pause).unwrap();
+        assert!(endpoint.handshake_complete());assert!(!endpoint.playing);
+        endpoint.transport_ready(false);assert!(endpoint.handshake_complete());
+        endpoint.transport_ready(true);assert!(endpoint.handshake_complete());
+        assert!(!Endpoint::new().handshake_complete());
+    }
+
     #[test]
     fn continuous_audio_cannot_starve_video_heartbeat() {
         let path=std::env::temp_dir().join(format!("carlink-heartbeat-{}",std::process::id()));

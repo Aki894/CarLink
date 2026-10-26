@@ -478,9 +478,24 @@ mod linux {
         }
     }
 
+    // Runs in the ep0 owner, independently of potentially stalled bulk workers.
+    // Only initial enabled accessory time is charged; a successful handshake
+    // disarms this deadline for the entire Workers lifetime.
+    struct NegotiationDeadline {last:Instant,spent:Duration,enabled:bool}
+    impl NegotiationDeadline {
+        fn new(now:Instant)->Self {Self{last:now,spent:Duration::ZERO,enabled:true}}
+        fn expired(&mut self,now:Instant,enabled:bool,complete:bool)->bool {
+            if self.enabled {self.spent=self.spent.saturating_add(now.saturating_duration_since(self.last));}
+            self.last=now;self.enabled=enabled;
+            !complete&&enabled&&self.spent>=Duration::from_secs(30)
+        }
+    }
+
     struct Workers {
         stop: Arc<AtomicBool>,
         enabled: Arc<AtomicBool>,
+        handshake_complete: Arc<AtomicBool>,
+        negotiation: NegotiationDeadline,
         errors: Receiver<String>,
         handles: Vec<JoinHandle<()>>,
     }
@@ -489,11 +504,12 @@ mod linux {
         fn start(rx: File, mut tx: File, deadline: Instant, media: Option<crate::media::TestMedia>, live_path: Option<std::path::PathBuf>) -> Result<Self, String> {
             let stop = Arc::new(AtomicBool::new(false));
             let enabled = Arc::new(AtomicBool::new(true));
+            let handshake_complete = Arc::new(AtomicBool::new(false));
             let (incoming_tx, incoming_rx) = mpsc::sync_channel::<Vec<u8>>(16);
             let (outgoing_tx, outgoing_rx) = mpsc::sync_channel::<Outgoing>(8);
             let epochs = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
             let (errors_tx, errors) = mpsc::sync_channel::<String>(4);
-            let mut own = Self { stop, enabled, errors, handles: Vec::new() };
+            let mut own = Self { stop, enabled, handshake_complete, negotiation:NegotiationDeadline::new(Instant::now()), errors, handles: Vec::new() };
             let stop = own.stop.clone(); let enabled = own.enabled.clone(); let errors_tx_rx = errors_tx.clone();
             own.handles.push(thread::Builder::new().name("carlink-usb-rx".into()).spawn(move || {
                 let result = (|| {
@@ -570,6 +586,7 @@ mod linux {
             }
             let stop = own.stop.clone();
             let protocol_enabled = own.enabled.clone();
+            let protocol_complete = own.handshake_complete.clone();
             let protocol = thread::Builder::new().name("carlink-usb-protocol".into()).spawn(move || {
                 // Construct here: Endpoint is never sent/shared across threads.
                 let mut endpoint = match crate::runtime::Endpoint::with_source(media, live_path) {Ok(endpoint)=>endpoint,Err(e)=>{let _=errors_tx.try_send(e);stop.store(true,Ordering::Release);return;}};
@@ -582,6 +599,7 @@ mod linux {
                         match incoming_rx.recv_timeout(Duration::from_millis(2)) {
                             Ok(chunk) => {
                                 let responses = endpoint.receive(&chunk)?;
+                                if endpoint.handshake_complete(){protocol_complete.store(true,Ordering::Release);}
                                 publish_epochs(&epochs, endpoint.epochs());
                                 if responses.len() > 32 { return Err("too many responses to one USB chunk".into()); }
                                 for frame in responses {
@@ -632,6 +650,13 @@ mod linux {
             Ok(own)
         }
 
+        fn check_negotiation(&mut self,now:Instant)->Result<(),String> {
+            if self.negotiation.expired(now,self.enabled.load(Ordering::Acquire),self.handshake_complete.load(Ordering::Acquire)) {
+                return Err("CarLife negotiation timed out before VIDEO_START".into());
+            }
+            Ok(())
+        }
+
         fn finish(&mut self) -> Result<(), String> {
             self.stop.store(true, Ordering::Release);
             let limit = Instant::now() + Duration::from_secs(2);
@@ -679,9 +704,10 @@ mod linux {
         let mut enabled = false;
         let mut events = [0u8; 12 * 16];
         while Instant::now() < deadline && !INTERRUPTED.load(Ordering::Relaxed) {
-            if let Some(worker) = workers.as_ref() {
+            if let Some(worker) = workers.as_mut() {
                 if let Ok(error) = worker.errors.try_recv() { return Err(error); }
                 if worker.stop.load(Ordering::Acquire) { return Ok(()); }
+                worker.check_negotiation(Instant::now())?;
             }
             let ep0 = gadget.ep0.as_mut().ok_or("missing FunctionFS ep0")?;
             if !ready(ep0.as_raw_fd(), POLLIN, Duration::from_millis(50))? { continue; }
@@ -779,6 +805,28 @@ mod linux {
     #[cfg(test)]
     mod outgoing_tests {
         use super::*;
+
+        #[test]
+        fn accessory_negotiation_deadline_expires_only_before_first_start(){
+            let now=Instant::now();let mut watch=NegotiationDeadline::new(now);
+            assert!(!watch.expired(now+Duration::from_secs(29),true,false));
+            assert!(watch.expired(now+Duration::from_secs(30),true,false));
+            // A fresh USB enumeration has an independent initial deadline.
+            let mut fresh=NegotiationDeadline::new(now+Duration::from_secs(30));
+            assert!(!fresh.expired(now+Duration::from_secs(59),true,false));
+            // Ready is latched by the protocol owner, including while paused.
+            assert!(!fresh.expired(now+Duration::from_secs(60),true,true));
+            assert!(!fresh.expired(now+Duration::from_secs(3600),true,true));
+        }
+
+        #[test]
+        fn suspended_usb_time_does_not_consume_negotiation_window(){
+            let now=Instant::now();let mut watch=NegotiationDeadline::new(now);
+            assert!(!watch.expired(now+Duration::from_secs(5),false,false));
+            assert!(!watch.expired(now+Duration::from_secs(100),true,false));
+            assert!(!watch.expired(now+Duration::from_secs(124),true,false));
+            assert!(watch.expired(now+Duration::from_secs(125),true,false));
+        }
 
         #[test]
         fn epochs_discard_old_media_without_discarding_control_responses() {
