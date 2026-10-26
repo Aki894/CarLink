@@ -21,6 +21,8 @@ jobs:
   app:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@v4
       - name: Validate scripts and locked toolchain
@@ -91,6 +93,7 @@ jobs:
           bash scripts/build-carplay.sh
           PYTHONPATH=dist/carplay/hicar/python timeout 120s python3 scripts/test-hicar-rust-radio.py app/target/debug/carlink
           python3 scripts/test-live-bridge.py app/target/debug/carlink dist/carplay/bin/carlink-audio
+          python3 scripts/test-runtime-install.py dist/app dist/carplay
       - uses: actions/upload-artifact@v4
         with:
           name: carplay-armv7

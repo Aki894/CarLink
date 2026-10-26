@@ -37,6 +37,11 @@ fn validate(c:&Config)->Result<()>{
 }
 fn beacon(model:&str,sequence:u8)->Result<Vec<u8>>{let raw=super::unhex(model)?;if raw.len()!=4{return Err("invalid model".into());}Ok(vec![1,1,1,3,raw[0],raw[1],raw[2],4,raw[3],16,sequence])}
 fn service_record(channel:u16,uuid:&str)->String{format!("<record><attribute id=\"0x0001\"><sequence><uuid value=\"{uuid}\"/></sequence></attribute><attribute id=\"0x0004\"><sequence><sequence><uuid value=\"0x0100\"/></sequence><sequence><uuid value=\"0x0003\"/><uint8 value=\"{channel}\"/></sequence></sequence></attribute><attribute id=\"0x0005\"><sequence><uuid value=\"0x1002\"/></sequence></attribute><attribute id=\"0x0100\"><text value=\"NearbyServerSocket\"/></attribute></record>")}
+fn hotspot_ipv4_ready(addresses:&Value,interface:&str)->bool{
+    addresses.as_array().is_some_and(|links|links.iter().any(|link|link["ifname"]==interface
+        &&link["addr_info"].as_array().is_some_and(|addresses|addresses.iter().any(|address|
+            address["family"]=="inet"&&address["local"]=="192.168.49.1"&&address["prefixlen"]==24))))
+}
 struct Selection{prefix:String,selected:Option<String>,excluded:BTreeSet<String>,deadline:Option<u64>}
 impl Selection{
     fn new(c:&Config)->Result<Self>{Ok(Self{prefix:format!("{}/dev_",c.adapter),selected:c.peer.as_ref().map(|p|mac(p).map(|p|format!("{}/dev_{}",c.adapter,p.replace(':',"_")))).transpose()?,excluded:c.exclude_peers.iter().map(|p|mac(p)).collect::<Result<_>>()?,deadline:None})}
@@ -294,7 +299,15 @@ impl Radio{
         let connection=self.nm("/org/freedesktop/NetworkManager/Settings","org.freedesktop.NetworkManager.Settings","AddConnectionUnsaved",vec![settings])?.first().and_then(Arg::text).ok_or("missing temporary connection")?.to_owned();self.connection=Some(connection.clone());
         command("iw",&["reg","set","CN"])?;
         self.nm("/org/freedesktop/NetworkManager","org.freedesktop.NetworkManager","ActivateConnection",vec![path(&connection),path(&device),path("/")])?;
-        let deadline=Instant::now()+Duration::from_secs(12);loop{let info=command("iw",&["dev",&interface,"info"])?;let info=String::from_utf8_lossy(&info);if info.contains("type AP")&&info.contains("(5745 MHz)"){break;}if Instant::now()>=deadline{return Err("5 GHz hotspot not ready".into());}std::thread::sleep(Duration::from_millis(100));}
+        // ActivateConnection returns before address configuration completes.
+        // The adapter may still report the previous AP's type/channel, so the
+        // exact address on this interface is required before listeners bind.
+        let deadline=Instant::now()+Duration::from_secs(12);loop{
+            let info=command("iw",&["dev",&interface,"info"])?;let info=String::from_utf8_lossy(&info);
+            let addresses:Value=serde_json::from_slice(&command("ip",&["-j","address"])?).map_err(|_|"invalid hotspot interface addresses")?;
+            if info.contains("type AP")&&info.contains("(5745 MHz)")&&hotspot_ipv4_ready(&addresses,&interface){break;}
+            if Instant::now()>=deadline{return Err("5 GHz hotspot IPv4 not ready".into());}std::thread::sleep(Duration::from_millis(100));
+        }
         let bssid=std::fs::read_to_string(Path::new("/sys/class/net").join(&interface).join("address")).map_err(|_|"cannot read hotspot address")?;let bssid=mac(bssid.trim())?;
         self.offer=Some(Offer{ssid:"CarLink".into(),bssid,password,owner_ip:"192.168.49.1",client_ip:"192.168.49.2",frequency:5745,port:4005});super::super::crypto::wipe(&mut random);Ok(())
     }
@@ -364,6 +377,13 @@ pub fn run(fd:i32)->Result<()>{
 pub fn run(fd:i32)->Result<()>{#[cfg(unix)]{linux::run(fd)}#[cfg(not(unix))]{let _=fd;Err("radio worker requires Linux/Unix".into())}}
 
 #[cfg(test)]mod tests{use super::*;
+    #[test]fn hotspot_requires_target_interface_ipv4_and_prefix(){
+        let mut addresses=json!([{"ifname":"other0","addr_info":[{"family":"inet","local":"192.168.49.1","prefixlen":24}]},{"ifname":"wlan0","addr_info":[]}]);
+        assert!(!hotspot_ipv4_ready(&addresses,"wlan0"));
+        addresses[1]["addr_info"]=json!([{"family":"inet","local":"192.168.49.1","prefixlen":16}]);assert!(!hotspot_ipv4_ready(&addresses,"wlan0"));
+        addresses[1]["addr_info"][0]["prefixlen"]=24.into();assert!(hotspot_ipv4_ready(&addresses,"wlan0"));
+        addresses[1]["addr_info"][0]["family"]="inet6".into();assert!(!hotspot_ipv4_ready(&addresses,"wlan0"));
+    }
     #[test]fn selection_is_sticky_and_agent_cannot_claim(){let c:Config=serde_json::from_value(json!({"model":"00040A00","network":false,"manage_controller":false,"pair_seconds":10,"exclude_peers":["02:00:00:00:00:01"]})).unwrap();validate(&c).unwrap();let mut s=Selection::new(&c).unwrap();s.deadline=Some(10000);
         assert!(!s.allows("/org/bluez/hci0/dev_02_00_00_00_00_01",true,0));assert!(s.allows("/org/bluez/hci0/dev_02_00_00_00_00_02",false,0));assert!(s.selected.is_none());assert!(s.allows("/org/bluez/hci0/dev_02_00_00_00_00_03",true,0));assert!(!s.allows("/org/bluez/hci0/dev_02_00_00_00_00_02",true,0));assert!(s.allows("/org/bluez/hci0/dev_02_00_00_00_00_03",false,20000));}
     #[test]fn rejects_management_interface_and_bad_addresses(){for value in ["02:00:00:00:00: 1","02:00:00:00:00:0g","02:00:00:00:00:000"]{assert!(mac(value).is_err());}let c:Config=serde_json::from_value(json!({"model":"00040A00","interface":"end0","peer":"02:00:00:00:00:01"})).unwrap();assert!(validate(&c).is_err());assert_eq!(beacon("00040A00",7).unwrap(),vec![1,1,1,3,0,4,10,4,0,16,7]);}

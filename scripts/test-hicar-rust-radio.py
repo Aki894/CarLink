@@ -152,6 +152,7 @@ async def mock_bus(binary):
     NM_OLD=NM+'/Settings/8'
     NM_NEW=NM+'/Settings/9'
     NM_ACTIVE=NM+'/ActiveConnection/8'
+    ip_state = None
 
     class NetworkManager(ServiceInterface):
         def __init__(self):
@@ -162,6 +163,8 @@ async def mock_bus(binary):
         @method()
         def ActivateConnection(self, connection:'o', device:'o', specific:'o')->'o':
             assert connection in (NM_OLD,NM_NEW) and device==NM_DEVICE and specific=='/'
+            if connection == NM_NEW:
+                ip_state.write_text(json.dumps(dict(polls=0)))
             self.activated.append(connection);return NM+'/ActiveConnection/9'
 
     class Device(ServiceInterface):
@@ -285,12 +288,22 @@ async def mock_bus(binary):
             parent,child=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET)
             commands=Path(directory)/'commands';commands.mkdir()
             command_log=Path(directory)/'commands.jsonl'
+            ip_state=Path(directory)/'ip-state.json'
             command_source='#!'+sys.executable+'\n'+'''import json,os,sys
 from pathlib import Path
 with Path(os.environ['CARLINK_RADIO_COMMAND_LOG']).open('a') as f:f.write(json.dumps(sys.argv[1:])+'\\n')
 if Path(sys.argv[0]).name=='ip':
     assert sys.argv[1:]==['-j','address']
-    print(json.dumps([dict(ifname='lo',addr_info=[]),dict(ifname='end0',addr_info=[dict(local='192.168.77.2')])]))
+    state_path=Path(os.environ['CARLINK_RADIO_IP_STATE'])
+    addresses=[dict(ifname='lo',addr_info=[])]
+    if state_path.exists():
+        state=json.loads(state_path.read_text());state['polls']+=1
+        state_path.write_text(json.dumps(state))
+        if state['polls']==1:
+            addresses.append(dict(ifname='other0',addr_info=[dict(family='inet',local='192.168.49.1',prefixlen=24)]))
+        else:
+            addresses[0]['addr_info']=[dict(family='inet',local='192.168.49.1',prefixlen=16 if state['polls']==2 else 24)]
+    print(json.dumps(addresses))
 else:
     assert sys.argv[1:] in (['reg','set','CN'],['dev','lo','info'])
     if sys.argv[1:]==['dev','lo','info']:print('type AP\\nchannel 149 (5745 MHz)')
@@ -298,7 +311,8 @@ else:
             for name in ('ip','iw'):
                 executable=commands/name;executable.write_text(command_source);executable.chmod(0o700)
             env=dict(os.environ,DBUS_SYSTEM_BUS_ADDRESS=address.strip(),
-                PATH=str(commands)+os.pathsep+os.environ.get('PATH',''),CARLINK_RADIO_COMMAND_LOG=str(command_log))
+                PATH=str(commands)+os.pathsep+os.environ.get('PATH',''),CARLINK_RADIO_COMMAND_LOG=str(command_log),
+                CARLINK_RADIO_IP_STATE=str(ip_state))
             process=subprocess.Popen([*json.loads(os.environ.get('CARLINK_RUST_RUNNER','[]')),
                 binary,'hicar','radio-worker',str(child.fileno())],pass_fds=(child.fileno(),),
                 stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
@@ -307,6 +321,7 @@ else:
                 pair_seconds=120,exclude_peers=['02:00:00:00:00:01']))
             ready,fds=await asyncio.to_thread(channel.receive)
             assert ready['ok'] and ready['ready'] and not fds
+            assert json.loads(ip_state.read_text())['polls'] >= 3, 'readiness must await target IPv4 /24 despite a pre-existing 5 GHz AP'
             assert ready['address']=='02:11:22:33:44:55'
             assert ready['offer']['ssid']=='CarLink' and ready['offer']['frequency']==5745
             assert ready['offer']['password']==settings.settings['802-11-wireless-security']['psk'].value
@@ -389,6 +404,7 @@ else:
     print(json.dumps(dict(rust_radio_mock_bus='passed',hardware_accessed=False,
         callback_dispatch_during_registration=True,scm_rights=True,peer_selection=True,
         unsaved_network_settings=True,network_restored=True,credentials_absent_from_argv=True,
+        delayed_ipv4_readiness=True,no_ethernet_dependency=True,
         cleanup=True,parent_eof_cleanup=True)))
 
 
