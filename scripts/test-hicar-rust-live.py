@@ -81,11 +81,11 @@ def rtp_video(cipher, sequence, es, stamp=100):
     return len(packet).to_bytes(4, 'big')+packet
 
 
-def audio_packet(cipher, sequence, stamp=100):
+def audio_packet(cipher, sequence, stamp=100, stream=1003):
     # One legal ADTS header and four placeholder AAC bytes. The fake native
     # process deliberately only verifies bounded transport, not AAC syntax.
     adts = bytes([255, 241, 76, 128, 1, 127, 252, 0, 0, 0, 0])
-    rtp = b'\x80\x60'+sequence.to_bytes(2, 'big')+stamp.to_bytes(4, 'big')+(1003).to_bytes(4, 'big')+adts
+    rtp = b'\x80\x60'+sequence.to_bytes(2, 'big')+stamp.to_bytes(4, 'big')+stream.to_bytes(4, 'big')+adts
     data = cipher.encrypt(rtp)
     return b'\xab'+len(data).to_bytes(2, 'big')+data
 
@@ -211,6 +211,12 @@ def check(binary):
             assert len(until_frame(live, 3)[3]) == 3528
             status = rpc(ipc, dict(op='status'))['state']
             assert status['active'] and status['audio_frames'] == 1 and status['pcm_blocks'] >= 2
+            # SSRCs must own distinct decoders; align their PCM at one output tick.
+            udp.sendto(audio_packet(cipher, 2, 200), ('127.0.0.1', audio_port))
+            udp.sendto(audio_packet(cipher, 1, 200, stream=2004), ('127.0.0.1', audio_port))
+            mixed = until_frame(live, 3, lambda f: f[3][:4] == bytes([2,0,4,0]))
+            assert len(mixed[3]) == 3528
+            assert rpc(ipc, dict(op='status'))['state']['audio_streams'] == 2
             assert status['input_events'] == 4
             assert status['epoch_video_frames'] == 3
             # Datagram framing and selected source checks reject unexpected

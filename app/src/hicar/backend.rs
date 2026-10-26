@@ -231,8 +231,8 @@ impl Owner{
         if result["events"].as_array().is_some_and(|v|!v.is_empty()){c.last_valid=Instant::now();}
         pending(c,&result)?;let state=&result["state"];c.negotiated=state["negotiated"]==true;
         if let Some(events)=result["events"].as_array(){for e in events{
-            if e["microphone_ready"]==true{self.media_call(json!({"op":"microphone-start","port":e["port"],"session":e["session"]}))?;}
-            if e["microphone_stopped"]==true{self.media_call(json!({"op":"microphone-stop"}))?;}
+            if e["microphone_ready"]==true{self.media_call(json!({"op":"microphone-start","port":e["port"],"session":e["session"],"service":e["service"]}))?;if e["modem"]==true{self.media_call(json!({"op":"audio-role","role":3}))?;}}
+            if e["microphone_stopped"]==true{self.media_call(json!({"op":"microphone-stop","service":e["service"]}))?;if e["modem"]==true{self.media_call(json!({"op":"audio-role","role":0}))?;}}
             if e["audio_setup_sent"]==true{self.media_call(json!({"op":"audio-begin"}))?;self.speaker_ready=false;}
             if e["audio_ready"]==true{self.media_call(json!({"op":"audio-role","role":if e["modem"]==true{3}else{0}}))?;self.media_call(json!({"op":"audio-ready"}))?;self.speaker_ready=true;}
             if e["audio_stopped"]==true{self.media_call(json!({"op":"audio-stop"}))?;self.speaker_ready=false;}
