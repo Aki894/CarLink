@@ -202,7 +202,10 @@ def authentication(binary, library, rust_library):
                     response = w.call(dict(op='dmsdp-receive', session=control_token,
                         data=fragment.hex(), now_us=123456, capture=True))
                     assert response['state']['negotiated'] is bool(index)
-                assert response['events'] == [dict(negotiated=True, cipher='aes128-ctr')]
+                # DMSDP emits the parsed-message metadata before its derived
+                # state event, matching control_wire.Session and codec tests.
+                assert response['events'] == [control_packet(negotiation).metadata(),
+                    dict(negotiated=True, cipher='aes128-ctr')]
                 assert control_packet(bytes.fromhex(response['pending'][0])).start == 'DMSDP/1.0 200 OK'
                 with_cipher = Cipher(auth.session_key)
                 try:
@@ -212,7 +215,8 @@ def authentication(binary, library, rust_library):
                     wire = pack_frame(with_cipher.encrypt(keepalive), 0xab)
                     response = w.call(dict(op='dmsdp-receive', session=control_token,
                         data=wire.hex(), now_us=123457, capture=True))
-                    assert response['events'] == [dict(keepalive_received=True)]
+                    assert response['events'] == [Messages().feed(keepalive)[0].metadata(),
+                        dict(keepalive_received=True)]
                     assert response['plaintexts'] == [keepalive.hex()]
                 finally:
                     with_cipher.close()
@@ -284,7 +288,8 @@ def authentication(binary, library, rust_library):
                             wire = pack_frame(dmsdp_cipher.encrypt(request), 0xab)
                             received = w.call(dict(op='dmsdp-receive', session=control_token,
                                 data=wire.hex(), now_us=123458, capture=False))
-                            assert received['events'] == [dict(keepalive_received=True)]
+                            assert received['events'] == [Messages().feed(request)[0].metadata(),
+                                dict(keepalive_received=True)]
                             assert control_packet(bytes.fromhex(surviving['heartbeat']), dmsdp_cipher).start == 'GET_PARAMETER * DMSDP/1.0'
                         finally:
                             dmsdp_cipher.close()
