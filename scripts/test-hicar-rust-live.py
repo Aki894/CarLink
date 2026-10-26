@@ -315,6 +315,21 @@ def check(binary):
                     raise AssertionError('microphone packet after stop')
                 except socket.timeout:
                     pass
+                # A modem microphone keeps the call lifetime active after its
+                # playback service stops; ending it then releases call mode.
+                rpc(ipc, dict(op='microphone-start', port=microphone_peer.getsockname()[1], session=8, service='modemMic'))
+                assert json.loads(until_frame(live,7)[3])['active']
+                rpc(ipc, dict(op='audio-role', role=3))
+                until_frame(live,5,lambda f: f[1]==3 and f[3]==b'\1')
+                rpc(ipc, dict(op='audio-stop'))
+                until_frame(live,5,lambda f: f[1]==3 and f[3]==b'\0')
+                until_frame(live,5,lambda f: f[1]==3 and f[3]==b'\1')
+                assert rpc(ipc, dict(op='status'))['state']['call_active']
+                rpc(ipc, dict(op='microphone-stop', service='modemMic'))
+                assert not json.loads(until_frame(live,7)[3])['active']
+                rpc(ipc, dict(op='audio-role', role=0))
+                until_frame(live,5,lambda f: f[1]==3 and f[3]==b'\0')
+                assert not rpc(ipc, dict(op='status'))['state']['call_active']
             finally:
                 microphone_peer.close()
             # EOF must turn the source inactive immediately, even when the

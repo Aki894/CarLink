@@ -7,7 +7,7 @@ mod unix {
 use super::super::{crypto::{Crypto,wipe},hex,unhex,json as strict,wire::{Decoder,Format,Frame}};
 use super::Result;
 use serde_json::{Value,json};
-use std::{collections::VecDeque,io::{Read,Write,ErrorKind},net::{Ipv4Addr,TcpListener,TcpStream},
+use std::{collections::{BTreeMap,VecDeque},io::{Read,Write,ErrorKind},net::{Ipv4Addr,TcpListener,TcpStream},
     os::{fd::{OwnedFd,AsRawFd,FromRawFd},unix::{net::UnixStream,process::CommandExt}},
     path::PathBuf,process::{Child,Command,Stdio},sync::atomic::{AtomicBool,Ordering},time::{Duration,Instant}};
 const IPC:usize=256*1024;
@@ -19,6 +19,71 @@ fn now_us()->u64{let mut t=libc::timespec{tv_sec:0,tv_nsec:0};unsafe{libc::clock
 fn num(v:&Value,k:&str)->Result<u64>{v[k].as_u64().ok_or_else(||format!("missing private field {k}"))}
 fn text<'a>(v:&'a Value,k:&str)->Result<&'a str>{v[k].as_str().ok_or_else(||format!("missing private field {k}"))}
 fn wipe_field(v:&mut Value,k:&str){if let Some(Value::String(s))=v.get_mut(k){unsafe{wipe(s.as_bytes_mut());}}}
+/// Each DMSDP service owns its lifetime. A normal speaker/microphone teardown
+/// must not release the still-active modem speaker or microphone.
+#[derive(Default)]
+struct AudioServices{speakers:BTreeMap<String,bool>,microphones:BTreeMap<String,Value>,role:u8}
+impl AudioServices{
+    fn microphone(&self)->Option<(&str,&Value)>{self.microphones.get_key_value("modemMic").or_else(||self.microphones.get_key_value("mic1")).map(|(n,v)|(n.as_str(),v))}
+    fn apply(&mut self,e:&Value)->Vec<Value>{
+        let service=e["service"].as_str().unwrap_or("speaker1");
+        let old_mic=self.microphone().map(|(n,v)|(n.to_owned(),v.clone()));
+        let was_ready=!self.speakers.is_empty();let old_role=self.role;
+        let setup=e["audio_setup_sent"]==true;
+        if e["microphone_ready"]==true{self.microphones.insert(service.into(),e.clone());}
+        if e["microphone_stopped"]==true{self.microphones.remove(service);}
+        if setup||e["audio_stopped"]==true{self.speakers.remove(service);}
+        if e["audio_ready"]==true{self.speakers.insert(service.into(),e["modem"]==true);}
+        let new_mic=self.microphone().map(|(n,v)|(n.to_owned(),v.clone()));
+        let ready=!self.speakers.is_empty();
+        self.role=if self.microphones.contains_key("modemMic")||self.speakers.values().any(|m|*m){3}else{0};
+        let mut commands=vec![];
+        if old_mic!=new_mic{
+            if let Some((name,_))=old_mic{commands.push(json!({"op":"microphone-stop","service":name}));}
+            if let Some((name,v))=new_mic{commands.push(json!({"op":"microphone-start","service":name,"port":v["port"],"session":v["session"]}));}
+        }
+        if setup&&!ready{commands.push(json!({"op":"audio-begin"}));}
+        if old_role!=self.role{commands.push(json!({"op":"audio-role","role":self.role}));}
+        // Changing the role clears decoder state; re-arm the remaining speaker.
+        if ready&&(!was_ready||old_role!=self.role){commands.push(json!({"op":"audio-ready"}));}
+        else if was_ready&&!ready&&!setup{commands.push(json!({"op":"audio-stop"}));}
+        commands
+    }
+}
+#[cfg(test)]mod audio_service_tests{
+    use super::*;
+    fn ready(name:&str,modem:bool)->Value{json!({"audio_ready":true,"service":name,"modem":modem})}
+    fn mic(name:&str,port:u16)->Value{json!({"microphone_ready":true,"service":name,"modem":name=="modemMic","port":port,"session":7})}
+    #[test]fn a_remaining_modem_owner_keeps_call_role_and_playback(){
+        let mut s=AudioServices::default();s.apply(&ready("speaker1",false));s.apply(&ready("modemSpeaker",true));
+        s.apply(&mic("modemMic",42000));
+        let commands=s.apply(&json!({"microphone_stopped":true,"service":"modemMic","modem":true}));
+        assert_eq!(s.role,3);assert_eq!(commands,vec![json!({"op":"microphone-stop","service":"modemMic"})]);
+        assert!(s.apply(&json!({"audio_stopped":true,"service":"speaker1"})).is_empty());
+        assert_eq!(s.role,3);assert!(!s.speakers.is_empty());
+        let commands=s.apply(&json!({"audio_stopped":true,"service":"modemSpeaker","modem":true}));
+        assert!(commands.contains(&json!({"op":"audio-role","role":0})));
+        assert!(commands.contains(&json!({"op":"audio-stop"})));
+    }
+    #[test]fn microphone_priority_restores_speech_after_call_and_ignores_stale_stop(){
+        let mut s=AudioServices::default();s.apply(&mic("mic1",41000));
+        let commands=s.apply(&mic("modemMic",42000));
+        assert_eq!(commands[0],json!({"op":"microphone-stop","service":"mic1"}));
+        assert_eq!(commands[1]["service"],"modemMic");
+        assert!(s.apply(&mic("mic1",43000)).is_empty());
+        let commands=s.apply(&json!({"microphone_stopped":true,"service":"modemMic","modem":true}));
+        assert_eq!(commands[0],json!({"op":"microphone-stop","service":"modemMic"}));
+        assert_eq!(commands[1]["service"],"mic1");assert_eq!(commands[1]["port"],43000);
+        assert!(s.apply(&json!({"microphone_stopped":true,"service":"modemMic","modem":true})).is_empty());
+    }
+    #[test]fn another_speaker_setup_and_normal_stop_do_not_flush_call_decoder(){
+        let mut s=AudioServices::default();s.apply(&ready("modemSpeaker",true));
+        assert!(s.apply(&json!({"audio_setup_sent":true})).is_empty());
+        assert!(s.apply(&ready("speaker1",false)).is_empty());assert_eq!(s.role,3);
+        assert!(s.apply(&json!({"audio_stopped":true})).is_empty());
+        assert_eq!(s.apply(&json!({"audio_stopped":true,"service":"modemSpeaker","modem":true})).len(),2);
+    }
+}
 fn mac(s:&str)->Result<String>{let p:Vec<_>=s.split(':').collect();if p.len()!=6||p.iter().any(|s|s.len()!=2||!s.bytes().all(|b|b.is_ascii_hexdigit())){return Err("invalid peer address".into());}Ok(s.to_ascii_uppercase())}
 struct Config{model:String,identity:PathBuf,library:PathBuf,store:PathBuf,interface:String,live:PathBuf,audio_binary:PathBuf,
     adapter:String,peer:Option<String>,excluded:Vec<String>,pair:bool,pair_seconds:u64,sequence:u8,duration:u64,power:i16,channel:u16,
@@ -145,7 +210,7 @@ fn listener(local:Ipv4Addr,port:u16)->Result<TcpListener>{
 }
 struct Owner{config:Config,radio:Radio,worker:Rpc,media:Option<Rpc>,mock_media:Option<i32>,channels:Vec<Channel>,listeners:Vec<TcpListener>,
     offer:Value,address:String,own:String,local:Ipv4Addr,peer_ip:Ipv4Addr,base:u16,auth:Option<u64>,authenticated:bool,key:Vec<u8>,epoch:u64,
-    speaker_ready:bool,video_set:bool,clock_set:bool,last_stats:Instant,last_poll:Instant,closing:bool}
+    audio_services:AudioServices,video_set:bool,clock_set:bool,last_stats:Instant,last_poll:Instant,closing:bool}
 impl Owner{
     fn start(config:Config)->Result<Self>{
         // Validate every inherited mock endpoint before opening any real worker.
@@ -167,14 +232,14 @@ impl Owner{
         radio.call(json!({"op":"activate"}),Duration::from_secs(15))?;
         event("ready",0);
         Ok(Self{mock_media:config.fds[2],config,radio,worker,media:None,channels:vec![],listeners,offer,address,own,local,peer_ip,base,
-            auth:None,authenticated:false,key:vec![],epoch:0,speaker_ready:false,video_set:false,clock_set:false,last_stats:Instant::now(),last_poll:Instant::now(),closing:false})
+            auth:None,authenticated:false,key:vec![],epoch:0,audio_services:AudioServices::default(),video_set:false,clock_set:false,last_stats:Instant::now(),last_poll:Instant::now(),closing:false})
     }
     fn next_epoch(&mut self)->Result<()>{self.epoch=self.epoch.checked_add(1).ok_or("projection epoch exhausted")?;Ok(())}
     fn begin_media(&mut self)->Result<Value>{
         if self.media.is_some(){return Err("projection already active".into());}
         if self.config.test&&self.mock_media.is_none(){return Err("mock media descriptor already consumed".into());}
         let mut media=Rpc::new("media-worker",self.mock_media.take(),65536)?;let mut config=json!({"key":hex(&self.key),"local_ip":self.local,"peer_ip":self.peer_ip,"live_socket":self.config.live,"audio_binary":self.config.audio_binary});
-        let ready=media.call(&config);wipe_field(&mut config,"key");let ready=ready?;self.media=Some(media);self.video_set=false;self.clock_set=false;self.speaker_ready=false;Ok(ready)
+        let ready=media.call(&config);wipe_field(&mut config,"key");let ready=ready?;self.media=Some(media);self.video_set=false;self.clock_set=false;self.audio_services=AudioServices::default();Ok(ready)
     }
     fn media_call(&mut self,v:Value)->Result<Value>{self.media.as_mut().ok_or("media worker unavailable")?.call(&v)}
     fn auth_close(&mut self){if let Some(generation)=self.auth.take(){let _=self.worker.call(&json!({"op":"auth-close","generation":generation}));}self.authenticated=false;wipe(&mut self.key);self.key.clear();}
@@ -231,11 +296,7 @@ impl Owner{
         if result["events"].as_array().is_some_and(|v|!v.is_empty()){c.last_valid=Instant::now();}
         pending(c,&result)?;let state=&result["state"];c.negotiated=state["negotiated"]==true;
         if let Some(events)=result["events"].as_array(){for e in events{
-            if e["microphone_ready"]==true{self.media_call(json!({"op":"microphone-start","port":e["port"],"session":e["session"],"service":e["service"]}))?;if e["modem"]==true{self.media_call(json!({"op":"audio-role","role":3}))?;}}
-            if e["microphone_stopped"]==true{self.media_call(json!({"op":"microphone-stop","service":e["service"]}))?;if e["modem"]==true{self.media_call(json!({"op":"audio-role","role":0}))?;}}
-            if e["audio_setup_sent"]==true{self.media_call(json!({"op":"audio-begin"}))?;self.speaker_ready=false;}
-            if e["audio_ready"]==true{self.media_call(json!({"op":"audio-role","role":if e["modem"]==true{3}else{0}}))?;self.media_call(json!({"op":"audio-ready"}))?;self.speaker_ready=true;}
-            if e["audio_stopped"]==true{self.media_call(json!({"op":"audio-stop"}))?;self.speaker_ready=false;}
+            for command in self.audio_services.apply(e){self.media_call(command)?;}
         }}
         if !self.clock_set{if let Some(clock)=state["clock"].as_array(){self.media_call(json!({"op":"clock-start","port":clock[2]}))?;self.clock_set=true;}}
         if state["negotiated"]==true&&c.last_heartbeat.elapsed()>=Duration::from_secs(1){let heart=self.worker.call(&json!({"op":"dmsdp-heartbeat","session":c.token}))?;c.enqueue(unhex(text(&heart,"heartbeat")?)?)?;pending(c,&heart)?;c.last_heartbeat=Instant::now();}
@@ -289,7 +350,7 @@ impl Owner{
         for c in &mut self.channels{if c.kind==Kind::Sight&&!c.closing{if let Ok(v)=self.worker.call(&json!({"op":"hisight-teardown","session":c.token})){if let Some(w)=v["teardown"].as_str(){if let Ok(w)=unhex(w){let _=c.enqueue(w);}}let _=pending(c,&v);}let until=Instant::now()+Duration::from_millis(150);while !c.output.is_empty()&&Instant::now()<until{let _=c.flush();std::thread::sleep(Duration::from_millis(2));}let _=self.worker.call(&json!({"op":"hisight-close","session":c.token}));c.closing=true;}}
         for c in &mut self.channels{if c.kind==Kind::Control&&!c.closing{if let Ok(v)=self.worker.call(&json!({"op":"dmsdp-stop-audio","session":c.token})){let _=pending(c,&v);let _=c.flush();}let _=self.worker.call(&json!({"op":"dmsdp-close","session":c.token}));c.closing=true;}}
         if let Some(mut media)=self.media.take(){media.close();println!("{}",json!({"event":"bridge_stats","session_epoch":self.epoch,"active":false,"connected":false,"video_frames":0,"epoch_video_frames":0}));event("hisight_closed",self.epoch);}
-        self.video_set=false;self.clock_set=false;self.speaker_ready=false;self.closing=false;
+        self.video_set=false;self.clock_set=false;self.audio_services=AudioServices::default();self.closing=false;
     }
     fn run(&mut self)->Result<()>{let started=Instant::now();loop{
         if STOP.load(Ordering::Relaxed)||self.config.duration!=0&&started.elapsed()>=Duration::from_secs(self.config.duration){return Ok(());}

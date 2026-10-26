@@ -12,7 +12,7 @@
 手机通话/语音音频 → 接收端 → 44.1 kHz 双声道 PCM → CarLife MEDIA / VR → 车机扬声器
 ```
 
-CarPlay 接收端的 Opus 下行能力保留；麦克风仅声明 PCM 输入，桥接器将车机 16 kHz 单声道 PCM 转为手机请求的采样率及 20 ms 数据块。麦克风数据不进入 JSON，也不写文件。
+CarPlay 保留无线会话的 Opus 输入和输出声明。桥接器将车机 16 kHz 单声道 PCM 转成 48 kHz、20 ms 数据块，由固定版本 libopus 编码为 OXP 麦克风包；PCM 协商仍有独立回退路径。编码复杂度为 3，单声道码率 32 kbps。麦克风数据不进入 JSON，也不写文件。
 
 | 本地音频角色 | CarLife 输出 | 行为 |
 | --- | --- | --- |
@@ -59,3 +59,5 @@ CarLife 音乐模块的暂停不关闭通话音频。通话角色活动时，管
 - `scripts/build-audio.sh`：真实 ARMv7 编码器将麦克风 PCM 编码为 AAC，再由主机解码检查。
 
 协议常量参考本地固定版本的 [HeadSwap](https://github.com/YegorkaPomidorka/headswap)、[Carlife_on_box](https://github.com/SadykovIV/Carlife_on_box) 和 OpenXPlay 的 OXP 接口；HiCar 服务定义与协商根据本地协议分析实现。参考程序及原始采集均保留在忽略目录。
+
+接收端将音频格式和采集启停事件写到 tmpfs `/run/carlink-carplay/audio-diagnostics.jsonl`，限制约 64 KiB；字段仅包含角色、编码、采样率、声道和流编号。部署后需核对管理配置中的 CarPlay 接收端及 HiCar 音频工具路径，避免主程序已更新而子进程仍启动旧版本。

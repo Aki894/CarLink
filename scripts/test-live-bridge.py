@@ -157,6 +157,22 @@ with tempfile.TemporaryDirectory(prefix='carlink-live-ci-') as directory:
                 probe.send_json(source, {'type':'mic','stream':1,'request':None})
                 while media.packet(hu)[1] != 0x10023:
                     pass
+                # Wireless iOS uses Opus microphone offers; capture stays mono16k.
+                probe.send_json(source, {'type':'mic','stream':1,'request':{
+                    'codec':'OPUS','sampleRate':24000,'channels':1,'frameMs':20}})
+                while media.packet(hu)[1] != 0x10024:
+                    pass
+                hu.sendall(struct.pack('>II', 5, len(inner)) + inner)
+                while True:
+                    event = probe.receive(source)
+                    if isinstance(event, tuple) and event[0] == 3:
+                        import forward
+                        assert event[1] == 1 and forward.opus_samples(event[-1]) == 960
+                        assert event[-1] != mic_pcm[:640]
+                        break
+                probe.send_json(source, {'type':'mic','stream':1,'request':None})
+                while media.packet(hu)[1] != 0x10023:
+                    pass
                 # Calls have their own role; 16 kHz mono becomes HU stereo PCM.
                 probe.send_json(source, {'type':'audio-format','stream':1,'format':{
                     'role':'TELEPHONY','codec':'PCM_S16LE','sampleRate':16000,'channels':1}})

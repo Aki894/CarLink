@@ -14,6 +14,7 @@ class Microphone:
         self.send, self.request = send, request
         self.lock = threading.RLock()
         self.current = None
+        self.encoder = None
         self.generation = time.monotonic_ns()
 
     def stop(self, stream=None):
@@ -22,6 +23,9 @@ class Microphone:
                 return
             self.request(dict(generation=self.generation, active=False, sample_rate=16000, channels=1))
             self.current = None
+            if self.encoder:
+                self.encoder.close()
+                self.encoder = None
             self.samples, self.pcm, self.position = [], bytearray(), 0
 
     def configure(self, stream, request):
@@ -31,12 +35,16 @@ class Microphone:
             if request is None:
                 self.stop(stream)
                 return
-            if (not isinstance(request, dict) or request.get('codec') != 'PCM_S16LE'
+            if (not isinstance(request, dict) or request.get('codec') not in ('PCM_S16LE', 'OPUS')
                     or type(request.get('sampleRate')) is not int
                     or request['sampleRate'] not in (8000, 16000, 24000, 32000, 44100, 48000)
-                    or request.get('channels') != 1 or request.get('frameMs') != 20):
+                    or request.get('channels') not in (1, 2) or request.get('frameMs') != 20
+                    or request.get('codec') == 'PCM_S16LE' and request.get('channels') != 1):
                 raise ValueError('unsupported microphone format')
             self.stop()
+            if request['codec'] == 'OPUS':
+                from opus import Encoder
+                self.encoder = Encoder(request['channels'])
             self.generation += 1
             self.current = dict(request, stream=stream)
             self.samples, self.pcm, self.position = [], bytearray(), 0
@@ -53,7 +61,7 @@ class Microphone:
             values = array.array('h', data)
             if sys.byteorder != 'little':
                 values.byteswap()
-            rate = self.current['sampleRate']
+            rate = 48000 if self.encoder else self.current['sampleRate']
             if rate == 16000:
                 self.pcm.extend(data)
             else:
@@ -73,6 +81,8 @@ class Microphone:
             while len(self.pcm) >= size:
                 payload = bytes(self.pcm[:size])
                 del self.pcm[:size]
+                if self.encoder:
+                    payload = self.encoder.encode(payload)
                 pts = self.origin + self.sent_samples * 1000000 // rate
                 body = HEADER.pack(3, self.current['stream'], 0, 0, self.sequence, pts,
                                    time.monotonic_ns() // 1000) + payload

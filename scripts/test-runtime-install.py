@@ -62,6 +62,10 @@ class InstallTests(unittest.TestCase):
         manifest = json.loads((self.image / 'etc/carlink-build.json').read_text())
         self.assertEqual(manifest['app_sha256'], hashlib.sha256((self.app / 'carlink').read_bytes()).hexdigest())
         self.assertTrue((self.image / 'usr/local/bin/carlink-carplay').is_file())
+        runtime = self.image / 'usr/local/lib/carlink/carplay'
+        installer.armhf(runtime / 'lib/libcarlink_opus.so')
+        self.assertTrue((runtime / 'opus.py').is_file())
+        self.assertTrue((runtime / 'share/licenses/opus/COPYING').is_file())
         self.assertEqual(list((self.image / 'var/lib/carlink/carplay/mfi').iterdir()), [])
         if (self.app/'share').is_dir():
             self.assertTrue(manifest['app_notices'])
@@ -145,6 +149,45 @@ class InstallTests(unittest.TestCase):
     def test_corrupt_receiver_rejected_before_install(self):
         (self.receiver / 'probe.py').write_bytes(b'changed')
         with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+            self.install()
+        self.assertFalse((self.image / 'usr').exists())
+
+    def rehash_receiver(self, relative):
+        lines = (self.receiver / 'SHA256SUMS').read_text().splitlines()
+        digest = hashlib.sha256((self.receiver / relative).read_bytes()).hexdigest()
+        lines = [digest + '  ' + name if PurePosixPath(name).as_posix() == relative else old + '  ' + name
+                 for old, name in (line.split('  ', 1) for line in lines)]
+        (self.receiver / 'SHA256SUMS').write_text('\n'.join(lines) + '\n')
+
+    def test_opus_source_mismatch_rejected_after_valid_checksum(self):
+        relative = 'share/source/opus/SOURCE.json'
+        source = json.loads((self.receiver / relative).read_text())
+        source['commit'] = '0' * 40
+        (self.receiver / relative).write_text(json.dumps(source))
+        self.rehash_receiver(relative)
+        with self.assertRaisesRegex(ValueError, 'Opus microphone source lock mismatch'):
+            self.install()
+        self.assertFalse((self.image / 'usr').exists())
+
+    def test_opus_soft_float_rejected_after_valid_checksum(self):
+        relative = 'lib/libcarlink_opus.so'
+        path = self.receiver / relative
+        data = bytearray(path.read_bytes())
+        flags = int.from_bytes(data[36:40], 'little') & ~0x400
+        data[36:40] = flags.to_bytes(4, 'little')
+        path.write_bytes(data)
+        self.rehash_receiver(relative)
+        with self.assertRaisesRegex(ValueError, 'ARM hard-float'):
+            self.install()
+        self.assertFalse((self.image / 'usr').exists())
+
+    def test_missing_opus_runtime_rejected_with_consistent_manifest(self):
+        relative = 'lib/libcarlink_opus.so'
+        (self.receiver / relative).unlink()
+        lines = (self.receiver / 'SHA256SUMS').read_text().splitlines()
+        (self.receiver / 'SHA256SUMS').write_text('\n'.join(line for line in lines
+            if PurePosixPath(line.split('  ', 1)[1]).as_posix() != relative) + '\n')
+        with self.assertRaisesRegex(ValueError, 'Missing receiver payload'):
             self.install()
         self.assertFalse((self.image / 'usr').exists())
 

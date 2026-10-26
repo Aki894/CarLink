@@ -19,6 +19,14 @@
     "target": "arm-linux-gnueabihf",
     "cpu": "cortex-a7"
   },
+  "opus_microphone": {
+    "repository": "https://github.com/xiph/opus.git",
+    "commit": "ddbe48383984d56acd9e1ab6a090c54ca6b735a6",
+    "version": "1.5.2",
+    "license": "BSD-3-Clause",
+    "target": "arm-linux-gnueabihf",
+    "cpu": "cortex-a7"
+  },
   "carplay": {
     "rust": "1.99.1",
     "target": "armv7-unknown-linux-gnueabihf",

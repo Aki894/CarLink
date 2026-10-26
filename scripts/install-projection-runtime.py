@@ -75,13 +75,21 @@ def install(project, app, receiver, rootfs):
                 'share/source/stream.tar.gz', 'share/licenses/relay/LICENSE',
                 'share/licenses/relay/LICENSE-GPL-3.0', 'share/licenses/relay/NOTICE',
                 'share/licenses/stream/LICENSE']
-    required.append('voice.py')
+    required.extend(('voice.py', 'opus.py', 'lib/libcarlink_opus.so',
+                     'share/source/opus/SOURCE.json', 'share/source/opus/opus.tar.gz',
+                     'share/source/opus/configure-opus.sh', 'share/source/opus/opus-validation.txt',
+                     'share/licenses/opus/COPYING'))
     for name in required:
         if name not in receiver_files or not (receiver / name).stat().st_size:
             raise ValueError('Missing receiver payload: ' + name)
     if json.loads((receiver / 'share/source/menu/SOURCE.json').read_text()) != lock['menu']:
         raise ValueError('Menu source lock mismatch')
     armhf(receiver / 'lib/libcarlink_menu.so')
+    armhf(receiver / 'lib/libcarlink_opus.so')
+    opus_source = json.loads((receiver / 'share/source/opus/SOURCE.json').read_text())
+    for key, value in lock['opus_microphone'].items():
+        if opus_source.get(key) != value:
+            raise ValueError('Opus microphone source lock mismatch: ' + key)
     audio_source = json.loads((receiver / 'share/source/audio/SOURCE.json').read_text())
     for key, value in lock['audio_transcoder'].items():
         if audio_source[key] != value:
@@ -115,7 +123,7 @@ def install(project, app, receiver, rootfs):
     if destination.exists():
         shutil.rmtree(destination)
     shutil.copytree(receiver, destination)
-    for name in ('bin/openxplay-relay', 'bin/oxp-relay', 'bin/carlink-audio', 'probe.py', 'forward.py', 'voice.py', 'supervisor.py', 'run-carplay.sh', 'run-carlink.sh'):
+    for name in ('bin/openxplay-relay', 'bin/oxp-relay', 'bin/carlink-audio', 'probe.py', 'forward.py', 'voice.py', 'opus.py', 'supervisor.py', 'run-carplay.sh', 'run-carlink.sh'):
         (destination / name).chmod(0o755)
     bindir = rootfs / 'usr/local/bin'
     bindir.mkdir(parents=True, exist_ok=True)

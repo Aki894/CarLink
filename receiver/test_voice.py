@@ -1,5 +1,6 @@
 import struct
 import unittest
+from unittest.mock import patch
 import voice
 
 
@@ -55,6 +56,22 @@ class MicrophoneTests(unittest.TestCase):
     def test_stop_clears_partial_audio(self):
         self.config(); self.mic.feed(1, bytes(638)); self.mic.stop()
         self.config(); self.mic.feed(2, bytes(2)); self.assertFalse(self.sent)
+
+    def test_opus_uses_48k_capture_and_fences_encoder(self):
+        with patch('opus.Encoder') as encoder:
+            encoder.return_value.encode.return_value = b'\xf8\xff\xfe'
+            self.mic.configure(1, dict(codec='OPUS', sampleRate=24000, channels=2, frameMs=20))
+            for _ in range(2):
+                self.mic.feed(self.mic.generation, struct.pack('<h', 1234) * 320)
+            encoder.assert_called_once_with(2)
+            self.assertEqual(len(self.sent), 1)
+            pcm = encoder.return_value.encode.call_args.args[0]
+            self.assertEqual(len(pcm), 1920)
+            self.assertEqual(pcm, struct.pack('<h', 1234) * 960)
+            self.assertEqual(self.sent[0][28:], b'\xf8\xff\xfe')
+            self.mic.stop()
+            encoder.return_value.close.assert_called_once()
+            self.assertIsNone(self.mic.encoder)
 
 
 if __name__ == '__main__':

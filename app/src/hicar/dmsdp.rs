@@ -65,7 +65,7 @@ impl Speaker{
                     self.setup=Some(self.sequence);events.push(self.notify("setup_sent"));
                 },
                 "TEARDOWN"=>{if self.session==Some(id){if let Some(record)=self.teardown()?{replies.push(record);}events.push(self.notify("stopped"));}},
-                "CLOSE"=>{self.session=None;self.ready=false;events.push(self.notify("stopped"));},
+                "CLOSE"=>{if self.session==Some(id){self.session=None;self.ready=false;events.push(self.notify("stopped"));}},
                 _=>return Err("unsupported speaker trigger".into()),
             }
         }else if m.start.starts_with("DMSDP/1.0 "){
@@ -219,6 +219,18 @@ pub fn differential(v:&Value)->Result<Value>{
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn stale_close_does_not_revoke_a_new_audio_session(){
+        let mut speaker=Speaker::named("modemMic",9);speaker.session=Some(8);speaker.ready=true;
+        let mut messages=Messages::new("DMSDP");
+        for (id,expected) in [(7,false),(8,true)]{
+            let body="msdp_trigger_method: CLOSE";
+            let raw=format!("SET_PARAMETER * DMSDP/1.0\r\nCSeq: 1\r\nServiceID: modemMic\r\nServiceType: 9\r\nDataSessionID: {id}\r\nContent-Length: {}\r\n\r\n{body}",body.len());
+            let parsed=messages.feed(raw.as_bytes()).unwrap();assert_eq!(parsed.len(),1);
+            let (events,_)=speaker.receive(&parsed[0]).unwrap().unwrap();
+            assert_eq!(!events.is_empty(),expected);
+            if !expected{assert_eq!(speaker.session,Some(8));assert!(speaker.ready);}
+        }
+    }
     #[test]fn microphone_and_modem_services_are_explicit_and_authenticated(){
         let mut s=Session::new(&[],json!({"properties":{"5002":true}}),true).unwrap();assert_eq!(s.services.len(),3);
         s.set_audio_ports((41000,-1)).unwrap();
