@@ -130,10 +130,12 @@ impl LiveSource {
             4 => { let active=f.flags==1; if active!=self.active {self.active=active;self.reset();} },
             5 => {
                 if f.flags==3&&f.payload[0]==1&&!self.voice.call{
+                    self.audio_generation=self.audio_generation.wrapping_add(1);
                     self.queue.retain(|q|q.kind!=3||q.flags>=2);self.queued=self.queue.iter().map(|q|q.payload.len()).sum();self.stop_role(0);self.stop_role(1);
                 }
                 if f.flags==2{self.voice.speech(f.payload[0]==1);}if f.flags==3{self.voice.call(f.payload[0]==1);}
                 if f.payload[0]==0 {
+                    if f.flags==3{self.audio_generation=self.audio_generation.wrapping_add(1);}
                     let role=f.flags;
                     self.queue.retain(|q|q.kind!=3 || q.flags!=role);
                     self.queued=self.queue.iter().map(|q|q.payload.len()).sum();
@@ -215,7 +217,7 @@ impl LiveSource {
         }
         let base=*self.base_pts.get_or_insert(f.pts);
         let ms=(f.pts.saturating_sub(base)/1000).min(u32::MAX as u64) as u32;
-        let lane=if f.kind==2{0}else{f.flags as usize+1};
+        let lane=if f.kind==2{0}else if f.flags==3{1}else{f.flags as usize+1};
         let timestamp=self.stamps[lane].max(self.origin_ms.saturating_add(ms));
         self.stamps[lane]=timestamp;self.last_ms=self.last_ms.max(timestamp);
         if f.kind==2{return Some(packet(Channel::Video,0x20001,timestamp,f.payload));}
@@ -294,6 +296,23 @@ fn varint(bytes:&[u8],pos:&mut usize)->Result<u64,String>{let mut out=0u64;for s
  }
  #[test]#[cfg(unix)]fn pause_overload_and_reconnect_wait_for_keyframe(){let mut s=source();let frame=|key|Frame{arrived:Instant::now(),kind:2,flags:key,pts:1000,payload:vec![0,0,0,1,0x65]};s.accept_frame(frame(0)).unwrap();assert!(s.next(true).is_none());s.accept_frame(frame(1)).unwrap();assert!(s.next(true).is_some());s.set_playing(false);s.accept_frame(frame(1)).unwrap();assert!(s.queue.is_empty());s.set_playing(true);s.accept_frame(frame(0)).unwrap();assert!(s.queue.is_empty());s.queued=MAX_QUEUED;s.accept_frame(frame(0)).unwrap();assert!(s.waiting_key);s.disconnect();assert!(!s.configured);assert!(!s.active);}
  #[test]#[cfg(unix)]fn monotonic_timestamp_and_audio_init(){let mut s=source();s.waiting_key=false;for pts in [100000,90000]{s.accept_frame(Frame{arrived:Instant::now(),kind:3,flags:0,pts,payload:vec![0;4]}).unwrap();}assert_eq!(s.next(true).unwrap().id,0x30001);assert_eq!(s.next(true).unwrap().id,0x30006);assert_eq!(s.next(true).unwrap().timestamp_ms,Some(0));}
+ #[test]#[cfg(unix)]fn call_switch_fences_queued_audio_and_preserves_media_clock(){
+  let mut s=source();
+  s.accept_frame(Frame{kind:3,flags:0,pts:1000000,payload:vec![0;4],arrived:Instant::now()}).unwrap();
+  s.next(true).unwrap();s.next(true).unwrap();
+  s.accept_frame(Frame{kind:3,flags:0,pts:2000000,payload:vec![0;4],arrived:Instant::now()}).unwrap();
+  assert_eq!(s.next(true).unwrap().timestamp_ms,Some(1000));
+  let epoch=s.generation()[1];
+  s.accept_frame(Frame{kind:5,flags:3,pts:0,payload:vec![1],arrived:Instant::now()}).unwrap();
+  assert_ne!(s.generation()[1],epoch);
+  s.accept_frame(Frame{kind:3,flags:3,pts:1100000,payload:vec![0;4],arrived:Instant::now()}).unwrap();
+  let mut call_ms=None;
+  for _ in 0..8 {if let Some(m)=s.next(true){if m.id==0x30006{call_ms=m.timestamp_ms;break;}}}
+  assert_eq!(call_ms,Some(1000));
+  let epoch=s.generation()[1];
+  s.accept_frame(Frame{kind:5,flags:3,pts:0,payload:vec![0],arrived:Instant::now()}).unwrap();
+  assert_ne!(s.generation()[1],epoch);
+ }
  #[test]#[cfg(unix)]fn audio_clock_is_not_clamped_to_video_arrival() {
   let mut s=source();s.waiting_key=false;
   for pts in [1000000,2000000] {s.accept_frame(Frame{arrived:Instant::now(),kind:2,flags:1,pts,payload:vec![0,0,0,1,0x65]}).unwrap();}

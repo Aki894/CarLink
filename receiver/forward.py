@@ -12,6 +12,7 @@ import signal
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 
@@ -23,6 +24,24 @@ AUDIO_BUDGET = .12
 AUDIO_DECODE_BUDGET = .5  # Compressed AirPlay audio arrives in bursts before PCM pacing.
 PCM_CHUNK = 3528  # 20 ms, 44100 Hz, stereo S16LE
 ROLES = {'MEDIA': 0, 'ALERT': 1, 'VOICE': 2, 'TELEPHONY': 3}
+
+
+def audio_diagnostic(event, stream, fmt):
+    fmt = fmt if isinstance(fmt, dict) else {}
+    role = fmt.get('role') if fmt.get('role') in ROLES else 'OTHER'
+    codec = fmt.get('codec') if fmt.get('codec') in ('PCM_S16LE','AAC_LC','OPUS') else 'OTHER'
+    line = json.dumps(dict(event=event, stream=stream if type(stream) is int else None,
+        role=role, codec=codec, rate=fmt.get('sampleRate') if type(fmt.get('sampleRate')) is int else None,
+        channels=fmt.get('channels') if type(fmt.get('channels')) is int else None))
+    print(line,file=sys.stderr,flush=True)
+    # The supervisor filters output events; retain only format metadata in tmpfs.
+    path = Path('/run/carlink-carplay/audio-diagnostics.jsonl')
+    try:
+        mode = 'w' if path.exists() and path.stat().st_size > 65536 else 'a'
+        with path.open(mode) as output:
+            output.write(line + '\n')
+    except OSError:
+        pass
 
 
 def packet(kind, payload=b'', flags=0, pts=0):
@@ -466,6 +485,7 @@ def run(args):
                         else:
                             parameters, video_format = b'', None
                     elif kind == 'mic':
+                        audio_diagnostic('microphone_request' if message.get('request') else 'microphone_stopped',message.get('stream'),message.get('request'))
                         if active:
                             microphone.configure(message.get('stream'), message.get('request'))
                     elif kind == 'video-format' and message.get('screen') == 0:
@@ -483,6 +503,7 @@ def run(args):
                         feedback({'type': 'keyframe', 'screen': 0})
                     elif kind == 'audio-format':
                         ident, fmt = message.get('stream'), message.get('format')
+                        audio_diagnostic('audio_format' if fmt else 'audio_stopped',ident,fmt)
                         old = formats.pop(ident, None)
                         if ident in decoders:
                             decoders.pop(ident).close()
@@ -539,6 +560,7 @@ def run(args):
                                     link.media(3, pcm, timestamp, r)
 
                             decoder = AudioDecoder(args.audio_binary, fmt, emit)
+                            audio_diagnostic('audio_decoder_started',ident,fmt)
                             decoders[ident] = decoder
                             link.audio_state(role, True)
                         decoder.feed(payload, pts + capture_offset if source_clock and capture_offset is not None else sender if source_clock else pts)

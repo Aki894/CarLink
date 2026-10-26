@@ -34,7 +34,7 @@ jobs:
         run: |
           mkdir -p dist/hicar-source/experiments/hicar dist/hicar-source/receiver
           cp experiments/hicar/*.py experiments/hicar/requirements.txt dist/hicar-source/experiments/hicar/
-          cp receiver/forward.py receiver/probe.py receiver/test_forward.py dist/hicar-source/receiver/
+          cp receiver/forward.py receiver/probe.py receiver/voice.py receiver/test_forward.py receiver/test_voice.py dist/hicar-source/receiver/
           printf '%s\n' "$GITHUB_SHA" > dist/hicar-source/COMMIT
           (cd dist/hicar-source && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
       - uses: actions/upload-artifact@v4
