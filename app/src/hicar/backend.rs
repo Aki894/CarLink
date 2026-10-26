@@ -31,7 +31,8 @@ impl Config{
             peer:None,excluded:vec![],pair:false,pair_seconds:120,sequence:0,duration:0,power:11,channel:23,test:false,fds:[None;3],test_ip:None,test_port:None};
         let mut i=0;while i<args.len(){let name=args[i].as_str();i+=1;
             if matches!(name,"--pair"|"--test-mode"|"--managed"|"--allow-incoming"|"--reply-control"|"--reply-identity"|"--dmsdp-options"|"--audio"){
-                if name=="--pair"{c.pair=true;}if name=="--test-mode"{c.test=true;}continue;}
+                if name=="--pair"{c.pair=true;if args.get(i).is_some_and(|v|!v.starts_with("--")){c.pair_seconds=args[i].parse().map_err(|_|"invalid pairing duration")?;i+=1;}}
+                if name=="--test-mode"{c.test=true;}continue;}
             let value=args.get(i).ok_or("missing HiCar option value")?;i+=1;
             match name{
                 "--model"=>c.model=value.to_ascii_uppercase(),"--identity"=>c.identity=value.into(),"--auth-library"=>c.library=value.into(),

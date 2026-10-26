@@ -136,6 +136,12 @@ class HiSightTests(unittest.TestCase):
 
 class HiSightCloseTests(unittest.IsolatedAsyncioTestCase):
     async def test_media_eof_stops_projection_while_rtsp_peer_stays_open(self):
+        await self.check_media_eof(False)
+
+    async def test_media_eof_wins_over_simultaneous_rtsp_data(self):
+        await self.check_media_eof(True)
+
+    async def check_media_eof(self, simultaneous):
         import hisight
         events = []
         async def close_media(reader, writer):
@@ -149,7 +155,9 @@ class HiSightCloseTests(unittest.IsolatedAsyncioTestCase):
             peer_teardown = teardown_acknowledged = False
             def __init__(self, key): self.pending = []
             def initial(self): return b'hello'
-            def receive(self, data): return [], []
+            def receive(self, data):
+                events.append('parsed_rtsp')
+                return [], []
             def request(self, *args): pass
             def teardown(self): return None
             def close(self): pass
@@ -161,8 +169,16 @@ class HiSightCloseTests(unittest.IsolatedAsyncioTestCase):
         loop = asyncio.get_running_loop()
         await loop.sock_connect(client, listener.getsockname())
         receiver, _ = await loop.sock_accept(listener);receiver.setblocking(False)
+        original_wait = asyncio.wait
+        async def controlled_wait(tasks, **kwargs):
+            if simultaneous and len(tasks) > 1:
+                await tasks[1]
+                await loop.sock_sendall(client, b'late-rtsp')
+                await tasks[0]
+                return set(tasks), set()
+            return await original_wait(tasks, **kwargs)
         try:
-            with mock.patch.object(hisight, 'Session', State):
+            with mock.patch.object(hisight, 'Session', State), mock.patch.object(hisight.asyncio, 'wait', controlled_wait):
                 task = asyncio.create_task(hisight.receive(receiver, bytes(16), None,
                     lambda event, **fields: events.append(event), Sink(), continuous=True))
                 await loop.sock_sendall(client, b'activate')
@@ -170,6 +186,7 @@ class HiSightCloseTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('hisight_transport_ended', events)
             self.assertIn('video_stop', events)
             self.assertIn('hisight_closed', events)
+            self.assertEqual(events.count('parsed_rtsp'), 1)
         finally:
             client.close();receiver.close();listener.close();media_server.close();await media_server.wait_closed()
 

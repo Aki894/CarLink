@@ -43,14 +43,16 @@ class BootProfileTests(unittest.TestCase):
         self.assertEqual(legacy.readlink(), Path('/lib/systemd/system/serial-getty@.service'))
         self.assertFalse((system / 'carlink.service').exists())
 
-    def test_service_has_local_dependencies_and_identity_guards(self):
+    def test_service_has_local_dependencies_without_global_protocol_guards(self):
         profile.operate(self.root)
         unit = (self.root / 'etc/systemd/system/carlink.service').read_text()
         self.assertIn('After=NetworkManager.service bluetooth.service', unit)
         self.assertNotIn('network-online.target', unit)
         self.assertIn('RestartSec=5s', unit)
         self.assertIn('RuntimeDirectoryMode=0700', unit)
-        self.assertEqual(unit.count('ConditionPathExists='), 2)
+        self.assertNotIn('ConditionPathExists=', unit)
+        runner = (profile.PROFILE.parent.parent / 'scripts/run-carplay.sh').read_text()
+        self.assertIn('identity.pk8 certificate.p7b', runner)
         logging = (self.root / 'etc/systemd/system/carlink.service.d/80-journal.conf').read_text()
         self.assertIn('ExecStartPre=/usr/bin/journalctl --flush', logging)
         self.assertIn('ExecStartPre=/usr/bin/journalctl --sync', logging)

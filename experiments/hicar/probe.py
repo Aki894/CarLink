@@ -30,6 +30,7 @@ FDEE = '0000fdee-0000-1000-8000-00805f9b34fb'
 FE35 = '0000fe35-0000-1000-8000-00805f9b34fb'
 ROOT = '/org/carlink/hicar_probe'
 LIMIT = 1024 * 1024
+CONTROL_TIMEOUT = 8
 
 
 def control_session(key, device_info, audio=False, rust_worker=None):
@@ -118,10 +119,20 @@ def log(event, **fields):
           flush=True)
 
 
+def start_tcp_observer(client, session, factory):
+    """A rejected private-worker constructor belongs only to this client."""
+    try:
+        return asyncio.create_task(factory())
+    except (ProtocolError, RuntimeError, ValueError, OSError) as error:
+        client.close()
+        log('tcp_rejected', session=session, reason=type(error).__name__)
+        return None
+
+
 async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                   decode_control=True, auth_session=None, resource=None, dmsdp=None, control=None,
                   live_socket=None, audio_binary=None, continuous=False,
-                  rust_worker=None, auth_generation=None):
+                  rust_worker=None, auth_generation=None, session_epoch=None):
     """Observe bounded records; managed sessions outlive the capture byte budget."""
     total = 0
     digest = hashlib.sha256()
@@ -134,6 +145,12 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
     heartbeat_task = None
     sink = None
     control_lock = asyncio.Lock()
+    base_log = globals()['log']
+    def log(event, **fields):
+        if session_epoch is not None:
+            fields['session_epoch'] = session_epoch
+        base_log(event, **fields)
+    last_control_message = time.monotonic()
 
     async def send_control(records):
         async with control_lock:
@@ -179,7 +196,10 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
             try:
                 receive_size = 4096 if continuous else min(4096, limit - total)
                 if control and control.negotiated:
-                    data = await asyncio.wait_for(loop.sock_recv(sock, receive_size), 8)
+                    remaining = CONTROL_TIMEOUT - (time.monotonic() - last_control_message)
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+                    data = await asyncio.wait_for(loop.sock_recv(sock, receive_size), remaining)
                 else:
                     data = await loop.sock_recv(sock, receive_size)
             except asyncio.TimeoutError:
@@ -195,7 +215,10 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
             log('rx_chunk', session=session, size=len(data), total=total)
             if control:
                 try:
-                    for event in control.receive(data):
+                    parsed = control.receive(data)
+                    if parsed:
+                        last_control_message = time.monotonic()
+                    for event in parsed:
                         log('control_message', session=session, **event)
                         if audio_receiver:
                             if event.get('audio_setup_sent'):
@@ -688,7 +711,9 @@ async def run(args):
             tcp_listener.listen(4)
             tcp_listener.setblocking(False)
 
+            control_epoch = 0
             async def accept_tcp(listener, port, decode_control, dmsdp_port=None, control=False):
+                nonlocal control_epoch
                 sequence = 0
                 while True:
                     client, address = await loop.sock_accept(listener)
@@ -700,12 +725,16 @@ async def run(args):
                     sequence += 1
                     session = f'tcp-{port}-{sequence}'
                     log('tcp_connected', session=session, port=port)
-                    if decode_control and rust_worker:
-                        from rust_session import Negotiator as RustNegotiator
-                        negotiator = RustNegotiator(rust_worker, profile.resource)
-                    else:
-                        negotiator = Negotiator(profile.control_summary, resource=profile.resource) if decode_control else None
-                    task = asyncio.create_task(observe(client, session, args.capture_dir,
+                    if control:
+                        control_epoch += 1
+                    epoch = control_epoch if control else None
+                    def factory():
+                        if decode_control and rust_worker:
+                            from rust_session import Negotiator as RustNegotiator
+                            negotiator = RustNegotiator(rust_worker, profile.resource)
+                        else:
+                            negotiator = Negotiator(profile.control_summary, resource=profile.resource) if decode_control else None
+                        return observe(client, session, args.capture_dir,
                                                        negotiator=negotiator, decode_control=decode_control,
                                                        dmsdp=DmsdpNegotiation(dmsdp_port) if dmsdp_port else None,
                                                        control=control_session(profile.resource.session_key,
@@ -720,7 +749,11 @@ async def run(args):
                                                        live_socket=args.live_socket,
                                                        audio_binary=args.audio_binary,
                                                        continuous=args.managed, rust_worker=rust_worker,
-                                                       auth_generation=rust_worker.auth_generation if rust_worker else None))
+                                                       auth_generation=rust_worker.auth_generation if rust_worker else None,
+                                                       session_epoch=epoch)
+                    task = start_tcp_observer(client, session, factory)
+                    if task is None:
+                        continue
                     tcp_clients.add(task)
                     if control:
                         tcp_controls.add(task)

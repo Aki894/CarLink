@@ -82,7 +82,8 @@ fn diagnostic_stage(name:&str)->bool{matches!(name,"ready"|"controller_setting"|
 fn stage_summary(v:&Value)->Option<Value>{
     let stage=v["event"].as_str().filter(|s|diagnostic_stage(s))?;
     // Reconstruct, never forward the source object or its dynamic fields.
-    Some(json!({"event":"manager_backend_stage","stage":stage}))
+    let mut summary=json!({"event":"manager_backend_stage","stage":stage});
+    if let Some(epoch)=v["session_epoch"].as_u64(){summary["session_epoch"]=epoch.into();}Some(summary)
 }
 fn stage_report(generation:u64,current:u64,v:&Value)->Option<Value>{
     if generation!=current||v["event"]!="manager_backend_stage"{return None;}
@@ -132,7 +133,7 @@ impl Drop for Process{fn drop(&mut self){let _=self.end();}}
 struct Owner{config:Config,store:Store,status:Status,life:Option<Process>,backend:Option<Process>,choice:Option<Choice>,
     life_started:Instant,life_retry_at:Instant,life_failures:u8,
     started:Instant,ready:Option<Instant>,seen_media:bool,committed:bool,pair_deadline:Option<Instant>,repair_used:bool,
-    retry_at:Instant,tried:VecDeque<String>,last_auth:Option<Instant>,refusals:u8,mux:Option<crate::manager_menu::Mux>,menu_focus:usize,menu_pending:Option<Value>,menu_idle:bool,wireless_ready:bool,source_ready:bool}
+    retry_at:Instant,tried:VecDeque<String>,last_auth:Option<Instant>,refusals:u8,mux:Option<crate::manager_menu::Mux>,menu_focus:usize,menu_pending:Option<Value>,menu_idle:bool,wireless_ready:bool,source_ready:bool,session_epoch:u64}
 impl Owner{
     fn new(config:Config)->Result<Self>{
         if config.schema!=1||config.devices.len()>8||!(2..=120).contains(&config.connect_seconds)||!(1..=60).contains(&config.stable_seconds)||!(5..=120).contains(&config.pair_seconds){return Err("unsupported manager configuration".into());}
@@ -148,7 +149,7 @@ impl Owner{
         if boot.is_some()&&store.boot_id!=boot{store.paused=false;store.boot_id=boot;}
         let paused=store.paused;
         Ok(Self{config,store,status:Status{schema:1,generation:0,protocol:None,target:None,active:false,pairing:false,paused,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,last_error:None,last_stage:None},
-            life:None,backend:None,choice:None,life_started:Instant::now(),life_retry_at:Instant::now(),life_failures:0,started:Instant::now(),ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,wireless_ready:false,source_ready:false})
+            life:None,backend:None,choice:None,life_started:Instant::now(),life_retry_at:Instant::now(),life_failures:0,started:Instant::now(),ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,wireless_ready:false,source_ready:false,session_epoch:0})
     }
     fn automatic(&self)->Option<Choice>{
         if self.store.paused||self.store.policy==Policy::Manual{return None;}
@@ -181,7 +182,7 @@ impl Owner{
     fn select(&mut self,choice:Choice)->Result<()>{
         if choice.protocol==Protocol::Hicar&&((choice.device.is_none()&&!choice.pairing)||self.config.hicar.is_empty()){return Err("HiCar requires a selected target or explicit pairing window and configured backend".into());}
         self.status.active=false;self.show_recovery_menu();
-        self.stop_backend()?;self.status.generation=self.status.generation.checked_add(1).ok_or("generation exhausted")?;
+        self.stop_backend()?;self.session_epoch=0;self.status.generation=self.status.generation.checked_add(1).ok_or("generation exhausted")?;
         let mut args=if choice.protocol==Protocol::Carplay{self.config.carplay.clone()}else{self.config.hicar.clone()};
         if choice.pairing {args.extend(["--pair".into(),self.config.pair_seconds.to_string()]);}
         if choice.protocol==Protocol::Carplay&&choice.pairing&&choice.device.is_none(){args.push("--new-device-only".into());}
@@ -229,6 +230,9 @@ impl Owner{
     }
     fn ingest(&mut self,generation:u64,v:Value)->Result<()>{
         if generation!=self.status.generation{return Ok(());}
+        if self.status.protocol==Some(Protocol::Hicar){if let Some(epoch)=v["session_epoch"].as_u64(){
+            if epoch<self.session_epoch{return Ok(());}self.session_epoch=epoch;
+        }}
         let name=v["event"].as_str().unwrap_or("");
         if name=="manager_backend_stage"{
             if let Some(report)=stage_report(generation,self.status.generation,&v){
@@ -536,7 +540,7 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         let summary=stage_summary(&json!({"event":"stream_error","reason":"private detail","payload":[9]})).unwrap();
         assert!(stage_report(2,3,&summary).is_none());owner.ingest(2,summary.clone()).unwrap();
         assert_eq!(owner.status.last_stage.as_deref(),Some("ready"));assert!(owner.status.last_error.is_none());
-        owner.ingest(3,summary).unwrap();assert_eq!(owner.status.last_stage.as_deref(),Some("stream_error"));assert_eq!(owner.status.last_error.as_deref(),Some("stream_error"));
+        owner.ingest(3,summary).unwrap();assert_eq!(owner.status.last_stage.as_deref(),Some("stream_error"));assert!(owner.status.last_error.is_none());
         owner.ingest(3,json!({"event":"manager_backend_stage","stage":"unlisted_private_value"})).unwrap();assert_eq!(owner.status.last_stage.as_deref(),Some("stream_error"));
         fs::remove_dir(root).unwrap();
     }
@@ -583,6 +587,11 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         assert!(!owner.status.active&&owner.status.menu_visible);
         owner.mark_active().unwrap();assert!(!owner.status.active);
         owner.ingest(0,json!({"event":"bridge_stats","active":true,"video_frames":91,"epoch_video_frames":1})).unwrap();assert!(owner.status.active);
+        owner.ingest(0,json!({"event":"bridge_stats","session_epoch":2,"active":true,"epoch_video_frames":1})).unwrap();
+        owner.ingest(0,json!({"event":"hisight_closed","session_epoch":1})).unwrap();assert!(owner.status.active);
+        owner.ingest(0,json!({"event":"manager_backend_stage","session_epoch":1,"stage":"control_peer_timeout"})).unwrap();assert!(owner.status.active);
+        owner.ingest(0,json!({"event":"bridge_stats","session_epoch":2,"active":false})).unwrap();assert!(!owner.status.active&&owner.status.menu_visible);
+        owner.ingest(0,json!({"event":"bridge_stats","session_epoch":1,"active":true,"epoch_video_frames":9})).unwrap();assert!(!owner.status.active);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]fn ordinary_offline_does_not_erase_pairing(){for s in ["Host is down","Connection timed out","No route to host","AirPlay session ended"]{assert!(!auth_mismatch(s));}assert!(auth_mismatch("org.bluez.Error.AuthenticationFailed"));}

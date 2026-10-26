@@ -235,7 +235,8 @@ async def receive(sock, key, capture_dir, log, sink=None, continuous=False,
             pending_read = asyncio.create_task(loop.sock_recv(sock, 4096 if continuous else min(4096, capture_limit - total)))
             watched = [pending_read] + [task for task in (media_task, input_task) if task is not None]
             done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
-            if pending_read not in done:
+            # Media/input EOF wins even when a peer floods readable RTSP data.
+            if any(task in done for task in (media_task, input_task) if task is not None):
                 log('hisight_transport_ended')
                 break
             data = pending_read.result()

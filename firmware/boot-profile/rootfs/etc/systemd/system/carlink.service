@@ -1,10 +1,8 @@
 [Unit]
-Description=CarLink wireless CarPlay to wired CarLife bridge
+Description=CarLink wireless projection to wired CarLife bridge
 Documentation=https://github.com/Aki894/CarLink
 Wants=NetworkManager.service bluetooth.service
 After=NetworkManager.service bluetooth.service
-ConditionPathExists=/var/lib/carlink/carplay/mfi/identity.pk8
-ConditionPathExists=/var/lib/carlink/carplay/mfi/certificate.p7b
 StartLimitIntervalSec=0
 
 [Service]

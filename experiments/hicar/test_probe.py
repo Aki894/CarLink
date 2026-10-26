@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 import xml.etree.ElementTree as ET
 
-from probe import Advertisement, FE35, PeerAgent, PeerSelection, Profile, beacon, observe, service_record, close_tcp_streams, normalize_peer, main
+from probe import Advertisement, FE35, PeerAgent, PeerSelection, Profile, beacon, observe, service_record, close_tcp_streams, normalize_peer, main, start_tcp_observer
 from dbus_next import DBusError
 
 
@@ -224,6 +224,48 @@ class PairProfileTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejected_constructor_does_not_prevent_next_client(self):
+        first, first_peer = socket.socketpair()
+        second, second_peer = socket.socketpair()
+        def rejected():
+            raise RuntimeError('private session already active')
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertIsNone(start_tcp_observer(first, 'duplicate', rejected))
+                self.assertEqual(first.fileno(), -1)
+                task = start_tcp_observer(second, 'next', lambda: observe(second, 'next', decode_control=False))
+                second_peer.close()
+                await asyncio.wait_for(task, 1)
+                self.assertEqual(second.fileno(), -1)
+        finally:
+            first.close(); first_peer.close(); second.close(); second_peer.close()
+
+    async def test_partial_control_bytes_do_not_extend_message_deadline(self):
+        class Partial:
+            negotiated = True
+            speaker = clock = media_port = None
+            def initial(self): return b''
+            def receive(self, data): return []
+            def take_pending(self): return []
+            def heartbeat(self): return b''
+            def close(self): pass
+        receiver, peer = socket.socketpair()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as output, mock.patch('probe.CONTROL_TIMEOUT', 0.04):
+                task = asyncio.create_task(observe(receiver, 'partial', control=Partial(),
+                    decode_control=False, continuous=True, session_epoch=7))
+                for _ in range(20):
+                    if task.done(): break
+                    try: peer.sendall(b'x')
+                    except OSError: break
+                    await asyncio.sleep(0.005)
+                await asyncio.wait_for(task, 0.2)
+            self.assertIn('control_peer_timeout', output.getvalue())
+            self.assertIn('"session_epoch": 7', output.getvalue())
+            self.assertEqual(receiver.fileno(), -1)
+        finally:
+            receiver.close(); peer.close()
+
     async def test_media_finishes_before_underlying_transport_closes(self):
         events = []
         async def control():
