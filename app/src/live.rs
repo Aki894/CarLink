@@ -49,7 +49,7 @@ pub struct LiveSource {
     path: PathBuf,
     input: Vec<u8>, output: VecDeque<Vec<u8>>, output_offset: usize,
     queue: VecDeque<Frame>, queued: usize,
-    active: bool, configured: bool, playing: bool, waiting_key: bool,
+    active: bool, configured: bool, playing: bool, audio_ready:bool, waiting_key: bool,
     audio_active: [bool; 4], audio_pending: VecDeque<Message>, voice:crate::voice::Voice,
     base_pts: Option<u64>, origin_ms: u32, last_ms: u32, stamps: [u32;5], generation: u64,
     report_at:Instant, video_dropped:u64, age_max_us:u64, audio_generation:u64, keyframe_at:Option<Instant>,call_media:bool,
@@ -63,13 +63,13 @@ impl LiveSource {
             std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600)).map_err(|e|e.to_string())?;
             listener.set_nonblocking(true).map_err(|e|e.to_string())?;
             Ok(Self {listener,peer:None,path:path.into(),input:Vec::new(),output:VecDeque::new(),output_offset:0,queue:VecDeque::new(),queued:0,
-                active:false,configured:false,playing:false,waiting_key:true,audio_active:[false;4],audio_pending:VecDeque::new(),voice:crate::voice::Voice::default(),base_pts:None,origin_ms:0,last_ms:0,stamps:[0;5],generation:0,report_at:Instant::now(),video_dropped:0,age_max_us:0,audio_generation:0,keyframe_at:None,call_media:std::env::var("CARLINK_CALL_AUDIO_LANE").as_deref()==Ok("media")})
+                active:false,configured:false,playing:false,audio_ready:false,waiting_key:true,audio_active:[false;4],audio_pending:VecDeque::new(),voice:crate::voice::Voice::default(),base_pts:None,origin_ms:0,last_ms:0,stamps:[0;5],generation:0,report_at:Instant::now(),video_dropped:0,age_max_us:0,audio_generation:0,keyframe_at:None,call_media:std::env::var("CARLINK_CALL_AUDIO_LANE").as_deref()==Ok("media")})
         }
     }
     pub fn generation(&self)->[u64;2] { [self.generation,self.audio_generation] }
     pub fn accepts_input(&self)->bool {self.active && self.playing}
     pub fn microphone(&mut self,message:&Message){
-        if !self.active || !self.playing{return;}
+        if !self.active || !self.configured || !self.audio_ready{return;}
         if let Some(wire)=self.voice.pcm(message){
             if self.output.len()>=32{self.disconnect();return;}
             self.output.push_back(wire);
@@ -111,7 +111,21 @@ impl LiveSource {
     }
     fn audio_lane(&self,role:u8)->(Channel,u32,u32,u32){audio_lane(if role==3&&self.call_media{0}else{role})}
     fn stop_audio(&mut self) { for role in 0..4{self.stop_role(role);} }
-    pub fn set_playing(&mut self,value:bool) { if self.playing!=value { self.playing=value; self.reset(); } }
+    pub fn set_playing(&mut self,value:bool) {
+        if value{self.audio_ready=true;}
+        if self.playing!=value {
+            self.playing=value;
+            self.recover_video();
+            // Video backgrounding stops ordinary playback, not an ongoing call.
+            if !value{self.set_audio_allowed(false);}
+        }
+    }
+    pub fn transport_lost(&mut self) {
+        self.playing=false;self.audio_ready=false;
+        // Closing the source socket makes its consumer replay microphone demand
+        // after a fresh USB transport, instead of retaining an orphaned capture.
+        self.disconnect();
+    }
     pub fn set_audio_allowed(&mut self,value:bool) { if !value {
         self.queue.retain(|f|f.kind!=3||f.flags>=2);self.queued=self.queue.iter().map(|f|f.payload.len()).sum();
         self.stop_role(0);self.stop_role(1);
@@ -156,7 +170,8 @@ impl LiveSource {
                 self.voice.microphone(generation,active);
             },
             _ => {
-                if !self.active || !self.configured || !self.playing {return Ok(());}
+                if !self.active || !self.configured {return Ok(());}
+                if !self.playing && !(f.kind==3&&f.flags>=2&&self.audio_ready){return Ok(());}
                 if f.kind==3&&self.voice.call&&f.flags<3{return Ok(());}
                 let lane_count=self.queue.iter().filter(|q|q.kind==f.kind && (f.kind==2 || q.flags==f.flags)).count();
                 if self.queued+f.payload.len()>MAX_QUEUED || lane_count>=if f.kind==2{4}else{6} {
@@ -287,7 +302,35 @@ fn varint(bytes:&[u8],pos:&mut usize)->Result<u64,String>{let mut out=0u64;for s
    assert!(touch(&Message::command(0x68001,payload).unwrap(),CONFIG).is_err());
   }
  }
- #[cfg(unix)]fn source()->LiveSource{let p=std::env::temp_dir().join(format!("carlink-live-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));let mut s=LiveSource::bind(&p).unwrap();s.active=true;s.configured=true;s.playing=true;s}
+ #[cfg(unix)]fn source()->LiveSource{let p=std::env::temp_dir().join(format!("carlink-live-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));let mut s=LiveSource::bind(&p).unwrap();s.active=true;s.configured=true;s.playing=true;s.audio_ready=true;s}
+ #[test]#[cfg(unix)]fn video_pause_and_recovery_preserve_duplex_call(){
+  let mut s=source();s.call_media=false;
+  s.voice.microphone(91,true);s.voice.call(true);while s.voice.pop().is_some(){}
+  s.accept_frame(Frame{kind:3,flags:3,pts:1000,payload:vec![1;4],arrived:Instant::now()}).unwrap();
+  assert_eq!(s.next(true).unwrap().id,0x50002);assert_eq!(s.next(true).unwrap().id,0x50003);
+  let epoch=s.generation()[1];
+  for playing in [false,true,false] {
+   s.set_playing(playing);s.recover_video();
+   assert!(s.voice.call);assert_eq!(s.voice.capture,Some(91));assert_eq!(s.generation()[1],epoch);
+   s.accept_frame(Frame{kind:3,flags:3,pts:2000,payload:vec![2;4],arrived:Instant::now()}).unwrap();
+   assert_eq!(s.next(false).unwrap().id,0x50003);
+   let microphone=Message{channel:Channel::Vr,id:0x58001,timestamp_ms:Some(2),reserved:0,payload:vec![3;640]};
+   s.microphone(&microphone);
+   assert_eq!(s.output.back().unwrap()[4],130);
+   assert!(s.voice.pop().is_none());
+  }
+  s.transport_lost();assert!(!s.audio_ready);assert!(!s.voice.call);assert_eq!(s.voice.capture,None);
+  assert!(!s.active);assert!(!s.configured);assert_eq!(s.next(false).unwrap().id,0x10023);
+ }
+ #[test]#[cfg(unix)]fn call_pcm_waits_for_initial_video_start_and_source_session(){
+  let mut s=source();s.playing=false;s.audio_ready=false;s.voice.microphone(2,true);while s.voice.pop().is_some(){}
+  s.accept_frame(Frame{kind:3,flags:3,pts:0,payload:vec![1;4],arrived:Instant::now()}).unwrap();assert!(s.queue.is_empty());
+  let pcm=Message{channel:Channel::Vr,id:0x58001,timestamp_ms:Some(0),reserved:0,payload:vec![0;640]};
+  s.output.clear();s.microphone(&pcm);assert!(s.output.is_empty());
+  s.set_playing(true);s.microphone(&pcm);assert_eq!(s.output.back().unwrap()[4],130);
+  s.accept_frame(Frame{kind:4,flags:0,pts:0,payload:vec![],arrived:Instant::now()}).unwrap();
+  s.output.clear();s.microphone(&pcm);assert!(s.output.is_empty());assert_eq!(s.voice.capture,None);
+ }
  #[test]#[cfg(unix)]fn microphone_lifecycle_and_call_audio_ignore_music_mute(){
   let mut s=source();let request=serde_json::json!({"generation":51,"active":true,"sample_rate":16000,"channels":1});
   s.accept_frame(Frame{kind:7,flags:0,pts:0,payload:request.to_string().into_bytes(),arrived:Instant::now()}).unwrap();

@@ -54,7 +54,7 @@ impl Endpoint {
         }
     }
     pub fn transport_ready(&mut self, ready:bool) {
-        if self.transport_ready!=ready {self.transport_ready=ready;if let Some(live)=self.live.as_mut(){live.set_playing(ready && self.playing);}self.sync_live_epoch();}
+        if self.transport_ready!=ready {self.transport_ready=ready;if let Some(live)=self.live.as_mut(){if ready{live.set_playing(self.playing);}else{live.transport_lost();}}self.sync_live_epoch();}
     }
     /// VIDEO_START completed this USB negotiation. PAUSE and a silent/static
     /// source preserve the established connection rather than rearming it.
@@ -151,12 +151,12 @@ impl Endpoint {
                         self.stop_audio(&mut packets)?;
                     },
                     Event::VideoReset { .. } if self.playing => {
-                        if let Some(live)=self.live.as_mut(){live.reset();}
+                        if let Some(live)=self.live.as_mut(){live.recover_video();}
                         self.epochs[0] += 1;
                         if let Some(media) = self.media.as_mut() { media.set_playing(true, self.clock.elapsed()); }
                     },
                     Event::FrameRateChanged { fps } => {
-                        if let Some(live)=self.live.as_mut(){live.reset();}
+                        if let Some(live)=self.live.as_mut(){live.recover_video();}
                         self.epochs[0] += 1;
                         if let Some(media) = self.media.as_mut() {
                             media.set_fps(fps)?;
@@ -188,6 +188,8 @@ impl Endpoint {
     }
 
     pub fn finish(&mut self) -> Result<(), String> {
+        if let Some(live)=self.live.as_mut(){live.transport_lost();}
+        self.sync_live_epoch();
         self.decoder.finish().map_err(|e| e.to_string())
     }
 
@@ -365,5 +367,48 @@ mod tests {
             endpoint.receive(&touch).expect("bad contact must not disconnect USB");
             endpoint.receive(&init).expect("session must still process commands");
         }
+    }
+    #[test]
+    fn hu_video_controls_preserve_call_audio_and_microphone() {
+        let path=std::env::temp_dir().join(format!("carlink-duplex-reset-{}",std::process::id()));
+        let mut endpoint=Endpoint::with_source(None,Some(path.clone())).unwrap();
+        for (id,payload) in [(ids::HU_PROTOCOL_VERSION,vec![8,4,16,1]),
+            (ids::VIDEO_INIT,vec![8,0xa0,6,16,0xe0,3,24,30]),(ids::VIDEO_START,vec![])] {
+            endpoint.receive(&Message::command(id,payload).unwrap().encode().unwrap()).unwrap();
+        }
+        let mut producer=std::os::unix::net::UnixStream::connect(&path).unwrap();
+        producer.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let frame=|kind:u8,flags:u8,payload:&[u8]| {
+            let mut wire=((12+payload.len()) as u32).to_le_bytes().to_vec();
+            wire.extend([kind,flags,0,0]);wire.extend(0u64.to_le_bytes());wire.extend(payload);wire
+        };
+        let mut config=Vec::new();for n in [800u32,480,30]{config.extend(n.to_le_bytes());}
+        for wire in [frame(4,1,&[]),frame(1,0,&config),
+            frame(7,0,br#"{"generation":9,"active":true,"sample_rate":16000,"channels":1}"#),
+            frame(5,3,&[1]),frame(3,3,&[1;4])] {producer.write_all(&wire).unwrap();}
+        let poll=|endpoint:&mut Endpoint| {
+            let mut ids=Vec::new();for _ in 0..12 {
+                if let Some(wire)=endpoint.poll_media().unwrap() {
+                    ids.extend(Decoder::new(Limits::default()).feed(&wire).unwrap().iter().map(|m|m.id));
+                }
+            }ids
+        };
+        assert!(poll(&mut endpoint).contains(&0x50003));
+        for (id,payload) in [(ids::VIDEO_RESET,vec![]),(ids::VIDEO_FPS_CHANGE,vec![8,30]),(ids::VIDEO_PAUSE,vec![])] {
+            endpoint.receive(&Message::command(id,payload).unwrap().encode().unwrap()).unwrap();
+            producer.write_all(&frame(3,3,&[2;4])).unwrap();
+            let ids=poll(&mut endpoint);assert!(ids.contains(&0x50003));assert!(!ids.contains(&0x10023));assert!(!ids.contains(&0x50004));
+            let microphone=Message{channel:crate::carlife::Channel::Vr,id:0x58001,timestamp_ms:Some(0),reserved:0,payload:vec![3;640]};
+            endpoint.receive(&microphone.encode().unwrap()).unwrap();endpoint.poll_media().unwrap();
+            let mut found=false;
+            for _ in 0..8 {
+                let mut prefix=[0;4];producer.read_exact(&mut prefix).unwrap();
+                let mut body=vec![0;u32::from_le_bytes(prefix) as usize];producer.read_exact(&mut body).unwrap();
+                if body[0]==130 {assert_eq!(&body[20..],&microphone.payload);found=true;break;}
+            }
+            assert!(found);
+        }
+        endpoint.transport_ready(false);assert!(!endpoint.live.as_ref().unwrap().accepts_input());
+        assert!(poll(&mut endpoint).contains(&0x10023));
     }
 }

@@ -196,16 +196,19 @@ fn connect_output(path:&Path)->std::io::Result<UnixStream>{
     Ok(unsafe{UnixStream::from_raw_fd(fd)})
 }
 struct Worker {listener:UnixListener,output:PathBuf,view:Arc<Mutex<View>>,stop:Arc<AtomicBool>,events:SyncSender<Value>,rendered:RenderSlot,cached:Option<(u64,Vec<u8>)>,
+    microphone:Option<Frame>,audio_roles:[bool;4],
     source:Option<Pipe>,hu:Option<Pipe>,snapshot:View,source_active:bool,source_key:Option<Frame>,waiting_key:bool,retry:Instant,painted:Option<Instant>,presented:Option<View>,touch:Option<Value>,menu_touch:Option<(usize,f64,f64,bool)>,last_key:Option<Instant>,back_frames:Vec<Frame>,back_last:Option<Instant>,back_first:Option<Instant>}
 impl Worker {
     fn new(listener:UnixListener,output:PathBuf,view:Arc<Mutex<View>>,stop:Arc<AtomicBool>,events:SyncSender<Value>,rendered:RenderSlot)->Self{
-        Self{listener,output,view,stop,events,rendered,cached:None,source:None,hu:None,snapshot:View::default(),source_active:false,source_key:None,waiting_key:true,retry:Instant::now(),painted:None,presented:None,touch:None,menu_touch:None,last_key:None,back_frames:vec![],back_last:None,back_first:None}
+        Self{listener,output,view,stop,events,rendered,cached:None,microphone:None,audio_roles:[false;4],source:None,hu:None,snapshot:View::default(),source_active:false,source_key:None,waiting_key:true,retry:Instant::now(),painted:None,presented:None,touch:None,menu_touch:None,last_key:None,back_frames:vec![],back_last:None,back_first:None}
     }
     fn output(&mut self,f:Frame){if self.hu.as_mut().is_some_and(|p|p.push(f).is_err()){self.hu=None;self.painted=None;self.presented=None;self.waiting_key=true;}}
     fn source(&mut self,f:Frame){if self.source.as_mut().is_some_and(|p|p.push(f).is_err()){self.lose_source();}}
     fn lose_source(&mut self){self.back_frames.clear();self.back_last=None;self.back_first=None;let _=self.events.try_send(json!({"type":"source-state","active":false}));self.source=None;self.source_active=false;self.source_key=None;self.waiting_key=true;self.touch=None;self.last_key=None;self.stop_source_media();}
     fn stop_source_media(&mut self){
         if let Some(h)=self.hu.as_mut(){h.discard_media();}self.painted=None;
+        if let Some(f)=self.microphone.take(){if let Ok(mut v)=serde_json::from_slice::<Value>(&f.payload){v["active"]=Value::Bool(false);self.output(Frame::new(7,0,serde_json::to_vec(&v).unwrap()));}}
+        self.audio_roles=[false;4];
         for role in 0..4{self.output(Frame::new(5,role,vec![0]));}
         if !self.snapshot.visible{self.output(Frame::new(4,0,vec![]));}
     }
@@ -215,8 +218,15 @@ impl Worker {
         // frame invalidates this slot, so no missing prediction chain replays.
         if self.source_active&&!self.snapshot.visible{if let Some(key)=&self.source_key{let frame=menu_frame(key.payload.clone());self.output(frame);self.waiting_key=false;}}
     }
-    fn state(&mut self){self.output(configure());self.output(Frame::new(4,u8::from(self.snapshot.visible||self.source_active),vec![]));self.waiting_key=true;self.request_key();self.replay_source_key();self.painted=None;}
+    fn state(&mut self){self.output(configure());self.output(Frame::new(4,u8::from(self.snapshot.visible||self.source_active),vec![]));
+        if self.source_active{for role in 0..4{if self.audio_roles[role]{self.output(Frame::new(5,role as u8,vec![1]));}}if let Some(mic)=self.microphone.clone(){self.output(mic);}}
+        self.waiting_key=true;self.request_key();self.replay_source_key();self.painted=None;}
     fn incoming(&mut self,f:Frame){
+        if f.kind==5{self.audio_roles[f.flags as usize]=f.payload[0]==1;}
+        if f.kind==7{if let Ok(v)=serde_json::from_slice::<Value>(&f.payload){
+            if v["active"]==true{self.microphone=Some(f.clone());}
+            else if v["active"]==false&&self.microphone.as_ref().and_then(|m|serde_json::from_slice::<Value>(&m.payload).ok()).is_some_and(|m|m["generation"]==v["generation"]){self.microphone=None;}
+        }}
         if f.kind==5&&f.flags==3{let _=self.events.try_send(json!({"type":"call-state","active":f.payload[0]==1}));}
         match f.kind {
         1=>{if !self.snapshot.visible {self.output(f);}},
@@ -323,6 +333,25 @@ fn touch_row(x:f64,y:f64,focus:usize,count:usize)->Option<usize>{
 }
 #[cfg(test)]mod tests {
     use super::*;
+    #[test]fn hu_reconnect_replays_call_and_microphone_but_source_loss_stops_capture(){
+        let root=std::env::temp_dir().join(format!("carlink-call-replay-{}",std::process::id()));fs::create_dir(&root).unwrap();
+        let listener=UnixListener::bind(root.join("source")).unwrap();let(tx,_rx)=mpsc::sync_channel(32);
+        let mut w=Worker::new(listener,root.join("live"),Arc::new(Mutex::new(View::default())),Arc::new(AtomicBool::new(false)),tx,Arc::new(Mutex::new(None)));
+        w.source_active=true;w.snapshot.visible=true;
+        let request=|generation,active|Frame::new(7,0,serde_json::to_vec(&json!({"generation":generation,"active":active,"sample_rate":16000,"channels":1})).unwrap());
+        w.incoming(Frame::new(5,3,vec![1]));w.incoming(request(7,true));w.incoming(request(6,false));
+        assert!(w.microphone.is_some());
+        let(socket,_peer)=UnixStream::pair().unwrap();w.hu=Some(Pipe::new(socket).unwrap());w.state();
+        let pending=&w.hu.as_ref().unwrap().output;
+        assert_eq!(pending.iter().map(|p|p.kind).collect::<Vec<_>>(),vec![1,4,5,7]);
+        assert_eq!(pending[2].data[5],3);
+        assert_eq!(serde_json::from_slice::<Value>(&pending[3].data[16..]).unwrap()["generation"],7);
+        w.lose_source();assert!(w.microphone.is_none());assert_eq!(w.audio_roles,[false;4]);
+        let pending=&w.hu.as_ref().unwrap().output;
+        let stop=pending.iter().find(|p|p.kind==7).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&stop.data[16..]).unwrap()["active"],false);
+        drop(w);fs::remove_dir_all(root).unwrap();
+    }
     #[test]fn static_key_replays_only_while_it_is_latest_source_picture(){
         let root=std::env::temp_dir().join(format!("carlink-static-key-{}",std::process::id()));fs::create_dir(&root).unwrap();
         let listener=UnixListener::bind(root.join("source")).unwrap();let(tx,_rx)=mpsc::sync_channel(32);
