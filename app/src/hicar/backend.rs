@@ -27,7 +27,7 @@ impl Config{
     fn parse(args:&[String])->Result<Self>{
         let mut c=Self{model:"00040A00".into(),identity:"/var/lib/carlink/hicar/production/identity.json".into(),
             library:"/usr/local/lib/carlink/hicar-native/libcarlink_hichain.so".into(),store:"/var/lib/carlink/hicar/production/keys".into(),
-            interface:String::new(),live:"/run/carlink/live.sock".into(),audio_binary:"/usr/bin/ffmpeg".into(),adapter:"/org/bluez/hci0".into(),
+            interface:String::new(),live:"/run/carlink/live.sock".into(),audio_binary:"/usr/local/lib/carlink/carplay/bin/carlink-audio".into(),adapter:"/org/bluez/hci0".into(),
             peer:None,excluded:vec![],pair:false,pair_seconds:120,sequence:0,duration:0,power:11,channel:23,test:false,fds:[None;3],test_ip:None,test_port:None};
         let mut i=0;while i<args.len(){let name=args[i].as_str();i+=1;
             if matches!(name,"--pair"|"--test-mode"|"--managed"|"--allow-incoming"|"--reply-control"|"--reply-identity"|"--dmsdp-options"|"--audio"){
@@ -83,7 +83,9 @@ struct Rpc{socket:UnixStream,child:Option<Child>,limit:usize}
 impl Rpc{
     fn new(name:&str,inherited:Option<i32>,limit:usize)->Result<Self>{let (fd,child)=if let Some(fd)=inherited{validate_fd(fd,libc::SOCK_STREAM)?;(unsafe{OwnedFd::from_raw_fd(fd)},None)}else{let (fd,child)=spawn(name,libc::SOCK_STREAM)?;(fd,Some(child))};
         let socket=UnixStream::from(fd);socket.set_read_timeout(Some(Duration::from_secs(2))).map_err(|_|"worker read timeout unavailable")?;socket.set_write_timeout(Some(Duration::from_secs(2))).map_err(|_|"worker write timeout unavailable")?;Ok(Self{socket,child,limit})}
-    fn call(&mut self,v:&Value)->Result<Value>{let mut data=serde_json::to_vec(v).map_err(|_|"private request serialization failed")?;if data.is_empty()||data.len()>self.limit{return Err("private request exceeds limit".into());}
+    fn call(&mut self,v:&Value)->Result<Value>{
+        self.socket.set_read_timeout(Some(Duration::from_secs(if v["op"]=="set-video"{6}else{2}))).map_err(|_|"worker deadline unavailable")?;
+        let mut data=serde_json::to_vec(v).map_err(|_|"private request serialization failed")?;if data.is_empty()||data.len()>self.limit{return Err("private request exceeds limit".into());}
         let sent=self.socket.write_all(&(data.len() as u32).to_be_bytes()).and_then(|_|self.socket.write_all(&data));wipe(&mut data);sent.map_err(|_|"private worker send failed")?;
         let mut length=[0;4];self.socket.read_exact(&mut length).map_err(|_|"private worker reply unavailable")?;let n=u32::from_be_bytes(length) as usize;if n==0||n>self.limit{return Err("private response exceeds limit".into());}
         let mut data=vec![0;n];self.socket.read_exact(&mut data).map_err(|_|"private worker reply truncated")?;let result:Result<Value>=serde_json::from_slice(&data).map_err(|_|"invalid private response".into());wipe(&mut data);let v=result?;if v["ok"]!=true{return Err("private worker rejected operation".into());}Ok(v)}
@@ -132,6 +134,14 @@ fn connected(local:Ipv4Addr,peer:Ipv4Addr,port:u16)->Result<OwnedFd>{
         let mut error=0;let mut size=4;if unsafe{libc::getsockopt(raw,libc::SOL_SOCKET,libc::SO_ERROR,&mut error as *mut _ as *mut _,&mut size)}!=0||error!=0{return Err("HiSight control failed".into());}}
     Ok(fd)
 }
+fn listener(local:Ipv4Addr,port:u16)->Result<TcpListener>{
+    let raw=unsafe{libc::socket(libc::AF_INET,libc::SOCK_STREAM|libc::SOCK_CLOEXEC|libc::SOCK_NONBLOCK,0)};
+    if raw<0{return Err("cannot allocate HiCar listener".into());}let fd=unsafe{OwnedFd::from_raw_fd(raw)};let yes=1i32;
+    let address=libc::sockaddr_in{sin_family:libc::AF_INET as u16,sin_port:port.to_be(),sin_addr:libc::in_addr{s_addr:u32::from_ne_bytes(local.octets())},sin_zero:[0;8]};
+    if unsafe{libc::setsockopt(raw,libc::SOL_SOCKET,libc::SO_REUSEADDR,&yes as *const _ as *const _,std::mem::size_of_val(&yes) as _)}!=0
+        ||unsafe{libc::bind(raw,&address as *const _ as *const _,std::mem::size_of_val(&address) as _)}!=0||unsafe{libc::listen(raw,4)}!=0{return Err("cannot bind HiCar listener".into());}
+    Ok(TcpListener::from(fd))
+}
 struct Owner{config:Config,radio:Radio,worker:Rpc,media:Option<Rpc>,mock_media:Option<i32>,channels:Vec<Channel>,listeners:Vec<TcpListener>,
     offer:Value,address:String,own:String,local:Ipv4Addr,peer_ip:Ipv4Addr,base:u16,auth:Option<u64>,authenticated:bool,key:Vec<u8>,epoch:u64,
     speaker_ready:bool,video_set:bool,clock_set:bool,last_stats:Instant,last_poll:Instant,closing:bool}
@@ -152,7 +162,7 @@ impl Owner{
         let mut worker=Rpc::new("session-worker",config.fds[1],IPC)?;
         let ready=worker.call(&json!({"identity":config.identity,"model":config.model,"address":address,"library":config.library,"store":config.store,"offer":offer,"business_channel":config.channel+1}))?;
         if ready["ready"]!=true||ready["wire_identity_sha256"].as_str()!=Some(hex(&crypto.sha256(own.as_bytes())?).as_str()){return Err("private signing identity mismatch".into());}
-        let mut listeners=vec![];for offset in 0..3{let listener=TcpListener::bind((local,base+offset)).map_err(|_|"cannot bind HiCar network listener")?;listener.set_nonblocking(true).map_err(|_|"cannot configure HiCar network listener")?;listeners.push(listener);}
+        let mut listeners=vec![];for offset in 0..3{listeners.push(listener(local,base+offset)?);}
         radio.call(json!({"op":"activate"}),Duration::from_secs(15))?;
         event("ready",0);
         Ok(Self{mock_media:config.fds[2],config,radio,worker,media:None,channels:vec![],listeners,offer,address,own,local,peer_ip,base,
@@ -199,7 +209,10 @@ impl Owner{
                 let result=self.worker.call(&json!({"op":"dmsdp-open","generation":self.auth,"device_info":info,"audio":true}))?;channel.token=Some(num(&result,"session")?);channel.enqueue(unhex(text(&result,"initial")?)?)?;
                 let ports=self.worker.call(&json!({"op":"dmsdp-ports","session":channel.token,"ports":ready["audio_ports"]}))?;pending(&mut channel,&ports)?;
             }Ok(())})();
-        if opened.is_err(){if kind==Kind::Control{self.stop_projection();}event("tcp_stream_error",self.epoch);continue;}
+        if opened.is_err(){if kind==Kind::Control{
+            if let Some(token)=channel.token{let _=self.worker.call(&json!({"op":"dmsdp-close","session":token}));}
+            self.stop_projection();
+        }event("tcp_stream_error",self.epoch);continue;}
         self.channels.push(channel);event("tcp_connected",self.epoch);
     }}Ok(())}
     fn receive_nearby(&mut self,c:&mut Channel,bytes:&[u8])->Result<()>{for frame in c.decoder.feed(bytes)?{
