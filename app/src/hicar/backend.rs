@@ -279,8 +279,8 @@ impl Owner{
     fn stop_projection(&mut self){
         if self.closing{return;}self.closing=true;
         // Flush RTSP TEARDOWN while its authenticated worker still exists.
-        for c in &mut self.channels{if c.kind==Kind::Sight{if let Ok(v)=self.worker.call(&json!({"op":"hisight-teardown","session":c.token})){if let Some(w)=v["teardown"].as_str(){if let Ok(w)=unhex(w){let _=c.enqueue(w);}}let _=pending(c,&v);}let until=Instant::now()+Duration::from_millis(150);while !c.output.is_empty()&&Instant::now()<until{let _=c.flush();std::thread::sleep(Duration::from_millis(2));}let _=self.worker.call(&json!({"op":"hisight-close","session":c.token}));c.closing=true;}}
-        for c in &mut self.channels{if c.kind==Kind::Control{if let Ok(v)=self.worker.call(&json!({"op":"dmsdp-stop-audio","session":c.token})){let _=pending(c,&v);let _=c.flush();}let _=self.worker.call(&json!({"op":"dmsdp-close","session":c.token}));c.closing=true;}}
+        for c in &mut self.channels{if c.kind==Kind::Sight&&!c.closing{if let Ok(v)=self.worker.call(&json!({"op":"hisight-teardown","session":c.token})){if let Some(w)=v["teardown"].as_str(){if let Ok(w)=unhex(w){let _=c.enqueue(w);}}let _=pending(c,&v);}let until=Instant::now()+Duration::from_millis(150);while !c.output.is_empty()&&Instant::now()<until{let _=c.flush();std::thread::sleep(Duration::from_millis(2));}let _=self.worker.call(&json!({"op":"hisight-close","session":c.token}));c.closing=true;}}
+        for c in &mut self.channels{if c.kind==Kind::Control&&!c.closing{if let Ok(v)=self.worker.call(&json!({"op":"dmsdp-stop-audio","session":c.token})){let _=pending(c,&v);let _=c.flush();}let _=self.worker.call(&json!({"op":"dmsdp-close","session":c.token}));c.closing=true;}}
         if let Some(mut media)=self.media.take(){media.close();println!("{}",json!({"event":"bridge_stats","session_epoch":self.epoch,"active":false,"connected":false,"video_frames":0,"epoch_video_frames":0}));event("hisight_closed",self.epoch);}
         self.video_set=false;self.clock_set=false;self.speaker_ready=false;self.closing=false;
     }
