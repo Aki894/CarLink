@@ -130,6 +130,8 @@ class LiveLink:
             self._put(1, self.config)
 
     def audio_state(self, role, active):
+        if role == 3:
+            print(json.dumps(dict(event='call_state', active=bool(active))), flush=True)
         with self.lock:
             # Remove queued audio for the ended/reconfigured role.
             kept = [(k, w, t) for k, w, t in self.pending if k != 3 or w[5] != role]
@@ -488,6 +490,8 @@ def run(args):
                             link.audio_state(ROLES[old['role']], False)
                         if fmt is not None:
                             formats[ident] = fmt
+                        if fmt and fmt.get('role') == 'TELEPHONY':
+                            link.audio_state(3, True)
                 else:
                     kind, ident, flags, seq, pts, sender, payload = message
                     if not active:

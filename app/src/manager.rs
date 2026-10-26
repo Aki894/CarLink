@@ -75,7 +75,7 @@ fn save(path:&Path,store:&Store)->Result<()>{
     if result.is_err(){let _=fs::remove_file(&tmp);}result
 }
 #[derive(Clone,Serialize)]
-struct Status{schema:u32,generation:u64,protocol:Option<Protocol>,target:Option<Device>,active:bool,pairing:bool,paused:bool,
+struct Status{schema:u32,generation:u64,protocol:Option<Protocol>,target:Option<Device>,active:bool,pairing:bool,paused:bool,call_active:bool,
     carlife_pid:Option<u32>,backend_pid:Option<u32>,usb_connected:bool,menu_visible:bool,last_error:Option<String>,last_stage:Option<String>}
 fn event(name:&str){println!("{}",json!({"event":name}));}
 fn diagnostic_stage(name:&str)->bool{matches!(name,"ready"|"controller_setting"|"rfcomm_connected"|"rust_connection_worker_ready"|"rust_hisight_ready"|"rust_dmsdp_ready"|"rust_media_ready"|"rust_radio_ready"|"tcp_connected"|"hisight_connected"|"auth_parse_stopped"|"control_parse_stopped"|"control_peer_timeout"|"hisight_parse_stopped"|"parse_stopped"|"stream_error"|"tcp_stream_error"|"hisight_error"|"stopped")}
@@ -150,7 +150,7 @@ impl Owner{
         let boot=fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|s|s.trim().to_owned());
         if boot.is_some()&&store.boot_id!=boot{store.paused=false;store.boot_id=boot;}
         let paused=store.paused;
-        Ok(Self{config,store,status:Status{schema:1,generation:0,protocol:None,target:None,active:false,pairing:false,paused,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,last_error:None,last_stage:None},
+        Ok(Self{config,store,status:Status{schema:1,generation:0,protocol:None,target:None,active:false,pairing:false,paused,call_active:false,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,last_error:None,last_stage:None},
             life:None,backend:None,choice:None,life_started:Instant::now(),life_retry_at:Instant::now(),life_failures:0,life_ready:false,started:Instant::now(),ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,wireless_ready:false,source_ready:false,session_epoch:0,pair_pin:None})
     }
     fn automatic(&self)->Option<Choice>{
@@ -163,6 +163,7 @@ impl Owner{
             .or_else(||if self.store.devices.is_empty(){self.config.initial.map(|protocol|Choice{protocol,device:None,pairing:true})}else{None})
     }
     fn stop_backend(&mut self)->Result<()>{
+        self.status.call_active=false;
         self.pair_pin=None;
         self.menu_pending=None;self.menu_focus=0;
         let had_carplay=self.backend.is_some()&&self.status.protocol==Some(Protocol::Carplay);
@@ -183,6 +184,7 @@ impl Owner{
         }Ok(())
     }
     fn select(&mut self,choice:Choice)->Result<()>{
+        if self.status.call_active{return Err("finish the active call before switching phones".into());}
         if choice.protocol==Protocol::Hicar&&((choice.device.is_none()&&!choice.pairing)||self.config.hicar.is_empty()){return Err("HiCar requires a selected target or explicit pairing window and configured backend".into());}
         // Validate the persisted PIN before interrupting the current projection.
         // Identity creation and rotation belong to provisioning, never this UI.
@@ -236,7 +238,7 @@ impl Owner{
         if !success{return Err("Bluetooth control failed".into());}Ok(())
     }
     fn show_recovery_menu(&mut self){let explicit=self.status.menu_visible&&!self.menu_idle;self.status.menu_visible=true;self.menu_idle=!explicit;self.menu_pending=None;self.menu_focus=0;if let Some(mux)=&self.mux{let (rows,_)=self.menu_model();let _=mux.set_menu(rows,0,true);}}
-    fn source_lost(&mut self){self.wireless_ready=false;self.status.active=false;self.ready=None;self.seen_media=false;self.show_recovery_menu();self.started=Instant::now()-Duration::from_secs(self.config.connect_seconds.saturating_sub(8));}
+    fn source_lost(&mut self){self.status.call_active=false;self.wireless_ready=false;self.status.active=false;self.ready=None;self.seen_media=false;self.show_recovery_menu();self.started=Instant::now()-Duration::from_secs(self.config.connect_seconds.saturating_sub(8));}
     fn mark_active(&mut self)->Result<()>{
         if self.wireless_ready&&(self.mux.is_none()||self.source_ready){
             if !self.status.active {
@@ -357,6 +359,7 @@ impl Owner{
         (labels,commands)
     }
     fn menu_input(&mut self,v:Value)->Result<()>{
+        if v["type"]=="call-state"{self.status.call_active=v["active"]==true;return Ok(());}
         if v["type"]=="open-menu"{self.status.menu_visible=true;self.menu_idle=false;self.menu_focus=0;self.menu_pending=None;return Ok(());}
         if v["type"]=="source-state"{self.source_ready=v["active"]==true;if !self.source_ready&&self.status.active{self.source_lost();}self.mark_active()?;return Ok(());}
         if !self.status.menu_visible{return Ok(());}let (rows,actions)=self.menu_model();

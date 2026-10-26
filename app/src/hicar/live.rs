@@ -34,9 +34,9 @@ fn connect(local:Ipv4Addr,peer:Ipv4Addr,port:u16,timeout:Duration)->Result<TcpSt
 }
 fn live(kind:u8,flags:u8,data:&[u8],pts:u64)->Vec<u8>{let mut out=(12u32+data.len() as u32).to_le_bytes().to_vec();out.extend([kind,flags,0,0]);out.extend(pts.to_le_bytes());out.extend(data);out}
 struct Queued{kind:u8,wire:Vec<u8>,offset:usize,at:Instant}
-struct Link{path:PathBuf,socket:Option<UnixStream>,input:Vec<u8>,queue:VecDeque<Queued>,size:usize,retry:Instant,wait_key:bool,established:bool,active:bool,audio:bool,sent:u64,dropped:u64,reconnects:u64}
+struct Link{path:PathBuf,socket:Option<UnixStream>,input:Vec<u8>,queue:VecDeque<Queued>,size:usize,retry:Instant,wait_key:bool,established:bool,active:bool,audio:bool,audio_role:u8,microphone:Option<Vec<u8>>,mic_pcm:VecDeque<(u64,Vec<u8>)>,sent:u64,dropped:u64,reconnects:u64}
 impl Link{
-    fn new(path:PathBuf)->Self{Self{path,socket:None,input:vec![],queue:VecDeque::new(),size:0,retry:Instant::now(),wait_key:true,established:false,active:false,audio:false,sent:0,dropped:0,reconnects:0}}
+    fn new(path:PathBuf)->Self{Self{path,socket:None,input:vec![],queue:VecDeque::new(),size:0,retry:Instant::now(),wait_key:true,established:false,active:false,audio:false,audio_role:0,microphone:None,mic_pcm:VecDeque::new(),sent:0,dropped:0,reconnects:0}}
     fn clear(&mut self){self.queue.clear();self.size=0;self.wait_key=true;}
     fn push(&mut self,kind:u8,flags:u8,data:&[u8],pts:u64){let wire=live(kind,flags,data,pts);if self.queue.len()>=128||self.size+wire.len()>MAX_QUEUE{self.disconnect();}self.size+=wire.len();self.queue.push_back(Queued{kind,wire,offset:0,at:Instant::now()});}
     fn prune(&mut self,kind:u8){if self.queue.iter().any(|v|v.kind==kind&&v.offset>0){self.disconnect();return;}self.queue.retain(|v|v.kind!=kind);self.size=self.queue.iter().map(|v|v.wire.len()-v.offset).sum();}
@@ -46,14 +46,15 @@ impl Link{
         if self.queue.iter().any(|v|v.kind==2&&v.offset>0){self.disconnect();return;}
         self.prune(2);self.prune(6);self.wait_key=true;self.push(6,0,&[],0);
     }
-    fn session(&mut self,active:bool){if self.queue.iter().any(|v|v.offset>0){self.disconnect();}self.active=active;self.established=false;self.clear();self.push(4,u8::from(active),&[],0);self.push(1,0,&[800u32.to_le_bytes(),480u32.to_le_bytes(),30u32.to_le_bytes()].concat(),0);if self.audio{self.push(5,0,&[1],0);}}
-    fn audio(&mut self,active:bool){self.audio=active;self.prune(3);self.push(5,0,&[u8::from(active)],0);}
+    fn session(&mut self,active:bool){if self.queue.iter().any(|v|v.offset>0){self.disconnect();}self.active=active;self.established=false;self.clear();self.push(4,u8::from(active),&[],0);self.push(1,0,&[800u32.to_le_bytes(),480u32.to_le_bytes(),30u32.to_le_bytes()].concat(),0);if self.audio{self.push(5,self.audio_role,&[1],0);}if active{if let Some(v)=self.microphone.clone(){self.push(7,0,&v,0);}}else{self.microphone=None;self.mic_pcm.clear();}}
+    fn audio(&mut self,active:bool){self.audio=active;self.prune(3);self.push(5,self.audio_role,&[u8::from(active)],0);}
+    fn microphone(&mut self,generation:u64,active:bool){let v=json!({"generation":generation,"active":active,"sample_rate":16000,"channels":1}).to_string().into_bytes();self.microphone=active.then(||v.clone());self.mic_pcm.clear();self.push(7,0,&v,0);}
     fn media(&mut self,kind:u8,data:&[u8],pts:u64,key:bool)->bool{
         if self.socket.is_none()||!self.active||kind==2&&self.wait_key&&!key{self.dropped+=1;return false;}
         if self.size+data.len()+16>MAX_QUEUE||self.queue.iter().filter(|v|v.kind==kind).count()>=if kind==2{4}else{6}{self.dropped+=1;if kind==2{self.recover();}return false;}
-        self.push(kind,u8::from(kind==2&&key),data,pts);if kind==2{self.wait_key=false;self.established=true;}true
+        self.push(kind,if kind==3{self.audio_role}else{u8::from(kind==2&&key)},data,pts);if kind==2{self.wait_key=false;self.established=true;}true
     }
-    fn disconnect(&mut self){self.established=false;self.socket=None;self.input.clear();self.clear();self.retry=Instant::now()+Duration::from_millis(250);}
+    fn disconnect(&mut self){self.established=false;self.socket=None;self.input.clear();self.mic_pcm.clear();self.clear();self.retry=Instant::now()+Duration::from_millis(250);}
     fn step(&mut self)->Vec<Value>{
         let mut controls=vec![];
         if self.socket.is_none()&&Instant::now()>=self.retry{
@@ -78,12 +79,18 @@ impl Link{
         }
         let mut bytes=[0u8;4096];
         if !broken{for _ in 0..8{match socket.read(&mut bytes){
-            Ok(0)=>{broken=true;break;},Ok(n)=>{self.input.extend(&bytes[..n]);if self.input.len()>8192{broken=true;break;}},
+            Ok(0)=>{broken=true;break;},Ok(n)=>{self.input.extend(&bytes[..n]);if self.input.len()>32768{broken=true;break;}},
             Err(e)if e.kind()==ErrorKind::WouldBlock=>break,Err(_)=>{broken=true;break;}
         }}}
         while !broken&&self.input.len()>=4{
             let n=u32::from_le_bytes(self.input[..4].try_into().unwrap()) as usize;
-            if !(12..=4096).contains(&n){broken=true;break;}if self.input.len()<n+4{break;}
+            if !(12..=16404).contains(&n){broken=true;break;}if self.input.len()<n+4{break;}
+            if self.input[4..8]==[130,0,0,0]{
+                let payload=&self.input[16..n+4];
+                if !(10..=16392).contains(&payload.len())||payload.len()%2!=0||self.mic_pcm.len()>=6{broken=true;break;}
+                let generation=u64::from_le_bytes(payload[..8].try_into().unwrap());self.mic_pcm.push_back((generation,payload[8..].to_vec()));self.input.drain(..n+4);continue;
+            }
+            if n>4096{broken=true;break;}
             if self.input[4..8]!=[129,0,0,0]{broken=true;break;}
             match serde_json::from_slice(&self.input[16..n+4]){Ok(value)=>controls.push(value),Err(_)=>{broken=true;break;}}
             self.input.drain(..n+4);
@@ -150,6 +157,7 @@ impl Clock{
     }
 }
 struct Engine{
+    uplink:Option<super::super::uplink::Uplink>,mic_generation:u64,mic_packets:u64,
     key:Vec<u8>,crypto:Crypto,local:Ipv4Addr,peer:Ipv4Addr,audio_binary:PathBuf,udp:UdpSocket,link:Link,
     video:Option<TcpStream>,video_bytes:Vec<u8>,video_decoder:media::Video,video_open:bool,video_ended:bool,
     input:Option<TcpStream>,input_port:Option<u16>,input_queue:VecDeque<InputPacket>,contact:Option<(u16,u16)>,keys:BTreeSet<String>,input_next:Instant,input_start:Instant,
@@ -167,13 +175,21 @@ impl Engine{
         let mut key=unhex(string(config,"key")?)?;if !matches!(key.len(),16|32){wipe(&mut key);return Err("invalid authenticated media key".into());}
         if let Some(Value::String(text))=config.get_mut("key"){unsafe{wipe(text.as_bytes_mut());}}
         if key.len()>16{wipe(&mut key[16..]);key.truncate(16);}
-        Ok(Self{key,crypto,local,peer,audio_binary,udp,link:Link::new(source),video:None,video_bytes:vec![],video_decoder:media::Video::new(),video_open:false,video_ended:false,input:None,input_port:None,input_queue:VecDeque::new(),contact:None,keys:BTreeSet::new(),input_next:Instant::now(),input_start:Instant::now(),audio:media::Audio::new(),audio_ready:false,audio_generation:0,decoder:None,parameters:[None,None],clock:None,clock_offset:None,clock_updated:None,clock_rtt:None,video_frames:0,epoch_video_frames:0,key_frames:0,input_events:0,audio_frames:0,pcm_blocks:0,invalid:0,audio_resets:0})
+        Ok(Self{uplink:None,mic_generation:0,mic_packets:0,key,crypto,local,peer,audio_binary,udp,link:Link::new(source),video:None,video_bytes:vec![],video_decoder:media::Video::new(),video_open:false,video_ended:false,input:None,input_port:None,input_queue:VecDeque::new(),contact:None,keys:BTreeSet::new(),input_next:Instant::now(),input_start:Instant::now(),audio:media::Audio::new(),audio_ready:false,audio_generation:0,decoder:None,parameters:[None,None],clock:None,clock_offset:None,clock_updated:None,clock_rtt:None,video_frames:0,epoch_video_frames:0,key_frames:0,input_events:0,audio_frames:0,pcm_blocks:0,invalid:0,audio_resets:0})
     }
     fn state(&self)->Value{json!({"active":self.link.active&&self.link.socket.is_some()&&self.link.established,"connected":self.link.socket.is_some(),"waiting_key":self.link.wait_key,"video_open":self.video_open,"video_ended":self.video_ended,"input_connected":self.input.is_some(),"video_frames":self.video_frames,"epoch_video_frames":self.epoch_video_frames,"key_frames":self.key_frames,"audio_frames":self.audio_frames,"pcm_blocks":self.pcm_blocks,"input_events":self.input_events,"audio_generation":self.audio_generation,"audio_ready":self.audio_ready,"audio_packets":self.audio.packets,"audio_lost":self.audio.lost,"audio_duplicates":self.audio.duplicates,"rejected":self.invalid,"audio_resets":self.audio_resets,"pending":self.link.queue.len(),"pending_bytes":self.link.size,"sent":self.link.sent,"dropped":self.link.dropped,"reconnects":self.link.reconnects,"clock_offset_us":self.clock_offset,"clock_updated_us":self.clock_updated,"clock_rtt_us":self.clock_rtt})}
     fn stop_audio(&mut self){self.audio_ready=false;self.decoder=None;self.link.audio(false);}
     fn reset_decoder(&mut self){self.decoder=None;self.audio_resets+=1;self.link.audio(false);}
-    fn stop_video(&mut self){self.release_inputs();self.flush_input();self.video=None;self.video_bytes.clear();self.video_open=false;self.video_ended=true;self.input=None;self.input_queue.clear();self.contact=None;self.keys.clear();self.stop_audio();self.link.session(false);}
+    fn stop_microphone(&mut self){if self.uplink.take().is_some(){self.link.microphone(self.mic_generation,false);}}
+    fn stop_video(&mut self){self.stop_microphone();self.release_inputs();self.flush_input();self.video=None;self.video_bytes.clear();self.video_open=false;self.video_ended=true;self.input=None;self.input_queue.clear();self.contact=None;self.keys.clear();self.stop_audio();self.link.session(false);}
     fn command(&mut self,v:&Value)->Result<Value>{match string(v,"op")?{
+        "microphone-start"=>{
+            self.stop_microphone();self.mic_generation=self.mic_generation.checked_add(1).ok_or("microphone generation exhausted")?;
+            let remote=port(v,"port")?;let stream=v["session"].as_u64().filter(|id|*id<=u32::MAX as u64).ok_or("invalid microphone session")? as u32;
+            self.uplink=Some(super::super::uplink::Uplink::new(&self.audio_binary,self.mic_generation,remote,stream)?);self.link.microphone(self.mic_generation,true);
+        },
+        "microphone-stop"=>self.stop_microphone(),
+        "audio-role"=>{let role=v["role"].as_u64().filter(|n|matches!(n,0|3)).ok_or("invalid call audio role")? as u8;if self.link.audio_role!=role{self.stop_audio();self.link.audio_role=role;self.link.audio(true);}},
         "set-video"=>{
             if self.video.is_some(){return Err("video transport already open".into());}
             let video=connect(self.local,self.peer,port(v,"media_port")?,Duration::from_secs(2))?;
@@ -269,6 +285,13 @@ impl Engine{
         if let Some(clock)=self.clock.as_mut(){if let Some((rtt,offset,updated))=clock.step(&self.crypto,&self.key){self.clock_rtt=Some(rtt);self.clock_offset=Some(offset);self.clock_updated=Some(updated);}}
         if let Some(decoder)=self.decoder.as_mut(){match decoder.step(){Ok(Some((pcm,pts)))=>{self.link.media(3,&pcm,pts,false);self.pcm_blocks+=1;},Ok(None)=>{},Err(_)=>self.reset_decoder()}}
         let controls=self.link.step();for v in controls{self.feedback(v);}self.flush_input();
+        let mut failed=false;
+        while let Some((generation,pcm))=self.link.mic_pcm.pop_front(){if let Some(u)=self.uplink.as_mut(){if u.feed(generation,pcm).is_err(){failed=true;break;}}}
+        if let Some(u)=self.uplink.as_mut(){match u.poll(&self.crypto,&self.key){
+            Ok(packets)=>{for packet in packets{match self.udp.send_to(&packet,SocketAddrV4::new(self.peer,u.port)){Ok(n)if n==packet.len()=>self.mic_packets+=1,Err(e)if e.kind()==ErrorKind::WouldBlock=>{},_=>{failed=true;break;}}}},
+            Err(_)=>failed=true,
+        }}
+        if failed{self.invalid+=1;self.stop_microphone();println!("{}",json!({"event":"microphone_error","capture_stopped":true}));}
     }
     fn pollfds(&self)->Vec<libc::pollfd>{
         let mut fds=vec![libc::pollfd{fd:self.udp.as_raw_fd(),events:libc::POLLIN,revents:0}];

@@ -206,7 +206,7 @@ impl Owner{
         let fd:OwnedFd=stream.into();let mut channel=Channel::new(fd,kind,self.epoch)?;
         let opened:Result<()>=(||{if kind==Kind::Nearby{channel.token=Some(num(&self.worker.call(&json!({"op":"open","business":false}))?,"channel")?);}
             if kind==Kind::Control{
-                let ready=self.begin_media()?;let info=json!({"deviceId":self.own,"deviceName":"CarLink","deviceType":4,"bluetoothMac":self.address,"btName":"CarLink","localIp":self.local.to_string(),"remoteIp":self.peer_ip.to_string(),"port":0,"properties":{"2003":self.config.model,"5004":true,"5014":false}});
+                let ready=self.begin_media()?;let info=json!({"deviceId":self.own,"deviceName":"CarLink","deviceType":4,"bluetoothMac":self.address,"btName":"CarLink","localIp":self.local.to_string(),"remoteIp":self.peer_ip.to_string(),"port":0,"properties":{"2003":self.config.model,"5002":true,"5003":true,"5004":true,"5014":false}});
                 let result=self.worker.call(&json!({"op":"dmsdp-open","generation":self.auth,"device_info":info,"audio":true}))?;channel.token=Some(num(&result,"session")?);channel.enqueue(unhex(text(&result,"initial")?)?)?;
                 let ports=self.worker.call(&json!({"op":"dmsdp-ports","session":channel.token,"ports":ready["audio_ports"]}))?;pending(&mut channel,&ports)?;
             }Ok(())})();
@@ -230,7 +230,13 @@ impl Owner{
     fn receive_control(&mut self,c:&mut Channel,bytes:&[u8])->Result<()>{let result=self.worker.call(&json!({"op":"dmsdp-receive","session":c.token,"data":hex(bytes),"now_us":now_us(),"capture":false}))?;
         if result["events"].as_array().is_some_and(|v|!v.is_empty()){c.last_valid=Instant::now();}
         pending(c,&result)?;let state=&result["state"];c.negotiated=state["negotiated"]==true;
-        if let Some(events)=result["events"].as_array(){for e in events{if e["audio_setup_sent"]==true{self.media_call(json!({"op":"audio-begin"}))?;self.speaker_ready=false;}if e["audio_ready"]==true{self.media_call(json!({"op":"audio-ready"}))?;self.speaker_ready=true;}if e["audio_stopped"]==true{self.media_call(json!({"op":"audio-stop"}))?;self.speaker_ready=false;}}}
+        if let Some(events)=result["events"].as_array(){for e in events{
+            if e["microphone_ready"]==true{self.media_call(json!({"op":"microphone-start","port":e["port"],"session":e["session"]}))?;}
+            if e["microphone_stopped"]==true{self.media_call(json!({"op":"microphone-stop"}))?;}
+            if e["audio_setup_sent"]==true{self.media_call(json!({"op":"audio-begin"}))?;self.speaker_ready=false;}
+            if e["audio_ready"]==true{self.media_call(json!({"op":"audio-role","role":if e["modem"]==true{3}else{0}}))?;self.media_call(json!({"op":"audio-ready"}))?;self.speaker_ready=true;}
+            if e["audio_stopped"]==true{self.media_call(json!({"op":"audio-stop"}))?;self.speaker_ready=false;}
+        }}
         if !self.clock_set{if let Some(clock)=state["clock"].as_array(){self.media_call(json!({"op":"clock-start","port":clock[2]}))?;self.clock_set=true;}}
         if state["negotiated"]==true&&c.last_heartbeat.elapsed()>=Duration::from_secs(1){let heart=self.worker.call(&json!({"op":"dmsdp-heartbeat","session":c.token}))?;c.enqueue(unhex(text(&heart,"heartbeat")?)?)?;pending(c,&heart)?;c.last_heartbeat=Instant::now();}
         if let Some(port)=state["media_port"].as_u64(){if !self.channels.iter().any(|c|c.kind==Kind::Sight){

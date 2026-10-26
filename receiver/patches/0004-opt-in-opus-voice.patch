@@ -10,7 +10,7 @@
 +    // OXP can carry Opus without decoding. Enable only for consumers that accept
 +    // compressed voice; the default native output retains its PCM/AAC offer.
 +    let voice_opus = std::env::var("CARLINK_CARPLAY_VOICE_OPUS").as_deref() == Ok("1");
-+    config.microphone_opus = false; // CarLife microphone consumer supplies PCM16.
++    config.microphone_opus = voice_opus;
 +    config.output_opus = voice_opus;
      config.main.fps = session.0;
      config.hevc = session.1;

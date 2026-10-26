@@ -8,6 +8,8 @@ pub mod session;
 pub mod hisight;
 pub mod dmsdp;
 pub mod live;
+#[cfg(unix)]
+pub mod uplink;
 pub mod radio;
 pub mod backend;
 #[cfg(unix)]

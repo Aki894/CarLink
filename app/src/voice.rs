@@ -11,6 +11,7 @@ pub struct Voice {
     pending: VecDeque<Message>,
 }
 impl Voice {
+    pub fn congested(&self)->bool{self.pending.len()>=24}
     fn cmd(&mut self,id:u32,payload:Vec<u8>) {
         self.pending.push_back(Message::command(id,payload).expect("fixed voice command"));
     }

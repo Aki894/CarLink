@@ -45,9 +45,9 @@ set -euo pipefail
     --disable-avdevice --disable-swscale \
     --disable-hwaccels --disable-gpl --disable-nonfree --disable-version3 \
     --enable-avcodec --enable-avformat --enable-avfilter --enable-swresample \
-    --enable-decoder=aac,pcm_s16le,opus --enable-encoder=pcm_s16le \
+    --enable-decoder=aac,pcm_s16le,opus --enable-encoder=pcm_s16le,aac \
     --enable-parser=aac,opus --enable-demuxer=aac,pcm_s16le,ogg \
-    --enable-muxer=pcm_s16le --enable-protocol=pipe \
+    --enable-muxer=pcm_s16le,adts --enable-protocol=pipe \
     --enable-filter=aresample,aformat,anull,abuffer,abuffersink
 CONFIGURE
 chmod +x "$work/configure-audio.sh"

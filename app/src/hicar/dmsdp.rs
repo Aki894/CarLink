@@ -31,24 +31,28 @@ fn clock_port(s:&str)->Result<u16>{let(negative,text)=decimal(s)?;if negative{re
 fn trigger(body:&[u8])->Option<&str>{let text=std::str::from_utf8(body).ok()?.strip_prefix("msdp_trigger_method:")?.trim_matches(|c:char|c.is_ascii_whitespace());
     (!text.is_empty()&&text.bytes().all(|b|b.is_ascii_uppercase())).then_some(text)}
 
-struct Speaker{ports:Option<(u16,i32)>,session:Option<u32>,sequence:u32,setup:Option<u32>,format:Option<Value>,ready:bool}
+struct Speaker{name:&'static str,kind:u8,remote:Option<u16>,ports:Option<(u16,i32)>,session:Option<u32>,sequence:u32,setup:Option<u32>,format:Option<Value>,ready:bool}
 impl Speaker{
-    fn new()->Self{Self{ports:None,session:None,sequence:0,setup:None,format:None,ready:false}}
+    fn new()->Self{Self::named("speaker1",3)}
+    fn named(name:&'static str,kind:u8)->Self{Self{name,kind,remote:None,ports:None,session:None,sequence:0,setup:None,format:None,ready:false}}
+    fn microphone(&self)->bool{matches!(self.kind,2|9)}
+    fn notify(&self,name:&str)->Value{let mut v=json!({});v[format!("{}_{}",if self.microphone(){"microphone"}else{"audio"},name)]=true.into();if self.name!="speaker1"{v["service"]=self.name.into();v["modem"]=(self.kind>=9).into();if let Some(p)=self.remote{v["port"]=p.into();}if let Some(id)=self.session{v["session"]=id.into();}}v}
     fn request(&mut self,method:&str,extra:&[(&str,String)])->Result<Vec<u8>>{
         self.sequence=self.sequence.checked_add(1).filter(|n|*n<=999999999).ok_or("speaker sequence exhausted")?;
-        let mut fields=vec![("ServiceID","speaker1".into()),("ServiceType","3".into()),("DataSessionID",self.session.ok_or("no speaker session")?.to_string()),("CSeq",self.sequence.to_string())];fields.extend_from_slice(extra);
+        let mut fields=vec![("ServiceID",self.name.into()),("ServiceType",self.kind.to_string()),("DataSessionID",self.session.ok_or("no speaker session")?.to_string()),("CSeq",self.sequence.to_string())];fields.extend_from_slice(extra);
         encode(&format!("{method} * DMSDP/1.0"),&fields)
     }
     fn teardown(&mut self)->Result<Option<Vec<u8>>>{if self.session.is_none(){return Ok(None);}let record=self.request("TEARDOWN",&[])?;self.session=None;self.ready=false;Ok(Some(record))}
     fn state(&self)->Value{json!({"ports":self.ports,"session_id":self.session,"sequence":self.sequence,"setup_sequence":self.setup,"format":self.format,"ready":self.ready})}
     fn receive(&mut self,m:&Message)->Result<Option<(Vec<Value>,Vec<Vec<u8>>)>>{
-        let h=&m.headers;if h.get("serviceid").map(String::as_str)!=Some("speaker1"){return Ok(None);}
-        if h.get("servicetype").map(String::as_str)!=Some("3"){return Err("unsupported speaker transport type".into());}
+        let h=&m.headers;if h.get("serviceid").map(String::as_str)!=Some(self.name){return Ok(None);}
+        if h.get("servicetype")!=Some(&self.kind.to_string()){return Err("unsupported audio transport type".into());}
         let sequence=h.get("cseq").map(String::as_str).unwrap_or("");seq(sequence)?;
         let id=h.get("datasessionid").map(String::as_str).unwrap_or("");
         let id=(if digits(id,10){id.parse::<u32>().ok().filter(|n|*n<=0x7fffffff)}else{None}).ok_or("invalid speaker session")?;
         let mut events=vec![];let mut replies=vec![];
-        let acknowledge=||encode("DMSDP/1.0 200 OK",&[("ServiceID","speaker1".into()),("ServiceType","3".into()),("DataSessionID",id.to_string()),("CSeq",sequence.into())]);
+        let name=self.name;let kind=self.kind;
+        let acknowledge=||encode("DMSDP/1.0 200 OK",&[("ServiceID",name.into()),("ServiceType",kind.to_string()),("DataSessionID",id.to_string()),("CSeq",sequence.into())]);
         if let Some(t)=trigger(&m.body){
             if !m.start.starts_with("SET_PARAMETER "){return Err("speaker trigger outside SET_PARAMETER".into());}
             match t{
@@ -58,10 +62,10 @@ impl Speaker{
                     if self.session==Some(id){return Ok(Some((events,replies)));}
                     self.session=Some(id);self.ready=false;self.format=None;
                     replies.push(self.request("SETUP",&[("Transport",format!("RTP/AVP/UDP;unicast;client_port={port}--1")),("Simple","1".into()),("CryptoVer","1".into()),("CryptoAbility","222".into()),("CryptoAlg","aes128-ctr".into()),("Fillp","0".into()),("TCP","0".into()),("Codec","0".into())])?);
-                    self.setup=Some(self.sequence);events.push(json!({"audio_setup_sent":true}));
+                    self.setup=Some(self.sequence);events.push(self.notify("setup_sent"));
                 },
-                "TEARDOWN"=>{if self.session==Some(id){if let Some(record)=self.teardown()?{replies.push(record);}events.push(json!({"audio_stopped":true}));}},
-                "CLOSE"=>{self.session=None;self.ready=false;events.push(json!({"audio_stopped":true}));},
+                "TEARDOWN"=>{if self.session==Some(id){if let Some(record)=self.teardown()?{replies.push(record);}events.push(self.notify("stopped"));}},
+                "CLOSE"=>{self.session=None;self.ready=false;events.push(self.notify("stopped"));},
                 _=>return Err("unsupported speaker trigger".into()),
             }
         }else if m.start.starts_with("DMSDP/1.0 "){
@@ -72,16 +76,17 @@ impl Speaker{
             let (client,server)=ports.ok_or("invalid speaker server endpoint")?;
             if !client.bytes().all(|b|b.is_ascii_digit())||client.is_empty()||!server.bytes().all(|b|b.is_ascii_digit())||server.is_empty(){return Err("invalid speaker server endpoint".into());}
             if client.parse::<u16>().ok()!=self.ports.map(|p|p.0)||server.parse::<u16>().ok().filter(|p|*p!=0).is_none(){return Err("invalid speaker server endpoint".into());}
-            self.ready=true;events.push(json!({"audio_ready":true}));
+            self.remote=server.parse().ok();self.ready=true;events.push(self.notify("ready"));
         }else if self.session!=Some(id){return Err("speaker session mismatch".into());}
         else if m.start.starts_with("SET_PARAMETER "){
             let text=h.get("audioparameter").map(String::as_str).unwrap_or("");
             let parts=text.strip_prefix("SampleRate=").and_then(|s|s.strip_suffix(";Codec=0")).and_then(|s|s.split_once(";Format=16;ChannelNum="));
             let(rate,channels)=parts.ok_or("unsupported speaker audio parameters")?;
             if !matches!(rate,"48000"|"44100"|"32000"|"24000"|"16000"|"8000")||!matches!(channels,"1"|"2")||!m.body.is_empty(){return Err("unsupported speaker audio parameters".into());}
+            if self.microphone()&&(rate!="16000"||channels!="1"){return Err("microphone requires negotiated 16000 Hz mono AAC".into());}
             let format=json!({"codec":"aac-adts","rate":rate.parse::<u32>().unwrap(),"channels":channels.parse::<u8>().unwrap(),"pcm_bits":16});
             self.format=Some(format.clone());replies.push(acknowledge()?);let mut e=format;e["audio_negotiated"]=true.into();events.push(e);
-        }else if m.start.starts_with("TEARDOWN "){replies.push(acknowledge()?);self.session=None;self.ready=false;events.push(json!({"audio_stopped":true}));}
+        }else if m.start.starts_with("TEARDOWN "){replies.push(acknowledge()?);self.session=None;self.ready=false;events.push(self.notify("stopped"));}
         else if m.start.starts_with("GET_PARAMETER ")&&m.body.is_empty(){replies.push(acknowledge()?);}
         else{return Err("unsupported speaker request".into());}
         Ok(Some((events,replies)))
@@ -90,7 +95,7 @@ impl Speaker{
 
 pub struct Session{
     key:Vec<u8>,crypto:Option<Crypto>,decoder:Decoder,messages:Messages,pending:Vec<Vec<u8>>,failed:bool,
-    negotiated:bool,device_info:Value,device_exchanged:bool,clock:Option<(u64,u64,u16)>,media_port:Option<u16>,speaker:Option<Speaker>,heartbeat_sequence:u32,
+    negotiated:bool,device_info:Value,device_exchanged:bool,clock:Option<(u64,u64,u16)>,media_port:Option<u16>,speaker:Option<Speaker>,services:Vec<Speaker>,heartbeat_sequence:u32,
 }
 impl Drop for Session{fn drop(&mut self){wipe(&mut self.key);}}
 impl Session{
@@ -98,7 +103,8 @@ impl Session{
         if !matches!(key.len(),0|16|32){return Err("invalid authenticated DMSDP key".into());}
         if !device_info.is_null()&&!device_info.is_object(){return Err("invalid DMSDP device information".into());}
         if ascii_json(&device_info)?.len()>65536{return Err("device information exceeds limit".into());}
-        Ok(Self{key:key.iter().take(16).copied().collect(),crypto:if key.is_empty(){None}else{Some(Crypto::load()?)},decoder:Decoder::new(Format::Control),messages:Messages::new("DMSDP"),pending:vec![],failed:false,negotiated:false,device_info,device_exchanged:false,clock:None,media_port:None,speaker:audio.then(Speaker::new),heartbeat_sequence:1})
+        let services=if audio&&device_info["properties"]["5002"]==true{vec![Speaker::named("mic1",2),Speaker::named("modemMic",9),Speaker::named("modemSpeaker",10)]}else{vec![]};
+        Ok(Self{key:key.iter().take(16).copied().collect(),crypto:if key.is_empty(){None}else{Some(Crypto::load()?)},decoder:Decoder::new(Format::Control),messages:Messages::new("DMSDP"),pending:vec![],failed:false,negotiated:false,device_info,device_exchanged:false,clock:None,media_port:None,speaker:audio.then(Speaker::new),services,heartbeat_sequence:1})
     }
     fn healthy(&self)->Result<()>{if self.failed{Err("DMSDP session requires reset".into())}else{Ok(())}}
     fn pack(&self,data:&[u8],plain:bool)->Result<Vec<u8>>{
@@ -119,8 +125,8 @@ impl Session{
         self.heartbeat_sequence=self.heartbeat_sequence.checked_add(1).filter(|n|*n<=999999999).ok_or("heartbeat sequence exhausted")?;
         self.pack(&encode("GET_PARAMETER * DMSDP/1.0",&[("CSeq",self.heartbeat_sequence.to_string())])?,false)
     }
-    pub fn set_audio_ports(&mut self,ports:(u16,i32))->Result<()>{self.healthy()?;if ports.0==0||ports.1!= -1{return Err("invalid speaker ports".into());}self.speaker.as_mut().ok_or("speaker is disabled")?.ports=Some(ports);Ok(())}
-    pub fn stop_audio(&mut self)->Result<()>{self.healthy()?;if let Some(speaker)=self.speaker.as_mut(){if let Some(record)=speaker.teardown()?{self.send(&record)?;}}Ok(())}
+    pub fn set_audio_ports(&mut self,ports:(u16,i32))->Result<()>{self.healthy()?;if ports.0==0||ports.1!= -1{return Err("invalid speaker ports".into());}self.speaker.as_mut().ok_or("speaker is disabled")?.ports=Some(ports);for service in &mut self.services{service.ports=Some(ports);}Ok(())}
+    pub fn stop_audio(&mut self)->Result<()>{self.healthy()?;let mut pending=vec![];if let Some(speaker)=self.speaker.as_mut(){if let Some(record)=speaker.teardown()?{pending.push(record);}}for s in &mut self.services{if let Some(record)=s.teardown()?{pending.push(record);}}for p in pending{self.send(&p)?;}Ok(())}
     pub fn pending(&mut self)->Vec<Vec<u8>>{std::mem::take(&mut self.pending)}
     pub fn state(&self)->Value{json!({"failed":self.failed,"negotiated":self.negotiated,"device_exchanged":self.device_exchanged,"clock":self.clock,"media_port":self.media_port,"speaker":self.speaker.as_ref().map(Speaker::state),"heartbeat_sequence":self.heartbeat_sequence})}
     pub fn receive(&mut self,data:&[u8],now_us:u64,capture:bool)->Result<(Vec<Value>,Vec<Vec<u8>>)>{
@@ -156,9 +162,9 @@ impl Session{
                     if !self.device_exchanged{let mut own=self.device_info.clone();own["businessId"]=peer.get("businessId").cloned().unwrap_or(json!(1));let mut payload=wire::uint(101)?;payload.extend(ascii_json(&own)?);self.business(3,u32::MAX,&payload)?;self.device_exchanged=true;events.push(json!({"device_info_sent":true}));}
                 },
                 104=>{if !self.device_exchanged||body.len()-pos!=4{return Err("invalid service discovery request".into());}let mask=u32::from_be_bytes(body[pos..].try_into().unwrap());events.push(json!({"service_request_mask":mask}));
-                    for service_type in [8,4]{if mask&service_type==0||service_type==4&&self.speaker.is_none(){continue;}
+                    for service_type in [8,4,2,256,512]{if mask&service_type==0||service_type==4&&self.speaker.is_none()||matches!(service_type,2|256|512)&&self.services.is_empty(){continue;}
                         let id=self.device_info.get("deviceId").and_then(Value::as_str).ok_or("missing local device identifier")?;let name=self.device_info.get("deviceName").and_then(Value::as_str).ok_or("missing local device name")?;
-                        let service=if service_type==8{json!({"deviceId":id,"deviceName":name,"serviceId":"display1","serviceType":8,"properties":{"4001":1.0,"1009":800,"1010":480},"status":{}})}else{json!({"deviceId":id,"deviceName":name,"serviceId":"speaker1","serviceType":4,"properties":{"2003":"48000,44100","2004":"1","2005":"12"},"status":{}})};
+                        let service=if service_type==8{json!({"deviceId":id,"deviceName":name,"serviceId":"display1","serviceType":8,"properties":{"4001":1.0,"1009":800,"1010":480},"status":{}})}else{let microphone=matches!(service_type,2|256);let service_id=match service_type{2=>"mic1",256=>"modemMic",512=>"modemSpeaker",_=>"speaker1"};let rates=if microphone{"16000"}else if service_type==4{"48000,44100"}else{"48000,44100,16000,8000"};json!({"deviceId":id,"deviceName":name,"serviceId":service_id,"serviceType":service_type,"properties":{"2003":rates,"2004":"1","2005":if microphone{"16"}else{"12"}},"status":{}})};
                         let mut payload=wire::uint(102)?;payload.extend(ascii_json(&service)?);self.business(3,u32::MAX,&payload)?;events.push(json!({"service_announced":service_type}));
                     }
                 },_=>{},
@@ -166,6 +172,10 @@ impl Session{
         }Ok(())
     }
     fn text(&mut self,m:&Message,now_us:u64,events:&mut Vec<Value>)->Result<()>{
+        if let Some(index)=self.services.iter().position(|s|m.headers.get("serviceid").map(String::as_str)==Some(s.name)){
+            if !self.negotiated{return Err("audio service before control negotiation".into());}
+            if let Some((changes,replies))=self.services[index].receive(m)?{events.extend(changes);for reply in replies{self.send(&reply)?;}}return Ok(());
+        }
         if self.speaker.is_some(){
             if m.headers.get("serviceid").map(String::as_str)==Some("speaker1")&&!self.negotiated{return Err("speaker before control negotiation".into());}
             if let Some((audio,replies))=self.speaker.as_mut().unwrap().receive(m)?{events.extend(audio);for reply in replies{self.send(&reply)?;}return Ok(());}
@@ -209,6 +219,17 @@ pub fn differential(v:&Value)->Result<Value>{
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn microphone_and_modem_services_are_explicit_and_authenticated(){
+        let mut s=Session::new(&[],json!({"properties":{"5002":true}}),true).unwrap();assert_eq!(s.services.len(),3);
+        s.set_audio_ports((41000,-1)).unwrap();
+        let trigger=frame(b"SET_PARAMETER * DMSDP/1.0\r\nCSeq: 1\r\nServiceID: mic1\r\nServiceType: 2\r\nDataSessionID: 7\r\nSimple: 1\r\nContent-Length: 28\r\n\r\nmsdp_trigger_method: OPTIONS".to_vec(),false).unwrap();
+        assert!(s.receive(&trigger,0,false).is_err());
+        let mut s=Session::new(&[],json!({"properties":{"5002":true}}),true).unwrap();s.set_audio_ports((41000,-1)).unwrap();s.negotiated=true;
+        let (events,_)=s.receive(&trigger,0,false).unwrap();assert_eq!(events.last().unwrap()["microphone_setup_sent"],true);s.pending();
+        let response=frame(b"DMSDP/1.0 200 OK\r\nCSeq: 1\r\nServiceID: mic1\r\nServiceType: 2\r\nDataSessionID: 7\r\nTransport: RTP/AVP/UDP;unicast;client_port=41000--1;server_port=42000--1\r\n\r\n".to_vec(),false).unwrap();
+        let (events,_)=s.receive(&response,0,false).unwrap();assert_eq!(events.last().unwrap()["microphone_ready"],true);assert_eq!(events.last().unwrap()["port"],42000);
+        s.stop_audio().unwrap();assert!(s.services.iter().all(|s|s.session.is_none()));
+    }
     #[test]fn null_session_preserves_fragmentation_and_negotiation(){
         let mut s=Session::new(&[],Value::Null,false).unwrap();let wire=frame(b"SET_PARAMETER * DMSDP/1.0\r\nCSeq: 7\r\nCryptoVer: 1\r\nCryptoSwitch: 222\r\nCryptoAlg: null\r\n\r\n".to_vec(),false).unwrap();
         for part in wire.chunks(1){s.receive(part,9,false).unwrap();}assert_eq!(s.state()["negotiated"],true);assert_eq!(s.pending().len(),1);assert!(s.heartbeat().unwrap().starts_with(&[0]));

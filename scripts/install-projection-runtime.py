@@ -75,6 +75,7 @@ def install(project, app, receiver, rootfs):
                 'share/source/stream.tar.gz', 'share/licenses/relay/LICENSE',
                 'share/licenses/relay/LICENSE-GPL-3.0', 'share/licenses/relay/NOTICE',
                 'share/licenses/stream/LICENSE']
+    required.append('voice.py')
     for name in required:
         if name not in receiver_files or not (receiver / name).stat().st_size:
             raise ValueError('Missing receiver payload: ' + name)

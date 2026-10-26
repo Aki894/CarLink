@@ -121,6 +121,7 @@ impl LiveSource {
         self.reset(); self.output.clear();
     }
     fn accept_frame(&mut self,f:Frame)->Result<(),String> {
+        if matches!(f.kind,5|7)&&self.voice.congested(){self.disconnect();return Err("voice controls exceeded bounded queue".into());}
         match f.kind {
             1 => { let v:Vec<u32>=f.payload.chunks_exact(4).map(|v|u32::from_le_bytes(v.try_into().unwrap())).collect();
                 if v != [CONFIG.width,CONFIG.height,CONFIG.fps] {return Err("live source must match advertised 800x480x30; restart with matching receiver mode".into());}

@@ -203,7 +203,7 @@ impl Worker {
     }
     fn output(&mut self,f:Frame){if self.hu.as_mut().is_some_and(|p|p.push(f).is_err()){self.hu=None;self.painted=None;self.presented=None;self.waiting_key=true;}}
     fn source(&mut self,f:Frame){if self.source.as_mut().is_some_and(|p|p.push(f).is_err()){self.lose_source();}}
-    fn lose_source(&mut self){self.back_frames.clear();self.back_last=None;self.back_first=None;let _=self.events.try_send(json!({"type":"source-state","active":false}));self.source=None;self.source_active=false;self.source_key=None;self.waiting_key=true;self.touch=None;self.last_key=None;self.stop_source_media();}
+    fn lose_source(&mut self){self.back_frames.clear();self.back_last=None;self.back_first=None;let _=self.events.try_send(json!({"type":"call-state","active":false}));let _=self.events.try_send(json!({"type":"source-state","active":false}));self.source=None;self.source_active=false;self.source_key=None;self.waiting_key=true;self.touch=None;self.last_key=None;self.stop_source_media();}
     fn stop_source_media(&mut self){
         if let Some(h)=self.hu.as_mut(){h.discard_media();}self.painted=None;
         for role in 0..4{self.output(Frame::new(5,role,vec![0]));}
@@ -216,7 +216,9 @@ impl Worker {
         if self.source_active&&!self.snapshot.visible{if let Some(key)=&self.source_key{let frame=menu_frame(key.payload.clone());self.output(frame);self.waiting_key=false;}}
     }
     fn state(&mut self){self.output(configure());self.output(Frame::new(4,u8::from(self.snapshot.visible||self.source_active),vec![]));self.waiting_key=true;self.request_key();self.replay_source_key();self.painted=None;}
-    fn incoming(&mut self,f:Frame){match f.kind {
+    fn incoming(&mut self,f:Frame){
+        if f.kind==5&&f.flags==3{let _=self.events.try_send(json!({"type":"call-state","active":f.payload[0]==1}));}
+        match f.kind {
         1=>{if !self.snapshot.visible {self.output(f);}},
         4=>{self.source_active=f.flags==1;self.source_key=None;let _=self.events.try_send(json!({"type":"source-state","active":self.source_active}));self.waiting_key=true;if !self.source_active{self.stop_source_media();}else if !self.snapshot.visible {self.output(f);}},
         6=>{self.waiting_key=true;self.source_key=None;if !self.snapshot.visible {self.output(f);}},
