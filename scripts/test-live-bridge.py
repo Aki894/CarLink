@@ -185,10 +185,10 @@ with tempfile.TemporaryDirectory(prefix='carlink-live-ci-') as directory:
                 call_thread = threading.Thread(target=send_call)
                 call_thread.start()
                 call_seen = set()
-                while not {0x30001,0x30006,0x30002} <= call_seen:
+                while not {0x50002,0x50003,0x50004} <= call_seen:
                     _, message_id, _, data = media.packet(hu)
                     call_seen.add(message_id)
-                    if message_id == 0x30006:
+                    if message_id == 0x50003:
                         assert len(data) == 3528 and any(data)
                 call_thread.join(3)
                 assert not call_thread.is_alive()
