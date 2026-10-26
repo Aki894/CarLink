@@ -464,6 +464,19 @@ mod linux {
     }
 
     impl Outgoing {
+        fn generated(data:Vec<u8>,epochs:[u64;2])->Result<Self,String>{
+            let channel=u32::from_be_bytes(data.get(..4).ok_or("USB output lacks channel header")?.try_into().unwrap());
+            let epoch=match channel{
+                1=>None,
+                2=>Some((0,epochs[0])),
+                3..=5=>{
+                    let id=u32::from_be_bytes(data.get(16..20).ok_or("USB audio lacks message header")?.try_into().unwrap());
+                    if matches!(id,0x30001|0x30002|0x40001|0x40002|0x50002|0x50004){None}else{Some((1,epochs[1]))}
+                },
+                _=>return Err("unexpected generated USB channel".into()),
+            };
+            Ok(Self{queued:Instant::now(),data,epoch})
+        }
         fn expired(&self)->bool {self.epoch.is_some() && self.queued.elapsed()>Duration::from_millis(120)}
         fn current(&self, epochs: &[AtomicU64; 2]) -> bool {
             self.epoch.map_or(true, |(lane, generation)| {
@@ -615,14 +628,12 @@ mod linux {
                             if frame.len() > MAX_FRAME { return Err("USB media exceeds frame bound".into()); }
                             let header = frame.get(..4).ok_or("USB media lacks channel header")?;
                             let channel = u32::from_be_bytes(header.try_into().unwrap());
-                            let lane = match channel {
-                                2 => 0,
-                                3 | 4 | 5 => 1,
-                                _ => return Err("unexpected test-media channel".into()),
-                            };
                             let current = endpoint.epochs();
                             publish_epochs(&epochs, current);
-                            let packet = Outgoing { queued:Instant::now(), data: frame, epoch: Some((lane, current[lane])) };
+                            let packet = Outgoing::generated(frame,current)?;
+                            // Microphone commands and audio INIT/STOP are protocol
+                            // transitions, not expiring/drop-on-pressure PCM.
+                            if packet.epoch.is_none(){send_bounded(&outgoing_tx,packet,&stop,deadline)?;continue;}
                             match outgoing_tx.try_send(packet) {
                                 Ok(()) => {},
                                 Err(TrySendError::Full(_)) => {
@@ -839,6 +850,22 @@ mod linux {
             assert!(!video.current(&epochs)); assert!(audio.current(&epochs));
             publish_epochs(&epochs, [4, 8]);
             assert!(!audio.current(&epochs)); assert!(control.current(&epochs));
+        }
+
+        #[test]
+        fn microphone_commands_and_voice_playback_controls_survive_media_epochs(){
+            use crate::carlife::{Channel,Message};
+            let epochs=[AtomicU64::new(8),AtomicU64::new(9)];
+            for id in [0x10026,0x10024,0x10023]{
+                let frame=Message::command(id,vec![]).unwrap().encode().unwrap();
+                let packet=Outgoing::generated(frame,[1,2]).unwrap();assert!(packet.epoch.is_none());assert!(packet.current(&epochs));
+            }
+            for id in [0x50002,0x50003,0x50004]{
+                let frame=Message{channel:Channel::Vr,id,timestamp_ms:Some(1),reserved:0,payload:vec![0;4]}.encode().unwrap();
+                let packet=Outgoing::generated(frame,[1,2]).unwrap();
+                assert_eq!(packet.epoch.is_none(),id!=0x50003);
+                assert_eq!(packet.current(&epochs),id!=0x50003);
+            }
         }
 
         #[test]
