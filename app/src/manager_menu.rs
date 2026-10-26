@@ -318,6 +318,18 @@ fn touch_row(x:f64,y:f64,focus:usize,count:usize)->Option<usize>{
 }
 #[cfg(test)]mod tests {
     use super::*;
+    #[test]fn static_key_replays_only_while_it_is_latest_source_picture(){
+        let root=std::env::temp_dir().join(format!("carlink-static-key-{}",std::process::id()));fs::create_dir(&root).unwrap();
+        let listener=UnixListener::bind(root.join("source")).unwrap();let(tx,_rx)=mpsc::sync_channel(32);
+        let mut w=Worker::new(listener,root.join("live"),Arc::new(Mutex::new(View::default())),Arc::new(AtomicBool::new(false)),tx,Arc::new(Mutex::new(None)));
+        w.snapshot.visible=true;w.incoming(Frame::new(4,1,vec![]));w.incoming(Frame::new(2,1,vec![1,2,3]));assert!(w.source_key.is_some());
+        let(socket,_peer)=UnixStream::pair().unwrap();w.hu=Some(Pipe::new(socket).unwrap());w.snapshot.visible=false;w.replay_source_key();
+        assert!(!w.waiting_key);assert_eq!(w.hu.as_ref().unwrap().output.len(),1);
+        w.incoming(Frame::new(2,0,vec![4]));assert!(w.source_key.is_none());
+        w.incoming(Frame::new(2,1,vec![5]));w.incoming(Frame::new(6,0,vec![]));assert!(w.source_key.is_none());
+        w.incoming(Frame::new(2,1,vec![6]));w.incoming(Frame::new(4,0,vec![]));assert!(w.source_key.is_none());
+        drop(w);fs::remove_dir_all(root).unwrap();
+    }
     #[test]fn touch_maps_visible_scroll_rows(){assert_eq!(touch_row(0.5,0.2,0,3),Some(0));assert_eq!(touch_row(0.5,0.2,8,15),Some(2));assert_eq!(touch_row(0.01,0.2,0,3),None);assert_eq!(touch_row(0.5,0.95,0,3),None);}
     #[test]fn triple_back_is_consumed_but_single_back_and_order_are_preserved(){
         let root=std::env::temp_dir().join(format!("carlink-back-{}",std::process::id()));fs::create_dir(&root).unwrap();

@@ -62,6 +62,7 @@ def compare(actual, key, info, audio, steps):
     cipher=Cipher(key) if key else None
     try:
         assert actual.get('ok'), 'valid DMSDP transcript rejected'
+        actual=actual['result']
         assert normalize(bytes.fromhex(actual['initial']),cipher)==normalize(session.initial(),cipher), 'DMSDP initial mismatch'
         assert len(actual['steps'])==len(steps)
         for index,(step,result) in enumerate(zip(steps,actual['steps'])):
