@@ -296,6 +296,9 @@ impl Owner{
         if result["events"].as_array().is_some_and(|v|!v.is_empty()){c.last_valid=Instant::now();}
         pending(c,&result)?;let state=&result["state"];c.negotiated=state["negotiated"]==true;
         if let Some(events)=result["events"].as_array(){for e in events{
+            if e["microphone_ready"]==true||e["microphone_stopped"]==true||e["audio_ready"]==true||e["audio_stopped"]==true{
+                println!("{}",json!({"event":"hicar_audio_service","service":e["service"].as_str().filter(|n|matches!(*n,"speaker1"|"mic1"|"modemMic"|"modemSpeaker")).unwrap_or("speaker1"),"ready":e["microphone_ready"]==true||e["audio_ready"]==true,"stopped":e["microphone_stopped"]==true||e["audio_stopped"]==true}));
+            }
             for command in self.audio_services.apply(e){self.media_call(command)?;}
         }}
         if !self.clock_set{if let Some(clock)=state["clock"].as_array(){self.media_call(json!({"op":"clock-start","port":clock[2]}))?;self.clock_set=true;}}

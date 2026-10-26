@@ -209,8 +209,14 @@ def check(binary):
             first_pcm = until_frame(live, 3)
             assert len(first_pcm[3]) == 3528 and any(first_pcm[3])
             assert len(until_frame(live, 3)[3]) == 3528
+            assert len(until_frame(live, 3)[3]) == 3528
             status = rpc(ipc, dict(op='status'))['state']
-            assert status['active'] and status['audio_frames'] == 1 and status['pcm_blocks'] >= 2
+            # The fake decoder writes exactly three 20 ms blocks at once. All
+            # three survive IO pumping until the single playout clock consumes
+            # them; none can overwrite a pending block in a second mixer timer.
+            assert status['active'] and status['audio_frames'] == 1 and status['pcm_blocks'] == 3
+            assert isinstance(status['audio_underruns'], int) and isinstance(status['mix_late'], int)
+            assert status['pcm_queued_blocks'] <= 6
             # SSRCs must own distinct decoders; align their PCM at one output tick.
             udp.sendto(audio_packet(cipher, 2, 200), ('127.0.0.1', audio_port))
             udp.sendto(audio_packet(cipher, 1, 200, stream=2004), ('127.0.0.1', audio_port))

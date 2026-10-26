@@ -101,7 +101,7 @@ impl Link{
 }
 
 struct AudioPacket{data:Vec<u8>,offset:usize,at:Instant}
-struct Decoder{child:Child,input:ChildStdin,output:ChildStdout,queue:VecDeque<AudioPacket>,pcm:Vec<u8>,origin:u64,samples:u64,next:Instant,rate:u32,channels:u8}
+struct Decoder{child:Child,input:ChildStdin,output:ChildStdout,queue:VecDeque<AudioPacket>,pcm:Vec<u8>,origin:u64,samples:u64,rate:u32,channels:u8}
 impl Drop for Decoder{fn drop(&mut self){let _=self.child.kill();let _=self.child.wait();}}
 impl Decoder{
     fn new(binary:&Path,rate:u32,channels:u8,pts:u64)->Result<Self>{
@@ -109,10 +109,10 @@ impl Decoder{
         let mut child=Command::new(binary).args(["-hide_banner","-loglevel","error","-nostdin","-threads","1","-probesize","32","-analyzeduration","0","-f","aac","-i","pipe:0","-vn","-threads","1","-ac","2","-ar","44100","-c:a","pcm_s16le","-f","s16le","-flush_packets","1","pipe:1"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|_|"cannot start native AAC decoder")?;
         let input=child.stdin.take().ok_or("missing decoder input")?;let output=child.stdout.take().ok_or("missing decoder output")?;
         if nonblocking(input.as_raw_fd()).is_err()||nonblocking(output.as_raw_fd()).is_err(){let _=child.kill();let _=child.wait();return Err("cannot configure decoder IO".into());}
-        Ok(Self{child,input,output,queue:VecDeque::new(),pcm:vec![],origin:pts,samples:0,next:Instant::now(),rate,channels})
+        Ok(Self{child,input,output,queue:VecDeque::new(),pcm:vec![],origin:pts,samples:0,rate,channels})
     }
     fn feed(&mut self,data:Vec<u8>)->Result<()>{if self.queue.len()>=16||data.len()>65536{return Err("decoder backpressure".into());}self.queue.push_back(AudioPacket{data,offset:0,at:Instant::now()});Ok(())}
-    fn step(&mut self)->Result<Option<(Vec<u8>,u64)>>{
+    fn step(&mut self)->Result<()>{
         if self.child.try_wait().map_err(|_|"decoder status failed")?.is_some(){return Err("decoder exited".into());}
         for _ in 0..4{
             let Some(item)=self.queue.front_mut()else{break;};if item.at.elapsed()>Duration::from_millis(500){return Err("decoder queue expired".into());}
@@ -122,10 +122,31 @@ impl Decoder{
             let room=(6*PCM).saturating_sub(self.pcm.len());if room==0{break;}
             match self.output.read(&mut bytes[..room.min(4096)]){Ok(0)=>return Err("decoder output closed".into()),Ok(n)=>self.pcm.extend(&bytes[..n]),Err(e)if e.kind()==ErrorKind::WouldBlock=>break,Err(_)=>return Err("decoder read failed".into())}
         }
-        if self.pcm.len()>=PCM&&Instant::now()>=self.next{
-            if self.next.elapsed()>Duration::from_millis(300){self.next=Instant::now();}
-            let chunk=self.pcm.drain(..PCM).collect();let pts=self.origin+self.samples*1_000_000/44100;self.samples+=882;self.next+=Duration::from_millis(20);return Ok(Some((chunk,pts)));
-        }Ok(None)
+        Ok(())
+    }
+    fn take_pcm(&mut self)->Option<(Vec<u8>,u64)>{
+        if self.pcm.len()<PCM{return None;}
+        let chunk=self.pcm.drain(..PCM).collect();let pts=self.origin+self.samples*1_000_000/44100;self.samples+=882;Some((chunk,pts))
+    }
+}
+/// One sample clock owns all decoded streams. Decoder IO never consumes PCM;
+/// only a playout tick removes one block from each bounded decoder buffer.
+#[derive(Default)]
+struct AudioPlayout{next:Option<Instant>,underruns:u64,late:u64}
+impl AudioPlayout{
+    fn reset(&mut self){self.next=None;}
+    fn due(&mut self,now:Instant,available:bool)->bool{
+        const PERIOD:Duration=Duration::from_millis(20);
+        let Some(next)=self.next else{
+            if available{self.next=Some(now+Duration::from_millis(40));}
+            return false;
+        };
+        if now<next{return false;}
+        if !available{self.underruns+=1;self.next=None;return false;}
+        // Ordinary scheduler jitter must not accumulate into a slower clock.
+        // After a missed whole slot, rebase instead of bursting old PCM ticks.
+        self.next=Some(if now.duration_since(next)>=PERIOD{self.late+=1;now+PERIOD}else{next+PERIOD});
+        true
     }
 }
 struct InputPacket{wire:Vec<u8>,offset:usize,due:Instant,release:Option<String>}
@@ -161,7 +182,7 @@ struct Engine{
     key:Vec<u8>,crypto:Crypto,local:Ipv4Addr,peer:Ipv4Addr,audio_binary:PathBuf,udp:UdpSocket,link:Link,
     video:Option<TcpStream>,video_bytes:Vec<u8>,video_decoder:media::Video,video_open:bool,video_ended:bool,
     input:Option<TcpStream>,input_port:Option<u16>,input_queue:VecDeque<InputPacket>,contact:Option<(u16,u16)>,keys:BTreeSet<String>,input_next:Instant,input_start:Instant,
-    audio:media::Audio,audio_ready:bool,audio_generation:u64,decoders:BTreeMap<u32,Decoder>,mix:BTreeMap<u32,(Vec<u8>,u64)>,mix_next:Instant,parameters:[Option<Vec<u8>>;2],
+    audio:media::Audio,audio_ready:bool,audio_generation:u64,decoders:BTreeMap<u32,Decoder>,playout:AudioPlayout,parameters:[Option<Vec<u8>>;2],
     clock:Option<Clock>,clock_offset:Option<i64>,clock_updated:Option<u64>,clock_rtt:Option<i64>,video_frames:u64,epoch_video_frames:u64,key_frames:u64,input_events:u64,audio_frames:u64,pcm_blocks:u64,invalid:u64,audio_resets:u64,
 }
 impl Drop for Engine{fn drop(&mut self){self.stop_video();self.decoders.clear();self.link.session(false);let until=Instant::now()+Duration::from_millis(100);while !self.link.queue.is_empty()&&Instant::now()<until{let _=self.link.step();std::thread::sleep(Duration::from_millis(2));}wipe(&mut self.key);}}
@@ -175,11 +196,11 @@ impl Engine{
         let mut key=unhex(string(config,"key")?)?;if !matches!(key.len(),16|32){wipe(&mut key);return Err("invalid authenticated media key".into());}
         if let Some(Value::String(text))=config.get_mut("key"){unsafe{wipe(text.as_bytes_mut());}}
         if key.len()>16{wipe(&mut key[16..]);key.truncate(16);}
-        Ok(Self{uplink:None,mic_generation:0,mic_packets:0,mic_service:None,key,crypto,local,peer,audio_binary,udp,link:Link::new(source),video:None,video_bytes:vec![],video_decoder:media::Video::new(),video_open:false,video_ended:false,input:None,input_port:None,input_queue:VecDeque::new(),contact:None,keys:BTreeSet::new(),input_next:Instant::now(),input_start:Instant::now(),audio:media::Audio::new(),audio_ready:false,audio_generation:0,decoders:BTreeMap::new(),mix:BTreeMap::new(),mix_next:Instant::now(),parameters:[None,None],clock:None,clock_offset:None,clock_updated:None,clock_rtt:None,video_frames:0,epoch_video_frames:0,key_frames:0,input_events:0,audio_frames:0,pcm_blocks:0,invalid:0,audio_resets:0})
+        Ok(Self{uplink:None,mic_generation:0,mic_packets:0,mic_service:None,key,crypto,local,peer,audio_binary,udp,link:Link::new(source),video:None,video_bytes:vec![],video_decoder:media::Video::new(),video_open:false,video_ended:false,input:None,input_port:None,input_queue:VecDeque::new(),contact:None,keys:BTreeSet::new(),input_next:Instant::now(),input_start:Instant::now(),audio:media::Audio::new(),audio_ready:false,audio_generation:0,decoders:BTreeMap::new(),playout:AudioPlayout::default(),parameters:[None,None],clock:None,clock_offset:None,clock_updated:None,clock_rtt:None,video_frames:0,epoch_video_frames:0,key_frames:0,input_events:0,audio_frames:0,pcm_blocks:0,invalid:0,audio_resets:0})
     }
-    fn state(&self)->Value{json!({"active":self.link.active&&self.link.socket.is_some()&&self.link.established,"connected":self.link.socket.is_some(),"waiting_key":self.link.wait_key,"video_open":self.video_open,"video_ended":self.video_ended,"input_connected":self.input.is_some(),"video_frames":self.video_frames,"epoch_video_frames":self.epoch_video_frames,"key_frames":self.key_frames,"audio_frames":self.audio_frames,"pcm_blocks":self.pcm_blocks,"input_events":self.input_events,"audio_generation":self.audio_generation,"audio_ready":self.audio_ready,"audio_packets":self.audio.packets,"audio_lost":self.audio.lost,"audio_duplicates":self.audio.duplicates,"rejected":self.invalid,"audio_resets":self.audio_resets,"pending":self.link.queue.len(),"pending_bytes":self.link.size,"sent":self.link.sent,"dropped":self.link.dropped,"reconnects":self.link.reconnects,"clock_offset_us":self.clock_offset,"clock_updated_us":self.clock_updated,"clock_rtt_us":self.clock_rtt,"microphone_active":self.uplink.is_some(),"microphone_packets":self.mic_packets,"audio_streams":self.decoders.len(),"call_active":self.link.audio_role==3&&(self.audio_ready||self.mic_service.as_deref()==Some("modemMic"))})}
-    fn stop_audio(&mut self){self.audio_ready=false;self.decoders.clear();self.mix.clear();self.link.audio(false);}
-    fn reset_decoder(&mut self,id:u32){self.decoders.remove(&id);self.mix.remove(&id);self.audio_resets+=1;if self.decoders.is_empty()&&self.link.audio_role!=3{self.link.audio(false);}}
+    fn state(&self)->Value{json!({"active":self.link.active&&self.link.socket.is_some()&&self.link.established,"connected":self.link.socket.is_some(),"waiting_key":self.link.wait_key,"video_open":self.video_open,"video_ended":self.video_ended,"input_connected":self.input.is_some(),"video_frames":self.video_frames,"epoch_video_frames":self.epoch_video_frames,"key_frames":self.key_frames,"audio_frames":self.audio_frames,"pcm_blocks":self.pcm_blocks,"input_events":self.input_events,"audio_generation":self.audio_generation,"audio_ready":self.audio_ready,"audio_packets":self.audio.packets,"audio_lost":self.audio.lost,"audio_duplicates":self.audio.duplicates,"rejected":self.invalid,"audio_resets":self.audio_resets,"audio_underruns":self.playout.underruns,"mix_late":self.playout.late,"pcm_queued_blocks":self.decoders.values().map(|d|d.pcm.len()/PCM).sum::<usize>(),"pending":self.link.queue.len(),"pending_bytes":self.link.size,"sent":self.link.sent,"dropped":self.link.dropped,"reconnects":self.link.reconnects,"clock_offset_us":self.clock_offset,"clock_updated_us":self.clock_updated,"clock_rtt_us":self.clock_rtt,"microphone_active":self.uplink.is_some(),"microphone_packets":self.mic_packets,"audio_streams":self.decoders.len(),"call_active":self.link.audio_role==3&&(self.audio_ready||self.mic_service.as_deref()==Some("modemMic"))})}
+    fn stop_audio(&mut self){self.audio_ready=false;self.decoders.clear();self.playout.reset();self.link.audio(false);}
+    fn reset_decoder(&mut self,id:u32){self.decoders.remove(&id);self.audio_resets+=1;if self.decoders.is_empty()&&self.link.audio_role!=3{self.link.audio(false);}}
     fn stop_microphone(&mut self){self.mic_service=None;if self.uplink.take().is_some(){self.link.microphone(self.mic_generation,false);}}
     fn stop_video(&mut self){self.stop_microphone();self.release_inputs();self.flush_input();self.video=None;self.video_bytes.clear();self.video_open=false;self.video_ended=true;self.input=None;self.input_queue.clear();self.contact=None;self.keys.clear();self.stop_audio();self.link.session(false);}
     fn command(&mut self,v:&Value)->Result<Value>{match string(v,"op")?{
@@ -242,9 +263,9 @@ impl Engine{
                 let pts=now_us();let format=(frame.aac.rate,frame.aac.channels);
                 let id=frame.stream;
                 if self.decoders.get(&id).is_none_or(|d|(d.rate,d.channels)!=format){
-                    self.decoders.remove(&id);self.mix.remove(&id);
+                    self.decoders.remove(&id);
                     if self.decoders.len()>=4{self.invalid+=1;continue;}
-                    match Decoder::new(&self.audio_binary,format.0,format.1,pts){Ok(d)=>{let first=self.decoders.is_empty();self.decoders.insert(id,d);if first{self.link.audio(true);self.mix_next=Instant::now()+Duration::from_millis(20);}},Err(_)=>{self.invalid+=1;continue;}}
+                    match Decoder::new(&self.audio_binary,format.0,format.1,pts){Ok(d)=>{let first=self.decoders.is_empty();self.decoders.insert(id,d);if first{self.link.audio(true);self.playout.reset();}},Err(_)=>{self.invalid+=1;continue;}}
                 }
                 if self.decoders.get_mut(&id).is_some_and(|d|d.feed(frame.aac.data).is_err()){self.reset_decoder(id);}self.audio_frames+=1;
             }
@@ -288,11 +309,12 @@ impl Engine{
         self.read_video();self.read_audio();
         if let Some(clock)=self.clock.as_mut(){if let Some((rtt,offset,updated))=clock.step(&self.crypto,&self.key){self.clock_rtt=Some(rtt);self.clock_offset=Some(offset);self.clock_updated=Some(updated);}}
         let mut failed=vec![];
-        for (id,decoder) in &mut self.decoders{match decoder.step(){Ok(Some(block))=>{self.mix.insert(*id,block);},Ok(None)=>{},Err(_)=>failed.push(*id)}}
+        for (id,decoder) in &mut self.decoders{if decoder.step().is_err(){failed.push(*id);}}
         for id in failed{self.reset_decoder(id);}
-        if Instant::now()>=self.mix_next{
-            self.mix_next=Instant::now()+Duration::from_millis(20);
-            if !self.mix.is_empty(){let pts=self.mix.values().map(|(_,t)|*t).max().unwrap_or(0);let blocks=std::mem::take(&mut self.mix);let pcm=mix_pcm(blocks.values().map(|(pcm,_)|pcm.as_slice()));self.link.media(3,&pcm,pts,false);self.pcm_blocks+=1;}
+        if self.playout.due(Instant::now(),self.decoders.values().any(|d|d.pcm.len()>=PCM)){
+            let blocks:Vec<_>=self.decoders.values_mut().filter_map(Decoder::take_pcm).collect();
+            let pts=blocks.iter().map(|(_,t)|*t).max().unwrap_or(0);
+            let pcm=mix_pcm(blocks.iter().map(|(pcm,_)|pcm.as_slice()));if self.link.media(3,&pcm,pts,false){self.pcm_blocks+=1;}
         }
         let controls=self.link.step();for v in controls{self.feedback(v);}self.flush_input();
         let mut failed=false;
@@ -311,6 +333,32 @@ impl Engine{
 }
 fn mix_pcm<'a>(blocks:impl Iterator<Item=&'a [u8]>)->Vec<u8>{let mut mixed=vec![0i32;PCM/2];for block in blocks{for (sample,data) in mixed.iter_mut().zip(block.chunks_exact(2)){*sample+=i16::from_le_bytes([data[0],data[1]])as i32;}}mixed.into_iter().flat_map(|sample|(sample.clamp(i16::MIN as i32,i16::MAX as i32)as i16).to_le_bytes()).collect()}
 #[test]fn pcm_mixer_saturates_without_changing_sample_layout(){let a=[30000i16.to_le_bytes(),(-30000i16).to_le_bytes()].concat();let output=mix_pcm([a.as_slice(),a.as_slice()].into_iter());assert_eq!(output.len(),PCM);assert_eq!(&output[..4],&[i16::MAX.to_le_bytes(),i16::MIN.to_le_bytes()].concat());}
+#[test]fn playout_clock_has_no_scheduler_drift_or_pcm_overwrite(){
+    for poll_us in [5200,6000,11000]{
+        let epoch=Instant::now();let mut clock=AudioPlayout::default();let mut pcm=VecDeque::new();let mut produced=0;let mut played=vec![];let mut last=None;
+        for elapsed in (0..2_500_000u64).step_by(poll_us as usize){
+            while produced<100&&produced*20_000<=elapsed{pcm.push_back(produced);produced+=1;}
+            assert!(pcm.len()<=6,"playout must stay inside decoder PCM budget");
+            if clock.due(epoch+Duration::from_micros(elapsed),!pcm.is_empty()){
+                played.push(pcm.pop_front().unwrap());
+                if let Some(previous)=last{let gap=elapsed-previous;assert!((20_000-poll_us..=20_000+poll_us).contains(&gap));}
+                last=Some(elapsed);
+            }
+            if played.len()==100{break;}
+        }
+        assert_eq!(played,(0..100).collect::<Vec<_>>());assert!(pcm.is_empty());assert_eq!(clock.underruns,0);assert_eq!(clock.late,0);
+    }
+}
+#[test]fn playout_underflow_and_stall_do_not_burst_expired_slots(){
+    let epoch=Instant::now();let mut clock=AudioPlayout::default();assert!(!clock.due(epoch,true));
+    assert!(clock.due(epoch+Duration::from_millis(40),true));
+    assert!(!clock.due(epoch+Duration::from_millis(60),false));assert_eq!(clock.underruns,1);
+    assert!(!clock.due(epoch+Duration::from_millis(200),true));
+    assert!(clock.due(epoch+Duration::from_millis(240),true));
+    assert!(clock.due(epoch+Duration::from_millis(400),true));assert_eq!(clock.late,1);
+    assert!(!clock.due(epoch+Duration::from_millis(400),true));assert!(!clock.due(epoch+Duration::from_millis(419),true));
+    assert!(clock.due(epoch+Duration::from_millis(420),true));
+}
 fn nal_units(data:&[u8])->Option<Vec<&[u8]>>{
     let mut starts=vec![];let mut pos=0;
     while pos+3<=data.len(){if data[pos..].starts_with(&[0,0,0,1]){starts.push((pos,4));pos+=4;}else if data[pos..].starts_with(&[0,0,1]){starts.push((pos,3));pos+=3;}else{pos+=1;}}

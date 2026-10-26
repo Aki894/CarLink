@@ -104,7 +104,7 @@ fn spawn(args:&[String],generation:u64,source:Option<&Path>)->Result<Process>{
             if !matches!(read,Ok(n) if n>0){break;}if line.len()>16384{break;}
             if let Ok(v)=serde_json::from_slice::<Value>(&line){
                 if let Some(summary)=stage_summary(&v){let _=tx.try_send(summary);}
-                if matches!(v["event"].as_str(),Some("stage"|"retry"|"forward_latency"|"bridge_stats"|"hisight_closed"|"target_selected"|"session_error"|"voice_stats"))
+                if matches!(v["event"].as_str(),Some("stage"|"retry"|"forward_latency"|"bridge_stats"|"hisight_closed"|"target_selected"|"session_error"|"voice_stats"|"hicar_audio_service"|"microphone_error"))
                     ||v["event"]=="carlife_state"&&v["detail"]=="AwaitingVideoSource"{
                     let _=tx.try_send(v);
                 }
@@ -133,7 +133,7 @@ impl Drop for Process{fn drop(&mut self){let _=self.end();}}
 struct PairPin(String);
 impl Drop for PairPin{fn drop(&mut self){unsafe{crate::hicar::crypto::wipe(self.0.as_bytes_mut());}}}
 struct Owner{config:Config,store:Store,status:Status,life:Option<Process>,backend:Option<Process>,choice:Option<Choice>,
-    life_started:Instant,life_retry_at:Instant,life_failures:u8,life_ready:bool,
+    life_started:Instant,life_retry_at:Instant,life_failures:u8,life_ready:bool,last_media_report:Option<Instant>,
     started:Instant,ready:Option<Instant>,seen_media:bool,committed:bool,pair_deadline:Option<Instant>,repair_used:bool,
     retry_at:Instant,tried:VecDeque<String>,last_auth:Option<Instant>,refusals:u8,mux:Option<crate::manager_menu::Mux>,menu_focus:usize,menu_pending:Option<Value>,menu_idle:bool,wireless_ready:bool,source_ready:bool,session_epoch:u64,pair_pin:Option<PairPin>}
 impl Owner{
@@ -151,7 +151,7 @@ impl Owner{
         if boot.is_some()&&store.boot_id!=boot{store.paused=false;store.boot_id=boot;}
         let paused=store.paused;
         Ok(Self{config,store,status:Status{schema:1,generation:0,protocol:None,target:None,active:false,pairing:false,paused,call_active:false,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,last_error:None,last_stage:None},
-            life:None,backend:None,choice:None,life_started:Instant::now(),life_retry_at:Instant::now(),life_failures:0,life_ready:false,started:Instant::now(),ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,wireless_ready:false,source_ready:false,session_epoch:0,pair_pin:None})
+            life:None,backend:None,choice:None,life_started:Instant::now(),life_retry_at:Instant::now(),life_failures:0,life_ready:false,last_media_report:None,started:Instant::now(),ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,wireless_ready:false,source_ready:false,session_epoch:0,pair_pin:None})
     }
     fn automatic(&self)->Option<Choice>{
         if self.store.paused||self.store.policy==Policy::Manual{return None;}
@@ -254,6 +254,17 @@ impl Owner{
         if self.status.protocol==Some(Protocol::Hicar){if let Some(epoch)=v["session_epoch"].as_u64(){
             if epoch<self.session_epoch{return Ok(());}self.session_epoch=epoch;
         }}
+        if self.status.protocol==Some(Protocol::Hicar){
+            if v["event"]=="bridge_stats"&&self.last_media_report.is_none_or(|t|t.elapsed()>=Duration::from_secs(5)){
+                let mut report=json!({"event":"manager_hicar_audio"});
+                for name in ["audio_frames","pcm_blocks","audio_lost","audio_resets","audio_underruns","mix_late","microphone_active","microphone_packets","call_active","pending","dropped"]{
+                    if v[name].is_u64()||v[name].is_boolean(){report[name]=v[name].clone();}
+                }
+                println!("{report}");self.last_media_report=Some(Instant::now());
+            }
+            if v["event"]=="hicar_audio_service"{println!("{}",json!({"event":"manager_hicar_audio_service","service":v["service"].as_str().filter(|n|matches!(*n,"speaker1"|"mic1"|"modemMic"|"modemSpeaker")).unwrap_or("unknown"),"ready":v["ready"]==true,"stopped":v["stopped"]==true}));}
+            if v["event"]=="microphone_error"{println!("{}",json!({"event":"manager_hicar_microphone_error","capture_stopped":true}));}
+        }
         let name=v["event"].as_str().unwrap_or("");
         if name=="manager_backend_stage"{
             if let Some(report)=stage_report(generation,self.status.generation,&v){
