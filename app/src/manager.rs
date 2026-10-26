@@ -131,7 +131,7 @@ impl Process{
 impl Drop for Process{fn drop(&mut self){let _=self.end();}}
 #[derive(Clone)]struct Choice{protocol:Protocol,device:Option<Device>,pairing:bool}
 struct Owner{config:Config,store:Store,status:Status,life:Option<Process>,backend:Option<Process>,choice:Option<Choice>,
-    life_started:Instant,life_retry_at:Instant,life_failures:u8,
+    life_started:Instant,life_retry_at:Instant,life_failures:u8,life_ready:bool,
     started:Instant,ready:Option<Instant>,seen_media:bool,committed:bool,pair_deadline:Option<Instant>,repair_used:bool,
     retry_at:Instant,tried:VecDeque<String>,last_auth:Option<Instant>,refusals:u8,mux:Option<crate::manager_menu::Mux>,menu_focus:usize,menu_pending:Option<Value>,menu_idle:bool,wireless_ready:bool,source_ready:bool,session_epoch:u64}
 impl Owner{
@@ -149,7 +149,7 @@ impl Owner{
         if boot.is_some()&&store.boot_id!=boot{store.paused=false;store.boot_id=boot;}
         let paused=store.paused;
         Ok(Self{config,store,status:Status{schema:1,generation:0,protocol:None,target:None,active:false,pairing:false,paused,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,last_error:None,last_stage:None},
-            life:None,backend:None,choice:None,life_started:Instant::now(),life_retry_at:Instant::now(),life_failures:0,started:Instant::now(),ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,wireless_ready:false,source_ready:false,session_epoch:0})
+            life:None,backend:None,choice:None,life_started:Instant::now(),life_retry_at:Instant::now(),life_failures:0,life_ready:false,started:Instant::now(),ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,wireless_ready:false,source_ready:false,session_epoch:0})
     }
     fn automatic(&self)->Option<Choice>{
         if self.store.paused||self.store.policy==Policy::Manual{return None;}
@@ -367,7 +367,7 @@ impl Owner{
         if self.menu_idle&&self.status.active{self.status.menu_visible=false;self.menu_idle=false;}
         if let Some(mux)=&self.mux{let (rows,_)=self.menu_model();self.menu_focus=self.menu_focus.min(rows.len()-1);mux.set_menu(rows,self.menu_focus,self.status.menu_visible)?;}
 
-        if let Some(life)=self.life.as_mut(){for v in life.events.try_iter().take(16){if v["event"]=="carlife_state"{self.status.usb_connected=true;self.status.last_error=None;}if v["event"]=="session_error"{
+        if let Some(life)=self.life.as_mut(){for v in life.events.try_iter().take(16){if v["event"]=="carlife_state"{self.status.usb_connected=true;self.life_ready=true;self.status.last_error=None;}if v["event"]=="session_error"{
             self.status.usb_connected=false;
             self.status.last_error=Some(v["detail"].as_str().unwrap_or("CarLife output failed").chars().take(256).collect());event("manager_carlife_error");
         }}}
@@ -378,7 +378,7 @@ impl Owner{
             }
         }
         if self.life.is_none()&&Instant::now()>=self.life_retry_at {
-            let p=spawn(&self.config.carlife,0,None)?;self.status.carlife_pid=Some(p.child.id());self.life=Some(p);self.life_started=Instant::now();
+            let p=spawn(&self.config.carlife,0,None)?;self.status.carlife_pid=Some(p.child.id());self.life=Some(p);self.life_started=Instant::now();self.life_ready=false;
         }
         if let Some(p)=self.backend.as_mut(){let generation=p.generation;let events=p.events.try_iter().take(64).collect::<Vec<_>>();
             for e in events{self.ingest(generation,e)?;}}
@@ -409,7 +409,7 @@ impl Owner{
     fn defer_carlife(&mut self){
         // A failing HU must see a meaningful detach interval. Do not reset on
         // initial negotiation: a broken session may fail immediately afterward.
-        self.life_failures=if self.life_started.elapsed()>=Duration::from_secs(30){0}else{self.life_failures.saturating_add(1)};
+        self.life_failures=if self.life_ready&&self.life_started.elapsed()>=Duration::from_secs(30){0}else{self.life_failures.saturating_add(1)};
         self.life_retry_at=Instant::now()+Duration::from_millis(500u64<<self.life_failures.min(4));
     }
 }
@@ -575,7 +575,8 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         let root=test_root("usb-backoff");let mut owner=test_owner(&root);let wireless=owner.retry_at;
         for expected in [1000,2000,4000,8000,8000,8000]{owner.life_started=Instant::now();let before=Instant::now();owner.defer_carlife();
             let delay=owner.life_retry_at.duration_since(before).as_millis();assert!(delay>=expected&&delay<=expected+50);assert_eq!(owner.retry_at,wireless);}
-        owner.life_started=Instant::now()-Duration::from_secs(31);let before=Instant::now();owner.defer_carlife();
+        owner.life_started=Instant::now()-Duration::from_secs(31);owner.defer_carlife();assert!(owner.life_failures>0);
+        owner.life_ready=true;let before=Instant::now();owner.defer_carlife();
         assert_eq!(owner.life_failures,0);assert!(owner.life_retry_at.duration_since(before)<Duration::from_millis(550));fs::remove_dir_all(root).unwrap();
     }
     #[test]fn inactive_hicar_and_previous_epoch_cannot_hide_recovery_menu(){
