@@ -201,6 +201,7 @@ impl LiveSource {
         if self.waiting_key && self.active && self.playing {self.feedback("{\"type\":\"keyframe\",\"screen\":0}");}
         if self.report_at.elapsed()>=Duration::from_secs(5){
             crate::runtime::log("live_latency",&format!("pending={} bytes={} age_max_ms={} video_dropped={}",self.queue.len(),self.queued,self.age_max_us/1000,self.video_dropped));
+            println!("{}",serde_json::json!({"event":"voice_stats","microphone_active":self.voice.capture.is_some(),"microphone_packets":self.voice.packets,"microphone_bytes":self.voice.bytes,"call_active":self.voice.call}));
             self.report_at=Instant::now();self.age_max_us=0;
         }
         if let Some(message)=self.voice.pop(){return Some(message);}

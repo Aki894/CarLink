@@ -104,7 +104,7 @@ fn spawn(args:&[String],generation:u64,source:Option<&Path>)->Result<Process>{
             if !matches!(read,Ok(n) if n>0){break;}if line.len()>16384{break;}
             if let Ok(v)=serde_json::from_slice::<Value>(&line){
                 if let Some(summary)=stage_summary(&v){let _=tx.try_send(summary);}
-                if matches!(v["event"].as_str(),Some("stage"|"retry"|"forward_latency"|"bridge_stats"|"hisight_closed"|"target_selected"|"session_error"))
+                if matches!(v["event"].as_str(),Some("stage"|"retry"|"forward_latency"|"bridge_stats"|"hisight_closed"|"target_selected"|"session_error"|"voice_stats"))
                     ||v["event"]=="carlife_state"&&v["detail"]=="AwaitingVideoSource"{
                     let _=tx.try_send(v);
                 }
@@ -394,7 +394,7 @@ impl Owner{
         if self.menu_idle&&self.status.active{self.status.menu_visible=false;self.menu_idle=false;}
         if let Some(mux)=&self.mux{let (rows,_)=self.menu_model();self.menu_focus=self.menu_focus.min(rows.len()-1);mux.set_menu(rows,self.menu_focus,self.status.menu_visible)?;}
 
-        if let Some(life)=self.life.as_mut(){for v in life.events.try_iter().take(16){if v["event"]=="carlife_state"{self.status.usb_connected=true;self.life_ready=true;self.status.last_error=None;}if v["event"]=="session_error"{
+        if let Some(life)=self.life.as_mut(){for v in life.events.try_iter().take(16){if v["event"]=="voice_stats"{println!("{}",json!({"event":"manager_voice_stats","microphone_active":v["microphone_active"]==true,"microphone_packets":v["microphone_packets"].as_u64().unwrap_or(0),"microphone_bytes":v["microphone_bytes"].as_u64().unwrap_or(0),"call_active":v["call_active"]==true}));}if v["event"]=="carlife_state"{self.status.usb_connected=true;self.life_ready=true;self.status.last_error=None;}if v["event"]=="session_error"{
             self.status.usb_connected=false;
             self.status.last_error=Some(v["detail"].as_str().unwrap_or("CarLife output failed").chars().take(256).collect());event("manager_carlife_error");
         }}}

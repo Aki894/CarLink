@@ -6,6 +6,8 @@ use std::collections::VecDeque;
 pub struct Voice {
     pub capture: Option<u64>,
     pub call: bool,
+    pub packets:u64,
+    pub bytes:u64,
     speech: bool,
     announced: bool,
     pending: VecDeque<Message>,
@@ -35,10 +37,11 @@ impl Voice {
         self.call=false;self.speech=false;self.status();
     }
     pub fn pop(&mut self)->Option<Message>{self.pending.pop_front()}
-    pub fn pcm(&self,message:&Message)->Option<Vec<u8>>{
+    pub fn pcm(&mut self,message:&Message)->Option<Vec<u8>>{
         let generation=self.capture?;
         if message.channel!=Channel::Vr||message.id!=0x58001||message.payload.is_empty()
             ||message.payload.len()>16384||message.payload.len()%2!=0{return None;}
+        self.packets+=1;self.bytes+=message.payload.len()as u64;
         let mut body=Vec::with_capacity(message.payload.len()+20);
         body.extend([130,0,0,0]);body.extend((message.timestamp_ms.unwrap_or(0) as u64*1000).to_le_bytes());
         body.extend(generation.to_le_bytes());body.extend(&message.payload);

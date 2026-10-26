@@ -6,6 +6,7 @@
 | --- | --- |
 | [验证与版本](validation.md) | 最新构建、部署、桌面实测、历史里程碑及未完成项目 |
 | [完成情况核对](status-audit.md) | R2/R3 当前范围、尚需实现的功能与待验收项目 |
+| [双向通话与麦克风](calls.md) | 音频角色、USB 采集、CarPlay/HiCar 上行和验证入口 |
 | [运行与媒体协议](live-forwarding.md) | 启停、配置、本地接口、音视频和生命周期 |
 | [CarLife 与实车兼容性](carlife-compatibility.md) | 80% / 0% 失败、持久日志、握手修复、下一轮取证 |
 | [性能与源码参考](performance.md) | 30 fps、排队和音频修复、同类源码、动画故障对照 |
