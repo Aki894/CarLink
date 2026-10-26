@@ -11,6 +11,7 @@ import socket
 import struct
 import subprocess
 import threading
+import time
 
 from auth_wire import AuthError
 from nearby_wire import ProtocolError
@@ -191,5 +192,91 @@ class HiSightSession:
             self.closed = True
             try:
                 self.worker.call(dict(op='hisight-close', session=self.session))
+            except (ValueError, RuntimeError, OSError):
+                pass
+
+
+class ControlSpeaker:
+    def __init__(self, owner):
+        self.owner = owner
+        self.values = {}
+
+    @property
+    def ports(self):
+        value = self.values.get('ports')
+        return tuple(value) if value else None
+
+    @ports.setter
+    def ports(self, value):
+        self.owner.update(self.owner.command('dmsdp-ports', ports=list(value)))
+
+    def __getattr__(self, name):
+        if name in ('session_id', 'sequence', 'setup_sequence', 'format', 'ready'):
+            return self.values.get(name)
+        raise AttributeError(name)
+
+
+class ControlSession:
+    """DMSDP control state lives in the authenticated private Rust worker."""
+    def __init__(self, worker, generation, key, device_info, audio=False):
+        from cipher import Cipher
+        self.worker = worker
+        self.device_info = device_info
+        self.cipher = Cipher(key)  # Transitional media/clock adapter key only.
+        self.on_plaintext = None
+        self.pending = []
+        self.closed = False
+        self.speaker = ControlSpeaker(self) if audio else None
+        try:
+            ready = worker.call(dict(op='dmsdp-open', generation=generation,
+                device_info=device_info, audio=audio))
+            self.session = ready['session']
+            self.initial_record = bytes.fromhex(ready['initial'])
+            self.update(dict(ready, events=[], pending=[], plaintexts=[]))
+        except BaseException:
+            self.cipher.close()
+            raise
+
+    def command(self, op, **fields):
+        return self.worker.call(dict(op=op, session=self.session, **fields))
+
+    def update(self, result):
+        for name, value in result['state'].items():
+            if name == 'speaker':
+                if self.speaker is not None:
+                    self.speaker.values = value or {}
+            else:
+                setattr(self, name, tuple(value) if name == 'clock' and value else value)
+        self.pending.extend(bytes.fromhex(p) for p in result['pending'])
+        if self.on_plaintext:
+            for payload in result['plaintexts']:
+                self.on_plaintext(bytes.fromhex(payload))
+        return result['events']
+
+    def initial(self):
+        return self.initial_record
+
+    def receive(self, data):
+        return self.update(self.command('dmsdp-receive', data=data.hex(),
+            now_us=time.monotonic_ns() // 1000, capture=self.on_plaintext is not None))
+
+    def heartbeat(self):
+        result = self.command('dmsdp-heartbeat')
+        self.update(result)
+        return bytes.fromhex(result['heartbeat'])
+
+    def take_pending(self):
+        pending, self.pending = self.pending, []
+        return pending
+
+    def stop_audio(self):
+        self.update(self.command('dmsdp-stop-audio'))
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.cipher.close()
+            try:
+                self.command('dmsdp-close')
             except (ValueError, RuntimeError, OSError):
                 pass

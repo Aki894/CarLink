@@ -194,26 +194,31 @@ fn connect_output(path:&Path)->std::io::Result<UnixStream>{
     Ok(unsafe{UnixStream::from_raw_fd(fd)})
 }
 struct Worker {listener:UnixListener,output:PathBuf,view:Arc<Mutex<View>>,stop:Arc<AtomicBool>,events:SyncSender<Value>,rendered:RenderSlot,cached:Option<(u64,Vec<u8>)>,
-    source:Option<Pipe>,hu:Option<Pipe>,snapshot:View,source_active:bool,waiting_key:bool,retry:Instant,painted:Option<Instant>,presented:Option<View>,touch:Option<Value>,menu_touch:Option<(usize,f64,f64,bool)>,last_key:Option<Instant>,back_frames:Vec<Frame>,back_last:Option<Instant>,back_first:Option<Instant>}
+    source:Option<Pipe>,hu:Option<Pipe>,snapshot:View,source_active:bool,source_key:Option<Frame>,waiting_key:bool,retry:Instant,painted:Option<Instant>,presented:Option<View>,touch:Option<Value>,menu_touch:Option<(usize,f64,f64,bool)>,last_key:Option<Instant>,back_frames:Vec<Frame>,back_last:Option<Instant>,back_first:Option<Instant>}
 impl Worker {
     fn new(listener:UnixListener,output:PathBuf,view:Arc<Mutex<View>>,stop:Arc<AtomicBool>,events:SyncSender<Value>,rendered:RenderSlot)->Self{
-        Self{listener,output,view,stop,events,rendered,cached:None,source:None,hu:None,snapshot:View::default(),source_active:false,waiting_key:true,retry:Instant::now(),painted:None,presented:None,touch:None,menu_touch:None,last_key:None,back_frames:vec![],back_last:None,back_first:None}
+        Self{listener,output,view,stop,events,rendered,cached:None,source:None,hu:None,snapshot:View::default(),source_active:false,source_key:None,waiting_key:true,retry:Instant::now(),painted:None,presented:None,touch:None,menu_touch:None,last_key:None,back_frames:vec![],back_last:None,back_first:None}
     }
     fn output(&mut self,f:Frame){if self.hu.as_mut().is_some_and(|p|p.push(f).is_err()){self.hu=None;self.painted=None;self.presented=None;self.waiting_key=true;}}
     fn source(&mut self,f:Frame){if self.source.as_mut().is_some_and(|p|p.push(f).is_err()){self.lose_source();}}
-    fn lose_source(&mut self){self.back_frames.clear();self.back_last=None;self.back_first=None;let _=self.events.try_send(json!({"type":"source-state","active":false}));self.source=None;self.source_active=false;self.waiting_key=true;self.touch=None;self.last_key=None;self.stop_source_media();}
+    fn lose_source(&mut self){self.back_frames.clear();self.back_last=None;self.back_first=None;let _=self.events.try_send(json!({"type":"source-state","active":false}));self.source=None;self.source_active=false;self.source_key=None;self.waiting_key=true;self.touch=None;self.last_key=None;self.stop_source_media();}
     fn stop_source_media(&mut self){
         if let Some(h)=self.hu.as_mut(){h.discard_media();}self.painted=None;
         self.output(Frame::new(5,0,vec![0]));self.output(Frame::new(5,1,vec![0]));
         if !self.snapshot.visible{self.output(Frame::new(4,0,vec![]));}
     }
     fn request_key(&mut self){if self.last_key.is_none_or(|t|t.elapsed()>=Duration::from_millis(250)){self.last_key=Some(Instant::now());self.source(keyframe());}}
-    fn state(&mut self){self.output(configure());self.output(Frame::new(4,u8::from(self.snapshot.visible||self.source_active),vec![]));self.waiting_key=true;self.request_key();self.painted=None;}
+    fn replay_source_key(&mut self){
+        // Only reuse a frame if it is still the latest source picture. Any P
+        // frame invalidates this slot, so no missing prediction chain replays.
+        if self.source_active&&!self.snapshot.visible{if let Some(key)=&self.source_key{let frame=menu_frame(key.payload.clone());self.output(frame);self.waiting_key=false;}}
+    }
+    fn state(&mut self){self.output(configure());self.output(Frame::new(4,u8::from(self.snapshot.visible||self.source_active),vec![]));self.waiting_key=true;self.request_key();self.replay_source_key();self.painted=None;}
     fn incoming(&mut self,f:Frame){match f.kind {
         1=>{if !self.snapshot.visible {self.output(f);}},
-        4=>{self.source_active=f.flags==1;let _=self.events.try_send(json!({"type":"source-state","active":self.source_active}));self.waiting_key=true;if !self.source_active{self.stop_source_media();}else if !self.snapshot.visible {self.output(f);}},
-        6=>{self.waiting_key=true;if !self.snapshot.visible {self.output(f);}},
-        2=>{if !self.snapshot.visible && self.source_active {
+        4=>{self.source_active=f.flags==1;self.source_key=None;let _=self.events.try_send(json!({"type":"source-state","active":self.source_active}));self.waiting_key=true;if !self.source_active{self.stop_source_media();}else if !self.snapshot.visible {self.output(f);}},
+        6=>{self.waiting_key=true;self.source_key=None;if !self.snapshot.visible {self.output(f);}},
+        2=>{self.source_key=if self.source_active&&f.flags&1==1{Some(f.clone())}else{None};if !self.snapshot.visible && self.source_active {
             if self.waiting_key && f.flags&1==0{return;}
             if self.hu.as_ref().is_some_and(|h|h.video_backlog() || h.queued+f.payload.len()+16>MAX_QUEUE/2){
                 if let Some(h)=self.hu.as_mut(){h.discard_video();}self.output(Frame::new(6,0,vec![]));self.waiting_key=true;self.request_key();if f.flags&1==0{return;}
@@ -276,6 +281,7 @@ impl Worker {
             }
             self.output(Frame::new(6,0,vec![]));self.output(Frame::new(4,u8::from(self.snapshot.visible||self.source_active),vec![]));
             self.waiting_key=true;self.request_key();
+            self.replay_source_key();
         }
         self.painted=None;
     }

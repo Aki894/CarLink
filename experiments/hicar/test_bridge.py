@@ -7,10 +7,13 @@ from cipher import Cipher
 class Link:
     def __init__(self, path, feedback):
         self.frames, self.states = [], []
+        self.active = False
+        self.connected = True
+        self.wait_key = False
     def configure(self, *args): pass
-    def session(self, active): pass
+    def session(self, active): self.active = active
     def start(self): pass
-    def media(self, *args): self.frames.append(args)
+    def media(self, *args): self.frames.append(args); return True
     def audio_state(self, *args): self.states.append(args)
     def report(self): pass
     def close(self): pass
@@ -44,6 +47,23 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(frame[2], 0)
         b.video(96, 0, b'\0\0\1\x41P')
         self.assertEqual(b.link.frames[-1][3], 0)
+
+    async def test_stopped_video_cannot_reactivate_from_late_frames(self):
+        b = self.bridge
+        frame = b'\0\0\1\x67SPS\0\0\1\x68PPS\0\0\1\x65IDR'
+        b.video(96, 0, frame)
+        self.assertTrue(b.link.active)
+        self.assertEqual(b.epoch_video_frames, 1)
+        b.video_stop()
+        self.assertFalse(b.link.active)
+        self.assertEqual(b.epoch_video_frames, 0)
+        count = len(b.link.frames)
+        b.video(96, 0, frame)
+        self.assertEqual(len(b.link.frames), count)
+        b.video_start()
+        self.assertEqual(b.epoch_video_frames, 0)
+        b.video(96, 0, frame)
+        self.assertEqual(b.epoch_video_frames, 1)
 
     async def test_audio_generation_discards_late_decoder_output(self):
         b = self.bridge

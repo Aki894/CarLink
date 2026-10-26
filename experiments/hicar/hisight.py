@@ -212,10 +212,13 @@ async def receive(sock, key, capture_dir, log, sink=None, continuous=False,
     total = 0
     capture_limit = 1024 * 1024
     media_task = None
+    pending_read = None
     media_writer = None
     input_writer = None
     input_task = None
     try:
+        if sink:
+            sink.video_start()
         if capture_dir:
             root = Path(capture_dir) / ('hisight-' + str(time.time_ns()))
             raw = os.fdopen(os.open(str(root) + '.bin', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb')
@@ -229,7 +232,14 @@ async def receive(sock, key, capture_dir, log, sink=None, continuous=False,
         await loop.sock_sendall(sock, session.initial())
         log('hisight_announce_sent')
         while continuous or total < capture_limit:
-            data = await loop.sock_recv(sock, 4096 if continuous else min(4096, capture_limit - total))
+            pending_read = asyncio.create_task(loop.sock_recv(sock, 4096 if continuous else min(4096, capture_limit - total)))
+            watched = [pending_read] + [task for task in (media_task, input_task) if task is not None]
+            done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+            if pending_read not in done:
+                log('hisight_transport_ended')
+                break
+            data = pending_read.result()
+            pending_read = None
             if not data:
                 break
             total += len(data)
@@ -261,6 +271,11 @@ async def receive(sock, key, capture_dir, log, sink=None, continuous=False,
     except ProtocolError as error:
         log('hisight_parse_stopped', reason=str(error))
     finally:
+        if sink:
+            sink.video_stop()
+        if pending_read:
+            pending_read.cancel()
+            await asyncio.gather(pending_read, return_exceptions=True)
         await graceful_close(sock, session, log)
         if input_task:
             input_task.cancel()

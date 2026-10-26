@@ -145,6 +145,7 @@ pub fn differential(v:&Value)->Result<Value>{
         let mut channels:BTreeMap<u32,Negotiator>=BTreeMap::new();let mut next=0u32;
         let mut business=Business{native:None,generation:0};let mut auth_open=false;let mut peer_seen=false;
         let mut sight:Option<(u32,super::super::hisight::Session)>=None;let mut next_sight=0u32;
+        let mut control:Option<(u32,super::super::dmsdp::Session)>=None;let mut next_control=0u32;
         send(&mut socket,&value!({"ok":true,"ready":true,"wire_identity_sha256":hex(&crypto.sha256(own.as_bytes())?)}))?;
         while let Some(command)=read(&mut socket)?{
             let op=text(&command,"op")?;let result:Result<Value>=(||{match op {
@@ -156,7 +157,7 @@ pub fn differential(v:&Value)->Result<Value>{
                         "pending":resource.pending().iter().map(|(k,v)|value!([k,hex(v)])).collect::<Vec<_>>(),"credentials_sent":resource.credentials_sent}))},
                 "close-channel"=>{channels.remove(&number(&command,"channel")?);Ok(value!({}))},
                 "auth-open"=>{if auth_open{return Err("business authentication already active".into());}
-                    business.generation=business.generation.checked_add(1).ok_or("auth generation exhausted")?;sight=None;business.close(&mut resource);peer_seen=false;auth_open=true;
+                    business.generation=business.generation.checked_add(1).ok_or("auth generation exhausted")?;sight=None;control=None;business.close(&mut resource);peer_seen=false;auth_open=true;
                     Ok(value!({"generation":business.generation}))},
                 "auth"=>{
                     if !auth_open||number(&command,"generation")?!=business.generation{return Err("stale authentication session".into());}
@@ -192,6 +193,28 @@ pub fn differential(v:&Value)->Result<Value>{
                     next_sight=next_sight.checked_add(1).ok_or("HiSight generation exhausted")?;
                     let initial=session.initial()?;sight=Some((next_sight,session));Ok(value!({"session":next_sight,"initial":hex(&initial)}))
                 },
+                "dmsdp-open"=>{
+                    if !auth_open||!resource.authenticated||number(&command,"generation")?!=business.generation{return Err("unauthenticated or stale DMSDP session".into());}
+                    if control.is_some(){return Err("DMSDP session already active".into());}
+                    let mut key=business.native.as_ref().and_then(|s|s.key_for_bridge()).ok_or("missing authenticated control key")?;
+                    let session=super::super::dmsdp::Session::new(&key,command["device_info"].clone(),command["audio"]==true);wipe(&mut key);let session=session?;
+                    next_control=next_control.checked_add(1).ok_or("DMSDP generation exhausted")?;
+                    let initial=session.initial()?;let state=session.state();control=Some((next_control,session));
+                    Ok(value!({"session":next_control,"initial":hex(&initial),"state":state}))
+                },
+                "dmsdp-receive"|"dmsdp-heartbeat"|"dmsdp-ports"|"dmsdp-stop-audio"|"dmsdp-close"=>{
+                    let token=number(&command,"session")?;
+                    let (_,session)=control.as_mut().filter(|(n,_)|*n==token).ok_or("stale DMSDP session")?;
+                    if op=="dmsdp-close"{control=None;return Ok(value!({}));}
+                    let (events,plaintexts)=if op=="dmsdp-receive"{session.receive(&unhex(text(&command,"data")?)?,command["now_us"].as_u64().ok_or("missing monotonic timestamp")?,command["capture"]==true)?}else{(vec![],vec![])};
+                    let heartbeat=if op=="dmsdp-heartbeat"{Some(session.heartbeat()?)}else{None};
+                    if op=="dmsdp-stop-audio"{session.stop_audio()?;}
+                    if op=="dmsdp-ports"{let ports=command["ports"].as_array().filter(|v|v.len()==2).ok_or("invalid speaker ports")?;
+                        let port=ports[0].as_u64().and_then(|v|u16::try_from(v).ok()).ok_or("invalid speaker RTP port")?;
+                        let rtcp=ports[1].as_i64().and_then(|v|i32::try_from(v).ok()).ok_or("invalid speaker RTCP mode")?;session.set_audio_ports((port,rtcp))?;
+                    }
+                    Ok(value!({"events":events,"plaintexts":plaintexts.iter().map(|v|hex(v)).collect::<Vec<_>>(),"pending":session.pending().iter().map(|v|hex(v)).collect::<Vec<_>>(),"heartbeat":heartbeat.map(|v|hex(&v)),"state":session.state()}))
+                },
                 "hisight-receive"|"hisight-play"|"hisight-teardown"|"hisight-close"=>{
                     let token=number(&command,"session")?;
                     let (_,session)=sight.as_mut().filter(|(n,_)|*n==token).ok_or("stale HiSight session")?;
@@ -205,8 +228,9 @@ pub fn differential(v:&Value)->Result<Value>{
             }})();
             match result{Ok(mut v)=>{v["ok"]=true.into();send(&mut socket,&v)?;if op=="close"{break;}},Err(error)=>{
                 // Protocol errors revoke authorization before any later network command.
-                if op=="auth"&&auth_open&&command["generation"].as_u64()==Some(business.generation as u64){sight=None;business.close(&mut resource);auth_open=false;peer_seen=false;}
+                if op=="auth"&&auth_open&&command["generation"].as_u64()==Some(business.generation as u64){sight=None;control=None;business.close(&mut resource);auth_open=false;peer_seen=false;}
                 if op.starts_with("hisight-")&&sight.as_ref().is_some_and(|(n,_)|command["session"].as_u64()==Some(*n as u64)){sight=None;}
+                if op.starts_with("dmsdp-")&&control.as_ref().is_some_and(|(n,_)|command["session"].as_u64()==Some(*n as u64)){control=None;sight=None;}
                 send(&mut socket,&value!({"ok":false,"error":error}))?;
             }}
         }

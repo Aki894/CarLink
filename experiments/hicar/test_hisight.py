@@ -2,6 +2,7 @@ import json
 import asyncio
 import socket
 import unittest
+from unittest import mock
 from cipher import Cipher
 from control_wire import Decoder, Messages, Session as ControlSession, pack_frame
 from hisight import Session, message, graceful_close
@@ -134,6 +135,44 @@ class HiSightTests(unittest.TestCase):
 
 
 class HiSightCloseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_media_eof_stops_projection_while_rtsp_peer_stays_open(self):
+        import hisight
+        events = []
+        async def close_media(reader, writer):
+            writer.close()
+            await writer.wait_closed()
+        media_server = await asyncio.start_server(close_media, '127.0.0.1', 0)
+        media_port = media_server.sockets[0].getsockname()[1]
+        class State:
+            media_endpoint = media_port
+            input_endpoint = None
+            peer_teardown = teardown_acknowledged = False
+            def __init__(self, key): self.pending = []
+            def initial(self): return b'hello'
+            def receive(self, data): return [], []
+            def request(self, *args): pass
+            def teardown(self): return None
+            def close(self): pass
+        class Sink:
+            def video_start(self): events.append('video_start')
+            def video_stop(self): events.append('video_stop')
+        listener = socket.socket();listener.bind(('127.0.0.1', 0));listener.listen(1);listener.setblocking(False)
+        client = socket.socket();client.setblocking(False)
+        loop = asyncio.get_running_loop()
+        await loop.sock_connect(client, listener.getsockname())
+        receiver, _ = await loop.sock_accept(listener);receiver.setblocking(False)
+        try:
+            with mock.patch.object(hisight, 'Session', State):
+                task = asyncio.create_task(hisight.receive(receiver, bytes(16), None,
+                    lambda event, **fields: events.append(event), Sink(), continuous=True))
+                await loop.sock_sendall(client, b'activate')
+                await asyncio.wait_for(task, 2)
+            self.assertIn('hisight_transport_ended', events)
+            self.assertIn('video_stop', events)
+            self.assertIn('hisight_closed', events)
+        finally:
+            client.close();receiver.close();listener.close();media_server.close();await media_server.wait_closed()
+
     async def test_revoked_rust_worker_does_not_interrupt_cleanup(self):
         class Revoked:
             def teardown(self):

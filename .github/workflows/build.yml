@@ -44,7 +44,7 @@ jobs:
       - name: Install ARM hard-float compiler and pinned Rust
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabihf qemu-user ffmpeg
+          sudo apt-get install -y gcc-arm-linux-gnueabihf qemu-user ffmpeg dbus-daemon libdbus-1-3
           rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET"
       - name: Reuse pinned Rust dependencies and cross build objects
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -69,6 +69,8 @@ jobs:
           python3 scripts/test-hicar-rust.py app/target/debug/carlink
           python3 scripts/test-hicar-rust-session.py app/target/debug/carlink
           python3 scripts/test-hicar-rust-hisight.py app/target/debug/carlink
+          python3 scripts/test-hicar-rust-dmsdp.py app/target/debug/carlink
+          python3 scripts/test-hicar-rust-live.py app/target/debug/carlink
           python3 scripts/test-manager.py app/target/debug/carlink
           python3 scripts/test-manager-web.py app/target/debug/carlink
           python3 -c 'import json; d=json.load(open("/tmp/carlink-doctor.json")); assert d["schema_version"] == 1; assert d["aoa"]["status"] == "not_tested"'
@@ -86,6 +88,7 @@ jobs:
       - name: Build pinned ARMv7 CarPlay receiver and output process
         run: |
           bash scripts/build-carplay.sh
+          PYTHONPATH=dist/carplay/hicar/python python3 scripts/test-hicar-rust-radio.py app/target/debug/carlink
           python3 scripts/test-live-bridge.py app/target/debug/carlink dist/carplay/bin/carlink-audio
       - uses: actions/upload-artifact@v4
         with:

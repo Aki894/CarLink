@@ -32,6 +32,15 @@ ROOT = '/org/carlink/hicar_probe'
 LIMIT = 1024 * 1024
 
 
+def control_session(key, device_info, audio=False, rust_worker=None):
+    if rust_worker:
+        from rust_session import ControlSession as RustControlSession
+        session = RustControlSession(rust_worker, rust_worker.auth_generation, key, device_info, audio)
+        log('rust_dmsdp_ready')
+        return session
+    return ControlSession(key, device_info, audio=audio)
+
+
 def mgmt_command(index, opcode, payload=b''):
     # Linux Bluetooth management control channel, independent of BlueZ's D-Bus.
     with socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, socket.BTPROTO_HCI) as ctl:
@@ -165,7 +174,17 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
             await asyncio.wait_for(loop.sock_sendall(sock, control.initial()), 2)
             log('control_options_sent', session=session, crypto_ability=222)
         while continuous or total < limit:
-            data = await loop.sock_recv(sock, 4096 if continuous else min(4096, limit - total))
+            if media_task and media_task.done():
+                break
+            try:
+                receive_size = 4096 if continuous else min(4096, limit - total)
+                if control and control.negotiated:
+                    data = await asyncio.wait_for(loop.sock_recv(sock, receive_size), 8)
+                else:
+                    data = await loop.sock_recv(sock, receive_size)
+            except asyncio.TimeoutError:
+                log('control_peer_timeout', session=session)
+                break
             if not data:
                 break
             total += len(data)
@@ -194,7 +213,7 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                                 while True:
                                     await send_control([control.heartbeat()])
                                     await asyncio.sleep(1)
-                            except (OSError, asyncio.TimeoutError) as error:
+                            except (OSError, ProtocolError, RuntimeError, asyncio.TimeoutError) as error:
                                 log('control_heartbeat_stopped', error=type(error).__name__)
                                 try:
                                     sock.shutdown(socket.SHUT_RDWR)
@@ -221,6 +240,8 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
                             except (OSError, ProtocolError, RuntimeError, asyncio.TimeoutError) as error:
                                 log('hisight_error', error=type(error).__name__)
                             finally:
+                                if sink:
+                                    sink.video_stop()
                                 media.close()
                         media_task = asyncio.create_task(observe_media())
                 except ProtocolError as error:
@@ -282,11 +303,11 @@ async def observe(sock, session, capture_dir=None, limit=LIMIT, negotiator=None,
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
         if control and control.speaker:
-            control.stop_audio()
             try:
+                control.stop_audio()
                 await asyncio.wait_for(send_control(control.take_pending()), 1)
                 log('audio_teardown_sent')
-            except (OSError, asyncio.TimeoutError):
+            except (OSError, ProtocolError, RuntimeError, asyncio.TimeoutError):
                 log('audio_teardown_stopped')
         if media_task:
             media_task.cancel()
@@ -687,14 +708,14 @@ async def run(args):
                     task = asyncio.create_task(observe(client, session, args.capture_dir,
                                                        negotiator=negotiator, decode_control=decode_control,
                                                        dmsdp=DmsdpNegotiation(dmsdp_port) if dmsdp_port else None,
-                                                       control=ControlSession(profile.resource.session_key,
+                                                       control=control_session(profile.resource.session_key,
                                                            dict(deviceId=business_profile.auth_identity.device_id,
                                                                 deviceName=business_profile.auth_identity.name,
                                                                 deviceType=4, bluetoothMac=own_bluetooth_address,
                                                                 btName='CarLink', localIp=args.network_offer.owner_ip,
                                                                 remoteIp=args.network_offer.client_ip, port=0,
                                                                 properties={'2003': args.model, '5004': True,
-                                                                            '5014': False}), audio=args.audio)
+                                                                            '5014': False}), audio=args.audio, rust_worker=rust_worker)
                                                        if control else None,
                                                        live_socket=args.live_socket,
                                                        audio_binary=args.audio_binary,

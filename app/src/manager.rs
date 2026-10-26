@@ -78,7 +78,7 @@ fn save(path:&Path,store:&Store)->Result<()>{
 struct Status{schema:u32,generation:u64,protocol:Option<Protocol>,target:Option<Device>,active:bool,pairing:bool,paused:bool,
     carlife_pid:Option<u32>,backend_pid:Option<u32>,usb_connected:bool,menu_visible:bool,last_error:Option<String>,last_stage:Option<String>}
 fn event(name:&str){println!("{}",json!({"event":name}));}
-fn diagnostic_stage(name:&str)->bool{matches!(name,"ready"|"controller_setting"|"rfcomm_connected"|"rust_connection_worker_ready"|"rust_hisight_ready"|"tcp_connected"|"hisight_connected"|"auth_parse_stopped"|"control_parse_stopped"|"parse_stopped"|"stream_error"|"tcp_stream_error"|"hisight_error"|"stopped")}
+fn diagnostic_stage(name:&str)->bool{matches!(name,"ready"|"controller_setting"|"rfcomm_connected"|"rust_connection_worker_ready"|"rust_hisight_ready"|"rust_dmsdp_ready"|"rust_media_ready"|"rust_radio_ready"|"tcp_connected"|"hisight_connected"|"auth_parse_stopped"|"control_parse_stopped"|"control_peer_timeout"|"hisight_parse_stopped"|"parse_stopped"|"stream_error"|"tcp_stream_error"|"hisight_error"|"stopped")}
 fn stage_summary(v:&Value)->Option<Value>{
     let stage=v["event"].as_str().filter(|s|diagnostic_stage(s))?;
     // Reconstruct, never forward the source object or its dynamic fields.
@@ -216,11 +216,11 @@ impl Owner{
         if !success{return Err("Bluetooth control failed".into());}Ok(())
     }
     fn show_recovery_menu(&mut self){let explicit=self.status.menu_visible&&!self.menu_idle;self.status.menu_visible=true;self.menu_idle=!explicit;self.menu_pending=None;self.menu_focus=0;if let Some(mux)=&self.mux{let (rows,_)=self.menu_model();let _=mux.set_menu(rows,0,true);}}
-    fn source_lost(&mut self){self.status.active=false;self.ready=None;self.seen_media=false;self.show_recovery_menu();self.started=Instant::now()-Duration::from_secs(self.config.connect_seconds.saturating_sub(8));}
+    fn source_lost(&mut self){self.wireless_ready=false;self.status.active=false;self.ready=None;self.seen_media=false;self.show_recovery_menu();self.started=Instant::now()-Duration::from_secs(self.config.connect_seconds.saturating_sub(8));}
     fn mark_active(&mut self)->Result<()>{
         if self.wireless_ready&&(self.mux.is_none()||self.source_ready){
             if !self.status.active {
-                self.ready=Some(Instant::now());self.status.active=true;
+                self.ready=Some(Instant::now());self.status.active=true;self.status.last_error=None;
                 if let Some(d)=self.status.target.as_ref().filter(|d|self.store.devices.iter().any(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address))){
                     self.store.preferred=Some(d.clone());save(&self.config.state,&self.store)?;
                 }
@@ -233,7 +233,10 @@ impl Owner{
         if name=="manager_backend_stage"{
             if let Some(report)=stage_report(generation,self.status.generation,&v){
                 let stage=report["stage"].as_str().unwrap();self.status.last_stage=Some(stage.into());
-                if matches!(stage,"auth_parse_stopped"|"control_parse_stopped"|"parse_stopped"|"stream_error"|"tcp_stream_error"|"hisight_error"){self.status.last_error=Some(stage.into());}
+                // A normal RFCOMM authentication handoff can end its stream.
+                // Projection health is determined by control/media lifecycle.
+                if matches!(stage,"auth_parse_stopped"|"control_parse_stopped"|"control_peer_timeout"|"hisight_parse_stopped"|"parse_stopped"|"tcp_stream_error"|"hisight_error"){self.status.last_error=Some(stage.into());}
+                if matches!(stage,"control_parse_stopped"|"control_peer_timeout"|"hisight_parse_stopped"|"hisight_error"){self.source_lost();}
                 println!("{report}");
             }return Ok(());
         }
@@ -253,10 +256,11 @@ impl Owner{
         }
         let ready=match self.status.protocol{
             Some(Protocol::Carplay)=>name=="stage"&&v["stage"]=="WirelessActive",
-            Some(Protocol::Hicar)=>name=="bridge_stats"&&v["active"]==true&&v["video_frames"].as_u64().unwrap_or(0)>0,
+            Some(Protocol::Hicar)=>name=="bridge_stats"&&v["active"]==true&&v.get("epoch_video_frames").unwrap_or(&v["video_frames"]).as_u64().unwrap_or(0)>0,
             None=>false,
         };
         if ready {self.wireless_ready=true;self.mark_active()?;}
+        if self.status.protocol==Some(Protocol::Hicar)&&name=="bridge_stats"&&v["active"]==false&&self.status.active{self.source_lost();}
         if name=="forward_latency"&&v["sent"].as_u64().unwrap_or(0)>0||name=="bridge_stats"&&v["connected"]==true&&v["video_frames"].as_u64().unwrap_or(0)>0{self.seen_media=true;}
         if name=="stage"&&v["stage"]=="ConnectingBluetooth"{
             if let Some(address)=v["address"].as_str().filter(|s|mac(s)){
@@ -569,6 +573,17 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
             let delay=owner.life_retry_at.duration_since(before).as_millis();assert!(delay>=expected&&delay<=expected+50);assert_eq!(owner.retry_at,wireless);}
         owner.life_started=Instant::now()-Duration::from_secs(31);let before=Instant::now();owner.defer_carlife();
         assert_eq!(owner.life_failures,0);assert!(owner.life_retry_at.duration_since(before)<Duration::from_millis(550));fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn inactive_hicar_and_previous_epoch_cannot_hide_recovery_menu(){
+        let root=test_root("hicar-disconnect");let mut owner=test_owner(&root);owner.status.protocol=Some(Protocol::Hicar);
+        owner.wireless_ready=true;owner.status.active=true;owner.status.menu_visible=false;
+        owner.ingest(0,json!({"event":"bridge_stats","active":false,"video_frames":90,"epoch_video_frames":0})).unwrap();
+        assert!(!owner.status.active&&!owner.wireless_ready&&owner.status.menu_visible);
+        owner.ingest(0,json!({"event":"bridge_stats","active":true,"video_frames":90,"epoch_video_frames":0})).unwrap();
+        assert!(!owner.status.active&&owner.status.menu_visible);
+        owner.mark_active().unwrap();assert!(!owner.status.active);
+        owner.ingest(0,json!({"event":"bridge_stats","active":true,"video_frames":91,"epoch_video_frames":1})).unwrap();assert!(owner.status.active);
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]fn ordinary_offline_does_not_erase_pairing(){for s in ["Host is down","Connection timed out","No route to host","AirPlay session ended"]{assert!(!auth_mismatch(s));}assert!(auth_mismatch("org.bluez.Error.AuthenticationFailed"));}
     #[test]fn stale_generation_cannot_steal_active_backend(){

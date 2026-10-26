@@ -6,6 +6,10 @@ pub mod crypto;
 pub mod identity;
 pub mod session;
 pub mod hisight;
+pub mod dmsdp;
+pub mod live;
+pub mod radio;
+pub mod backend;
 #[cfg(unix)]
 pub mod native;
 mod cli;

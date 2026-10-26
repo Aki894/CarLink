@@ -18,6 +18,8 @@ fn codec(v:&Value)->Result<Value>{
         "uint"=>Ok(value!({"hex":hex(&super::wire::uint(bounded_u32(v,"value")?)?)})),
         "nearby-session"=>super::session::differential(v),
         "hisight-session"=>super::hisight::differential(v),
+        "dmsdp-session"=>super::dmsdp::differential(v),
+        "radio-contract"=>super::radio::differential(v),
         "crc"=>Ok(value!({"crc":super::wire::crc16(&bytes(v,"data")?)})),
         "tlv"=>Ok(value!({"hex":hex(&super::wire::tlv(bounded_u32(v,"tag")?,&bytes(v,"data")?)?)})),
         "tlvs"=>Ok(value!({"values":super::wire::tlvs(&bytes(v,"data")?)?.iter().map(|(t,p)|value!([t,hex(p)])).collect::<Vec<_>>()})),
@@ -67,6 +69,9 @@ fn send(v:&Value)->Result<()>{let mut out=io::stdout().lock();serde_json::to_wri
 pub fn run(args:&[String])->Result<()>{
     let mut input=io::stdin().lock();
     match args.first().map(String::as_str){
+        Some("run")=>super::backend::run(&args[1..]),
+        Some("media-worker") if args.len()==2=>super::live::run(args[1].parse().map_err(|_|"invalid private socket fd")?),
+        Some("radio-worker") if args.len()==2=>super::radio::run(args[1].parse().map_err(|_|"invalid private socket fd")?),
         Some("codec") if args.len()==1=>{while let Some(v)=line(&mut input)?{send(&match codec(&v){Ok(v)=>value!({"ok":true,"result":v}),Err(e)=>value!({"ok":false,"error":e})})?;}Ok(())},
         #[cfg(unix)]
         Some("auth-worker") if args.len()==1=>auth_worker(&mut input),

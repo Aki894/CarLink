@@ -42,6 +42,8 @@ class Bridge:
         self.audio_epoch = 0
         self.parameters = {}
         self.video_frames = self.audio_frames = self.input_events = 0
+        self.video_running = True
+        self.epoch_video_frames = 0
         self.key_frames = 0
         self.pcm_blocks = self.pcm_nonzero = 0
         self.last_report = time.monotonic()
@@ -71,7 +73,7 @@ class Bridge:
             self.log('bridge_input_overflow')
 
     def video(self, kind, timestamp, data):
-        if self.closed or kind != 96:
+        if self.closed or not self.video_running or kind != 96:
             return
         if len(data) > TRANSPORT.MAX_VIDEO - 1024:
             self.link.recover_video()
@@ -90,9 +92,27 @@ class Bridge:
         # Video RTP timestamps use the peer clock. Until cross-stream video
         # clock mapping is verified, stamp local arrival instead of mixing
         # unrelated peer and PCM timelines in the CarLife output.
-        self.link.media(2, data, time.monotonic_ns() // 1000, int(key))
+        accepted = self.link.media(2, data, time.monotonic_ns() // 1000, int(key))
         self.video_frames += 1
-        self.report()
+        self.epoch_video_frames += int(bool(accepted))
+        self.report(force=bool(accepted) and self.epoch_video_frames == 1)
+
+    def video_start(self):
+        if self.closed:
+            return
+        self.video_running = True
+        self.epoch_video_frames = 0
+        self.parameters.clear()
+        self.link.session(True)
+
+    def video_stop(self):
+        if self.closed or not self.video_running:
+            return
+        self.video_running = False
+        self.epoch_video_frames = 0
+        self.parameters.clear()
+        self.link.session(False)
+        self.report(force=True)
 
     def audio_stop(self):
         self.audio_epoch += 1
@@ -129,14 +149,15 @@ class Bridge:
         self.audio_frames += 1
         self.report()
 
-    def report(self):
-        if time.monotonic() - self.last_report >= 5:
+    def report(self, force=False):
+        if force or time.monotonic() - self.last_report >= 5:
             self.link.report()
             self.log('bridge_stats', video_frames=self.video_frames,
                      audio_frames=self.audio_frames, input_events=self.input_events,
                      key_frames=self.key_frames, parameters=sorted(self.parameters),
                      pcm_blocks=self.pcm_blocks, pcm_nonzero=self.pcm_nonzero,
                      active=self.link.active, connected=self.link.connected,
+                     epoch_video_frames=self.epoch_video_frames,
                      waiting_key=self.link.wait_key)
             self.last_report = time.monotonic()
 
@@ -198,6 +219,7 @@ class Bridge:
 
     def close(self):
         if not self.closed:
+            self.video_stop()
             self.closed = True
             self.audio_stop()
             self.link.session(False)
