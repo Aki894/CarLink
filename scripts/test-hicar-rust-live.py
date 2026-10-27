@@ -252,7 +252,7 @@ while True:
             mixed = until_frame(live, 3, lambda f: f[3][:4] == bytes([2,0,4,0]))
             assert len(mixed[3]) == 3528
             assert rpc(ipc, dict(op='status'))['state']['audio_streams'] == 2
-            assert status['input_events'] == 6
+            assert status['input_events'] == 7
             assert status['epoch_video_frames'] == 3
             # A route can restart sequence zero on the same SSRC. Its fresh
             # session must not wait for the old route's sequence to catch up.
