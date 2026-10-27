@@ -1,5 +1,20 @@
 # 验证与部署记录
 
+## 2026-10-27：双向通话与 USB 恢复
+
+运行提交 `cac132a0644ecd017adc9f090015d7d6a930b082`，台架目录 `/opt/carlink/releases/calls-cac132a0644e`。应用由 [Actions 40379459149](https://github.com/Aki894/CarLink/actions/runs/40379459149) 编译，GitHub artifact digest、内部 SHA256SUMS、ARM ABI 与部署文件哈希均已核对；管理器、CarLife、CarPlay 和 HiCar 音频工具路径使用同一发布目录。
+
+- 自动回归：132 个主程序单测、14 个镜像安装测试通过；包含真实 UnixStream 的双向音频、USB 控制命令分类、视频 RESET/PAUSE、连接恢复和旧会话隔离。
+- ARM 编解码：固定 Opus 1.5.2 库在 QEMU 下通过 48 kHz、20 ms 单双声道编解码；AAC 麦克风编码、加密 HiCar RTP 与独立 SSRC 混音均有回归。
+- 实机通话：用户确认 iPhone 经 CarLink 和华为 CarLife 测试端的双向声音正常，通话期间画面未断开。CarLife 进程与 USB 会话保持不变，麦克风持续采集约 32 kB/s。
+- HiCar 已加入 mic1 / modemMic / modemSpeaker、服务拥有权及停止恢复；同一台华为兼任 HiCar 手机和测试 HU，独立 HU 通话与实车声学效果继续作为外部验收项目。
+
+用户进一步确认“音乐 → 通话 → 挂断 → 音乐”正常且稳定。
+
+完整固件 [Actions 40380718657](https://github.com/Aki894/CarLink/actions/runs/40380718657) 的原生认证、ARM 互通及 firmware job 全部成功，镜像结构、运行文件与源码校验通过，产物上传完成。下载后再次核对 GitHub artifact digest 和镜像 SHA256SUMS：镜像 `CarLink-refresh-39459953269-cac132a0.img.xz` 的 SHA256 为 `0bff0aa962dd7d7cfbd5f4debf9318182272ff7aafb0799351381517ac01a933`。
+
+实现细节见[双向通话与麦克风](calls.md)；HelloCar 对应模块同步保留在本地，未提交和上传。
+
 ## 2026-10-26：Rust HiCar 完整后端与固定 PIN 台架交付
 
 交付提交 `a47a9f0cdf307ff1f17518e8c90049821fee528d`，部署目录 `/opt/carlink/releases/r2-a47a9f0`；通过 SSH 更新运行程序并保留回滚目录，MFi/HiCar 身份文件校验保持一致。生产 HiCar 使用 `carlink hicar run`，由 Rust 管理无线、认证、DMSDP/RTSP、媒体和输入，Python 保留作参考与测试。
@@ -120,3 +135,10 @@ R1 的 73 项 Rust 单测、1,700 项差分、混合认证和已有身份只读�
 4. 内存压力、SD 稳定性和独立供电条件。
 
 本地证据集中在 `.build/evidence/`、`.build/car-investigation/`、`.build/apk-analysis/`、`.build/transition/`；私有身份和配对留在 `.build/private/`，不进入公开仓库。
+
+
+## 2026-10-27 连接与混合音频稳定性回归
+
+用户确认独立车机端的 HiCar 音乐卡顿已经消失。继续处理的实测问题包括通话麦克风无声、混合导航/音乐/通话后的积压与静音、HiCar 闪回菜单及协议抢连。
+
+代码修复覆盖本地 IPC 压力隔离、完整帧边界、角色/服务/源代次、已配对 HiCar 主动 Nearby 回连、三行菜单、默认协议与协议粘性。新增单测包含退役源迟到事件、视频暂停与真正会话退出的区别，以及相同 SSRC 的新服务序号归零。首轮 Actions Rust 检查 148 项通过；协议参考事件字段的严格差分已同步，后续完整流水线与台架结果继续记录于本节。

@@ -2,6 +2,14 @@
 
 CarLink 使用一个 Rust 管理器保持 CarLife USB 常驻，并独占调度一个 CarPlay 或 HiCar 无线后端。切换手机时保留 USB 会话；已连接手机不会被后来上车的另一部手机抢占。R3 的菜单、网页、未知 HiCar 添加与策略代码已实现，完整构建及既有台架回归已完成；真实触控板和多手机场景继续验收。
 
+## 三行菜单与连接生命周期
+
+屏幕菜单依次显示当前协议（点击切换另一协议）、连接/断开设备、默认协议。未连接时保持当前协议等待；手动断开后暂停回连，点击连接设备重新启用并开放配对。HiCar 配对行显示本机固定 PIN。三连返回键打开菜单，普通返回送给手机；菜单内返回恢复投屏。
+
+HiCar 已配对手机的主动回连使用 FE35 Nearby 控制、CCMP business 19 协商及动态 RFCOMM 认证通道。CarPlay 与 HiCar 接收端独占无线资源；切换先终止旧源、退休本地连接并隔离旧事件，再启动新源。CarLife USB 常驻。
+
+管理接口新增：`switch_protocol`（可附 `protocol`）、`connect_device`、`default_protocol`（`mode=last/carplay/hicar`）。详细状态与设计见 [connection-management.md](connection-management.md)。
+
 ## 使用入口
 
 - 开机等待连接时显示 CarLink 设备菜单；通过触摸或 Lexus 焦点方向、确认、返回操作。真实 Remote Touch 的原车快捷键仍待实车确定。

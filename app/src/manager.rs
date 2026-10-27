@@ -413,7 +413,11 @@ impl Owner{
             if self.status.protocol==Some(Protocol::Carplay){
                 self.source_ready=v["active"]==true;
                 if !self.source_ready&&(self.status.active||self.wireless_ready){self.source_lost();}
-                else if self.source_ready{self.mark_active()?;}
+                else if self.source_ready{
+                    // This producer flag comes directly from OXP session ACTIVE,
+                    // including an IPC-only reconnect of an existing session.
+                    self.wireless_ready=true;self.mark_active()?;
+                }
             }
             return Ok(());
         }
@@ -762,11 +766,22 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         owner.status.protocol=Some(Protocol::Carplay);owner.wireless_ready=true;owner.source_ready=true;owner.status.active=true;owner.status.menu_visible=false;
         owner.menu_input(json!({"type":"presentation-state","active":false})).unwrap();
         assert!(!owner.status.active);assert!(owner.status.menu_visible);assert!(!owner.source_ready);assert!(!owner.wireless_ready);
-        owner.menu_input(json!({"type":"presentation-state","active":true})).unwrap();assert!(!owner.status.active);
+        owner.menu_input(json!({"type":"presentation-state","active":true})).unwrap();assert!(owner.status.active);
         owner.ingest(0,json!({"event":"stage","stage":"WirelessActive"})).unwrap();assert!(owner.status.active);
         owner.status.protocol=Some(Protocol::Hicar);owner.status.menu_visible=false;
         owner.menu_input(json!({"type":"presentation-state","active":false})).unwrap();
         assert!(owner.status.active);assert!(!owner.status.menu_visible);assert!(owner.source_ready);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn active_carplay_phase_restores_local_ipc_without_wireless_reconnect(){
+        let root=test_root("carplay-ipc-recovery");let mut owner=test_owner(&root);
+        owner.status.protocol=Some(Protocol::Carplay);owner.status.active=true;owner.status.menu_visible=false;owner.wireless_ready=true;owner.source_ready=true;
+        owner.source_floor=7;owner.bound_source_id=7;
+        owner.menu_input(json!({"type":"source-state","source_id":7,"active":false})).unwrap();
+        assert!(!owner.status.active);assert!(!owner.wireless_ready);assert!(owner.status.menu_visible);
+        owner.menu_input(json!({"type":"presentation-state","source_id":8,"active":true})).unwrap();
+        assert!(owner.status.active);assert!(owner.wireless_ready);assert!(owner.source_ready);assert!(owner.recovery_deadline.is_none());
+        owner.menu_input(json!({"type":"presentation-state","source_id":7,"active":false})).unwrap();assert!(owner.status.active);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]fn stale_mux_source_and_call_events_cannot_override_new_protocol_session(){
