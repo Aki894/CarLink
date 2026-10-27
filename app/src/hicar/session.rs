@@ -281,6 +281,11 @@ pub fn differential(v:&Value)->Result<Value>{
         let reply=server.respond(&frame(2,pending[0].1.clone()),&mut sr).unwrap().unwrap();
         client.respond(&frame(2,reply),&mut cr).unwrap();assert_eq!(client.endpoint(),Some(24));assert!(client.pending().is_empty());assert_eq!(client.endpoint(),None);
     }
+    #[test]fn simultaneous_phone_business_request_preserves_passive_connection(){
+        let mut n=Negotiator::new(vec![b'A';64],Some(24)).unwrap();let mut r=Resource::new(offer());n.start().unwrap();n.seen=7;
+        let mut request=wire::uint(2).unwrap();request.extend(wire::uint(19).unwrap());request.extend(wire::uint(0).unwrap());request.extend(wire::uint(0).unwrap());
+        let reply=n.respond(&Frame{kind:2,flags:0,options:vec![],payload:wire::tlv(3,&request).unwrap()},&mut r).unwrap();assert!(reply.is_some());assert!(!n.initiator);assert!(n.pending().is_empty());assert_eq!(n.endpoint(),None);
+    }
     #[test]fn outgoing_nearby_rejects_unencrypted_mismatch_and_invalid_business_channel(){
         let mut client=Negotiator::new(vec![b'A';64],None).unwrap();let mut r=Resource::new(offer());client.start().unwrap();
         let mut response=wire::tlv(2,&[2]).unwrap();response.extend(wire::tlv(4,b"real peer summary").unwrap());response.extend(wire::tlv(6,&[1]).unwrap());

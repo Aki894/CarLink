@@ -137,7 +137,7 @@ impl Drop for PairPin{fn drop(&mut self){unsafe{crate::hicar::crypto::wipe(self.
 struct Owner{config:Config,store:Store,status:Status,life:Option<Process>,backend:Option<Process>,choice:Option<Choice>,
     life_started:Instant,life_retry_at:Instant,life_failures:u8,life_ready:bool,last_media_report:Option<Instant>,
     started:Instant,recovery_deadline:Option<Instant>,ready:Option<Instant>,seen_media:bool,committed:bool,pair_deadline:Option<Instant>,repair_used:bool,
-    retry_at:Instant,tried:VecDeque<String>,last_auth:Option<Instant>,refusals:u8,mux:Option<crate::manager_menu::Mux>,menu_focus:usize,menu_pending:Option<Value>,menu_idle:bool,wireless_ready:bool,source_ready:bool,session_epoch:u64,pair_pin:Option<PairPin>}
+    retry_at:Instant,tried:VecDeque<String>,last_auth:Option<Instant>,refusals:u8,mux:Option<crate::manager_menu::Mux>,menu_focus:usize,menu_pending:Option<Value>,menu_idle:bool,wireless_ready:bool,source_ready:bool,session_epoch:u64,closed_hicar_epoch:Option<u64>,source_floor:u64,bound_source_id:u64,pair_pin:Option<PairPin>}
 impl Owner{
     fn new(config:Config)->Result<Self>{
         if config.schema!=1||config.devices.len()>8||!(2..=120).contains(&config.connect_seconds)||!(1..=60).contains(&config.stable_seconds)||!(5..=120).contains(&config.pair_seconds){return Err("unsupported manager configuration".into());}
@@ -155,7 +155,7 @@ impl Owner{
         }
         let paused=store.paused;let protocol=store.selected_protocol.or(store.preferred.as_ref().or(store.last.as_ref()).map(|d|d.protocol)).or(config.initial).unwrap_or(Protocol::Carplay);let default_protocol=store.boot_protocol;
         Ok(Self{config,store,status:Status{schema:1,generation:0,default_protocol,protocol:Some(protocol),target:None,active:false,pairing:false,paused,call_active:false,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,last_error:None,last_stage:None},
-            life:None,backend:None,choice:None,life_started:Instant::now(),life_retry_at:Instant::now(),life_failures:0,life_ready:false,last_media_report:None,started:Instant::now(),recovery_deadline:None,ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,wireless_ready:false,source_ready:false,session_epoch:0,pair_pin:None})
+            life:None,backend:None,choice:None,life_started:Instant::now(),life_retry_at:Instant::now(),life_failures:0,life_ready:false,last_media_report:None,started:Instant::now(),recovery_deadline:None,ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,wireless_ready:false,source_ready:false,session_epoch:0,closed_hicar_epoch:None,source_floor:0,bound_source_id:0,pair_pin:None})
     }
     fn selected_protocol(&self)->Protocol{self.store.selected_protocol.or(self.status.protocol).or(self.store.preferred.as_ref().or(self.store.last.as_ref()).map(|d|d.protocol)).or(self.config.initial).unwrap_or(Protocol::Carplay)}
     fn automatic(&self)->Option<Choice>{
@@ -183,6 +183,8 @@ impl Owner{
                 if self.bluetooth(&["--timeout","3","disconnect",&target.address]).is_err(){event("manager_target_disconnect_failed");}
             }
         }
+        if let Some(mux)=&self.mux{self.source_floor=mux.retire_sources()?;}else{self.source_floor=self.bound_source_id.saturating_add(1);}
+        self.bound_source_id=0;
         self.status.backend_pid=None;self.status.active=false;self.ready=None;self.seen_media=false;self.wireless_ready=false;self.source_ready=false;self.show_recovery_menu();
         // Only our terminated receiver's socket in its private directory.
         let media=self.config.media_socket.as_deref().unwrap_or(Path::new("/run/carlink-carplay/media.sock"));
@@ -197,7 +199,7 @@ impl Owner{
         // Identity creation and rotation belong to provisioning, never this UI.
         let pair_pin=if choice.protocol==Protocol::Hicar&&choice.pairing{Some(self.read_pair_pin()?)}else{None};
         self.status.active=false;self.show_recovery_menu();
-        self.stop_backend()?;self.session_epoch=0;self.status.generation=self.status.generation.checked_add(1).ok_or("generation exhausted")?;
+        self.stop_backend()?;self.session_epoch=0;self.closed_hicar_epoch=None;self.status.generation=self.status.generation.checked_add(1).ok_or("generation exhausted")?;
         let mut args=if choice.protocol==Protocol::Carplay{self.config.carplay.clone()}else{self.config.hicar.clone()};
         if choice.pairing {args.extend(["--pair".into(),self.config.pair_seconds.to_string()]);}
         if let Some(d)=&choice.device{args.extend([if choice.protocol==Protocol::Carplay{"--iphone".into()}else{"--peer".into()},d.address.clone()]);}
@@ -242,6 +244,12 @@ impl Owner{
     }
     fn show_recovery_menu(&mut self){let explicit=self.status.menu_visible&&!self.menu_idle;self.status.menu_visible=true;self.menu_idle=!explicit;self.menu_pending=None;self.menu_focus=0;if let Some(mux)=&self.mux{let (rows,_)=self.menu_model();let _=mux.set_menu(rows,0,true);}}
     fn source_lost(&mut self){self.recovery_deadline=Some(Instant::now()+Duration::from_secs(8));self.status.call_active=false;self.wireless_ready=false;self.status.active=false;self.ready=None;self.seen_media=false;self.show_recovery_menu();self.started=Instant::now()-Duration::from_secs((if self.status.protocol==Some(Protocol::Hicar){120}else{self.config.connect_seconds}).saturating_sub(8));}
+    fn hicar_session_closed(&mut self){
+        // Media workers can finish a report after their control channel has
+        // closed. A terminal epoch cannot become healthy again from that report.
+        self.closed_hicar_epoch=Some(self.closed_hicar_epoch.unwrap_or(0).max(self.session_epoch));
+        self.source_lost();
+    }
     fn mark_active(&mut self)->Result<()>{
         if self.wireless_ready&&(self.mux.is_none()||self.source_ready){
             if !self.status.active {
@@ -275,7 +283,9 @@ impl Owner{
                 // A normal RFCOMM authentication handoff can end its stream.
                 // Projection health is determined by control/media lifecycle.
                 if matches!(stage,"auth_parse_stopped"|"control_parse_stopped"|"control_peer_timeout"|"hisight_parse_stopped"|"parse_stopped"|"tcp_stream_error"|"hisight_error"){self.status.last_error=Some(stage.into());}
-                if matches!(stage,"control_parse_stopped"|"control_peer_timeout"|"hisight_parse_stopped"|"hisight_error"){self.source_lost();}
+                if matches!(stage,"control_parse_stopped"|"control_peer_timeout"|"hisight_parse_stopped"|"hisight_error"){
+                    if self.status.protocol==Some(Protocol::Hicar){self.hicar_session_closed();}else{self.source_lost();}
+                }
                 println!("{report}");
             }return Ok(());
         }
@@ -295,11 +305,13 @@ impl Owner{
         }
         let ready=match self.status.protocol{
             Some(Protocol::Carplay)=>name=="stage"&&v["stage"]=="WirelessActive",
-            Some(Protocol::Hicar)=>name=="bridge_stats"&&v["active"]==true&&v.get("epoch_video_frames").unwrap_or(&v["video_frames"]).as_u64().unwrap_or(0)>0,
+            Some(Protocol::Hicar)=>name=="bridge_stats"&&v["active"]==true
+                &&self.closed_hicar_epoch.is_none_or(|closed|self.session_epoch>closed)
+                &&v.get("epoch_video_frames").unwrap_or(&v["video_frames"]).as_u64().unwrap_or(0)>0,
             None=>false,
         };
         if ready {self.wireless_ready=true;self.mark_active()?;}
-        if self.status.protocol==Some(Protocol::Hicar)&&name=="bridge_stats"&&v["connected"]==false&&v["video_ended"]==true&&self.status.active{self.source_lost();}
+        if self.status.protocol==Some(Protocol::Hicar)&&name=="bridge_stats"&&v["connected"]==false&&v["video_ended"]==true&&self.status.active{self.hicar_session_closed();}
         if name=="forward_latency"&&v["sent"].as_u64().unwrap_or(0)>0||name=="bridge_stats"&&v["connected"]==true&&v["video_frames"].as_u64().unwrap_or(0)>0{self.seen_media=true;}
         if name=="stage"&&v["stage"]=="ConnectingBluetooth"{
             if let Some(address)=v["address"].as_str().filter(|s|mac(s)){
@@ -315,7 +327,7 @@ impl Owner{
                 self.status.target=Some(self.store.devices.iter().find(|d|d.protocol==Protocol::Hicar&&d.address.eq_ignore_ascii_case(address)).cloned().unwrap_or(Device{protocol:Protocol::Hicar,address:address.to_uppercase(),name:format!("Huawei · {}",&address[address.len()-5..].to_uppercase()),auto:true,last_used:0}));
             }}
         }
-        if name=="hisight_closed" {self.wireless_ready=false;self.source_lost();}
+        if name=="hisight_closed" {self.wireless_ready=false;self.hicar_session_closed();}
         Ok(())
     }
     fn command(&mut self,v:Value)->Result<Value>{
@@ -380,9 +392,31 @@ impl Owner{
         let (label,next)=match self.store.boot_protocol{BootProtocol::Last=>("上一次选择","hicar"),BootProtocol::Hicar=>("华为 HiCar","carplay"),BootProtocol::Carplay=>("苹果 CarPlay","last")};
         (vec![first,second,format!("默认协议：{label}")],vec![json!({"op":"switch_protocol"}),action,json!({"op":"default_protocol","mode":next})])
     }
+    fn source_event_current(&mut self,v:&Value)->bool{
+        if !matches!(v["type"].as_str(),Some("source-state"|"presentation-state"|"call-state")){return true;}
+        let Some(id)=v["source_id"].as_u64()else{
+            // Unit fixtures predate source IDs. Runtime callbacks always carry
+            // an ID assigned by the resident mux, never by a backend payload.
+            return cfg!(test);
+        };
+        if id<self.source_floor||id<self.bound_source_id{return false;}
+        self.bound_source_id=id;true
+    }
     fn menu_input(&mut self,v:Value)->Result<()>{
+        if !self.source_event_current(&v){return Ok(());}
         if v["type"]=="call-state"{self.status.call_active=v["active"]==true;return Ok(());}
         if v["type"]=="open-menu"{self.status.menu_visible=true;self.menu_idle=false;self.menu_focus=0;self.menu_pending=None;return Ok(());}
+        if v["type"]=="presentation-state"{
+            // The CarPlay producer derives this flag from the OXP session phase.
+            // HiCar derives it from display-surface state, which may pause during
+            // an app transition while its authenticated session remains alive.
+            if self.status.protocol==Some(Protocol::Carplay){
+                self.source_ready=v["active"]==true;
+                if !self.source_ready&&(self.status.active||self.wireless_ready){self.source_lost();}
+                else if self.source_ready{self.mark_active()?;}
+            }
+            return Ok(());
+        }
         if v["type"]=="source-state"{self.source_ready=v["active"]==true;if !self.source_ready{self.status.call_active=false;if self.status.active{self.source_lost();}}self.mark_active()?;return Ok(());}
         if !self.status.menu_visible{return Ok(());}let (rows,actions)=self.menu_model();
         if v["menu_rows"]!=json!(rows){return Ok(());}
@@ -673,12 +707,16 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         owner.ingest(0,json!({"event":"bridge_stats","active":true,"video_frames":90,"epoch_video_frames":0})).unwrap();
         assert!(!owner.status.active&&owner.status.menu_visible);
         owner.mark_active().unwrap();assert!(!owner.status.active);
-        owner.ingest(0,json!({"event":"bridge_stats","active":true,"video_frames":91,"epoch_video_frames":1})).unwrap();assert!(owner.status.active);
+        owner.ingest(0,json!({"event":"bridge_stats","session_epoch":1,"active":true,"video_frames":91,"epoch_video_frames":1})).unwrap();assert!(owner.status.active);
         owner.ingest(0,json!({"event":"bridge_stats","session_epoch":2,"active":true,"epoch_video_frames":1})).unwrap();
         owner.ingest(0,json!({"event":"hisight_closed","session_epoch":1})).unwrap();assert!(owner.status.active);
         owner.ingest(0,json!({"event":"manager_backend_stage","session_epoch":1,"stage":"control_peer_timeout"})).unwrap();assert!(owner.status.active);
         owner.ingest(0,json!({"event":"hisight_closed","session_epoch":2})).unwrap();assert!(!owner.status.active&&owner.status.menu_visible);
+        owner.ingest(0,json!({"event":"bridge_stats","session_epoch":2,"active":true,"epoch_video_frames":9})).unwrap();assert!(!owner.status.active);
         owner.ingest(0,json!({"event":"bridge_stats","session_epoch":1,"active":true,"epoch_video_frames":9})).unwrap();assert!(!owner.status.active);
+        // The producer socket can stay resident across a wireless reconnect;
+        // readiness of a strictly newer session restores projection directly.
+        owner.ingest(0,json!({"event":"bridge_stats","session_epoch":3,"active":true,"epoch_video_frames":1})).unwrap();assert!(owner.status.active);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]fn selection_remains_on_requested_protocol_when_phone_is_offline(){
@@ -694,6 +732,17 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         let (rows,actions)=owner.menu_model();assert_eq!(rows.len(),3);assert_eq!(actions.len(),3);assert_eq!(actions[1]["op"],"connect_device");
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]fn connect_device_accepts_saved_phones_instead_of_new_device_only_enrollment(){
+        let root=test_root("resume-saved-phone");let mut owner=test_owner(&root);let script=root.join("receiver");
+        fs::write(&script,b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0%/*}/receiver-args\"\nexec sleep 60\n").unwrap();
+        fs::set_permissions(&script,fs::Permissions::from_mode(0o700)).unwrap();owner.config.carplay=vec![script.to_string_lossy().into_owned()];
+        owner.store.devices.push(Device{protocol:Protocol::Carplay,address:"02:00:00:00:00:01".into(),name:"saved iPhone".into(),auto:true,last_used:1});
+        owner.store.selected_protocol=Some(Protocol::Carplay);owner.command(json!({"op":"disconnect"})).unwrap();assert!(owner.store.paused);
+        owner.command(json!({"op":"connect_device"})).unwrap();assert!(!owner.store.paused);assert!(owner.status.pairing);
+        let until=Instant::now()+Duration::from_secs(2);let args=loop{if let Ok(args)=fs::read_to_string(root.join("receiver-args")){if args.lines().any(|arg|arg=="--pair"){break args;}}assert!(Instant::now()<until);thread::sleep(Duration::from_millis(5));};
+        assert!(args.lines().any(|arg|arg=="--pair"));assert!(!args.lines().any(|arg|arg=="--new-device-only"));
+        owner.stop_backend().unwrap();fs::remove_dir_all(root).unwrap();
+    }
     #[test]fn boot_default_overrides_only_on_actual_boot_and_keeps_last_selection_option(){
         let root=test_root("boot-protocol");let mut owner=test_owner(&root);
         owner.store.selected_protocol=Some(Protocol::Hicar);owner.store.boot_protocol=BootProtocol::Carplay;owner.store.boot_id=Some("previous-boot".into());save(&owner.config.state,&owner.store).unwrap();
@@ -707,6 +756,37 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         let root=test_root("presentation-pause");let mut owner=test_owner(&root);owner.status.protocol=Some(Protocol::Hicar);owner.wireless_ready=true;owner.status.active=true;owner.status.menu_visible=false;
         owner.ingest(0,json!({"event":"bridge_stats","active":false,"connected":true,"video_frames":100})).unwrap();assert!(owner.status.active);assert!(!owner.status.menu_visible);
         owner.ingest(0,json!({"event":"hisight_closed"})).unwrap();assert!(!owner.status.active);assert!(owner.status.menu_visible);fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn carplay_session_phase_returns_menu_immediately_but_hicar_surface_pause_does_not(){
+        let root=test_root("session-presentation");let mut owner=test_owner(&root);
+        owner.status.protocol=Some(Protocol::Carplay);owner.wireless_ready=true;owner.source_ready=true;owner.status.active=true;owner.status.menu_visible=false;
+        owner.menu_input(json!({"type":"presentation-state","active":false})).unwrap();
+        assert!(!owner.status.active);assert!(owner.status.menu_visible);assert!(!owner.source_ready);assert!(!owner.wireless_ready);
+        owner.menu_input(json!({"type":"presentation-state","active":true})).unwrap();assert!(!owner.status.active);
+        owner.ingest(0,json!({"event":"stage","stage":"WirelessActive"})).unwrap();assert!(owner.status.active);
+        owner.status.protocol=Some(Protocol::Hicar);owner.status.menu_visible=false;
+        owner.menu_input(json!({"type":"presentation-state","active":false})).unwrap();
+        assert!(owner.status.active);assert!(!owner.status.menu_visible);assert!(owner.source_ready);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn stale_mux_source_and_call_events_cannot_override_new_protocol_session(){
+        let root=test_root("mux-source-fence");let mut owner=test_owner(&root);
+        owner.status.protocol=Some(Protocol::Carplay);owner.status.active=true;owner.status.menu_visible=false;
+        owner.source_ready=true;owner.wireless_ready=true;owner.source_floor=3;owner.bound_source_id=3;
+        for kind in ["source-state","presentation-state","call-state"]{
+            owner.menu_input(json!({"type":kind,"source_id":2,"active":false})).unwrap();
+        }
+        owner.menu_input(json!({"type":"call-state","source_id":2,"active":true})).unwrap();
+        assert!(owner.status.active);assert!(!owner.status.menu_visible);assert!(!owner.status.call_active);assert!(owner.source_ready);
+        owner.menu_input(json!({"type":"source-state","source_id":4,"active":true})).unwrap();
+        owner.menu_input(json!({"type":"call-state","source_id":4,"active":true})).unwrap();assert!(owner.status.call_active);assert_eq!(owner.bound_source_id,4);
+        owner.menu_input(json!({"type":"source-state","source_id":3,"active":false})).unwrap();
+        owner.menu_input(json!({"type":"call-state","source_id":3,"active":false})).unwrap();assert!(owner.status.active);assert!(owner.status.call_active);
+        // HU menu gestures are not wireless-source callbacks and stay usable.
+        owner.menu_input(json!({"type":"open-menu"})).unwrap();assert!(owner.status.menu_visible);
+        owner.stop_backend().unwrap();assert_eq!(owner.source_floor,5);
+        owner.menu_input(json!({"type":"call-state","source_id":4,"active":true})).unwrap();assert!(!owner.status.call_active);
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]fn ordinary_offline_does_not_erase_pairing(){for s in ["Host is down","Connection timed out","No route to host","AirPlay session ended"]{assert!(!auth_mismatch(s));}assert!(auth_mismatch("org.bluez.Error.AuthenticationFailed"));}
     #[test]fn stale_generation_cannot_steal_active_backend(){

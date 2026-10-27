@@ -44,7 +44,7 @@ impl Speaker{
         let mut fields=vec![("ServiceID",self.name.into()),("ServiceType",self.kind.to_string()),("DataSessionID",self.session.ok_or("no speaker session")?.to_string()),("CSeq",self.sequence.to_string())];fields.extend_from_slice(extra);
         encode(&format!("{method} * DMSDP/1.0"),&fields)
     }
-    fn retire(&mut self){if let Some(id)=self.session.take(){if self.microphone(){if self.retired.len()>=16{self.retired.pop_front();}self.retired.push_back(id);}}self.ready=false;self.remote=None;self.mic_phase=MicPhase::Idle;}
+    fn retire(&mut self){if let Some(id)=self.session.take(){if self.retired.len()>=16{self.retired.pop_front();}self.retired.push_back(id);}self.ready=false;self.remote=None;self.mic_phase=MicPhase::Idle;}
     fn teardown(&mut self)->Result<Option<Vec<u8>>>{if self.session.is_none(){return Ok(None);}let record=self.request("TEARDOWN",&[])?;self.retire();Ok(Some(record))}
     fn state(&self)->Value{json!({"ports":self.ports,"session_id":self.session,"sequence":self.sequence,"setup_sequence":self.setup,"format":self.format,"ready":self.ready})}
     fn receive(&mut self,m:&Message)->Result<Option<(Vec<Value>,Vec<Vec<u8>>)>>{
@@ -63,7 +63,7 @@ impl Speaker{
                     let(port,rtcp)=self.ports.ok_or("speaker ports are not configured")?;
                     if port==0||rtcp!= -1||!matches!(h.get("simple").map(String::as_str),Some("1"|"0"))||id==0{return Err("unsupported speaker setup mode".into());}
                     if self.session==Some(id){return Ok(Some((events,replies)));}
-                    if self.microphone()&&self.retired.contains(&id){return Ok(Some((events,replies)));}
+                    if self.retired.contains(&id){return Ok(Some((events,replies)));}
                     if self.session.is_some(){if self.microphone()&&self.ready{events.push(self.notify("stopped"));}self.retire();}
                     self.session=Some(id);self.ready=false;self.format=None;
                     if self.microphone(){
@@ -91,7 +91,7 @@ impl Speaker{
             if !client.bytes().all(|b|b.is_ascii_digit())||client.is_empty()||!server.bytes().all(|b|b.is_ascii_digit())||server.is_empty(){return Err("invalid speaker server endpoint".into());}
             if client.parse::<u16>().ok()!=self.ports.map(|p|p.0)||server.parse::<u16>().ok().filter(|p|*p!=0).is_none(){return Err("invalid speaker server endpoint".into());}
             self.remote=server.parse().ok();self.ready=true;events.push(self.notify("ready"));
-        }else if self.session!=Some(id){if self.microphone(){return Ok(Some((events,replies)));}return Err("speaker session mismatch".into());}
+        }else if self.session!=Some(id){if self.microphone()||self.retired.contains(&id){return Ok(Some((events,replies)));}return Err("speaker session mismatch".into());}
         else if m.start.starts_with("SET_PARAMETER "){
             if self.microphone()&&h.contains_key("cryptoswitch"){
                 if self.mic_phase==MicPhase::Idle||h.get("cryptover").map(String::as_str)!=Some("1")||h.get("cryptoswitch").map(String::as_str)!=Some("222")||h.get("cryptoalg").map(String::as_str)!=Some("aes128-ctr")||!m.body.is_empty(){return Err("unsupported microphone crypto negotiation".into());}
@@ -254,6 +254,16 @@ pub fn differential(v:&Value)->Result<Value>{
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn retired_speaker_parameters_cannot_abort_the_replacement_session(){
+        for (name,kind) in [("speaker1",3),("modemSpeaker",10)]{
+            let mut speaker=Speaker::named(name,kind);speaker.session=Some(7);speaker.retire();speaker.session=Some(8);speaker.ready=true;
+            for id in [7,6]{
+                let raw=format!("SET_PARAMETER * DMSDP/1.0\r\nCSeq: 1\r\nServiceID: {name}\r\nServiceType: {kind}\r\nDataSessionID: {id}\r\nAudioParameter: SampleRate=48000;Format=16;ChannelNum=2;Codec=0\r\n\r\n");
+                let parsed=Messages::new("DMSDP").feed(raw.as_bytes()).unwrap();let result=speaker.receive(&parsed[0]);
+                if id==7{let(events,replies)=result.unwrap().unwrap();assert!(events.is_empty()&&replies.is_empty());assert_eq!(speaker.session,Some(8));assert!(speaker.ready);}else{assert!(result.is_err());}
+            }
+        }
+    }
     #[test]fn stale_close_does_not_revoke_a_new_audio_session(){
         let mut speaker=Speaker::named("modemMic",9);speaker.session=Some(8);speaker.ready=true;
         let mut messages=Messages::new("DMSDP");
