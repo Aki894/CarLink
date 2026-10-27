@@ -418,6 +418,7 @@ mod tests {
     fn hu_music_query_does_not_resume_but_new_player_activation_does(){
         let path=std::env::temp_dir().join(format!("carlink-mute-resume-{}",std::process::id()));
         let mut endpoint=Endpoint::with_source(None,Some(path.clone())).unwrap();
+        endpoint.receive(&Message::command(ids::HU_PROTOCOL_VERSION,vec![8,4,16,1]).unwrap().encode().unwrap()).unwrap();
         let module=|status|Message::command(ids::MODULE_CONTROL,vec![8,3,16,status]).unwrap().encode().unwrap();
         endpoint.receive(&module(0)).unwrap();assert!(endpoint.hu_muted);
         endpoint.receive(&module(1)).unwrap();assert!(endpoint.hu_muted);

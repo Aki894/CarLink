@@ -41,9 +41,8 @@ impl Link{
     fn push(&mut self,kind:u8,flags:u8,data:&[u8],pts:u64){let wire=live(kind,flags,data,pts);if self.queue.len()>=128||self.size+wire.len()>MAX_QUEUE{self.disconnect();}self.size+=wire.len();self.queue.push_back(Queued{kind,wire,offset:0,at:Instant::now()});}
     fn prune(&mut self,kind:u8){self.queue.retain(|v|v.kind!=kind||v.offset>0);self.size=self.queue.iter().map(|v|v.wire.len()-v.offset).sum();}
     fn recover(&mut self){
-        // A partially written record cannot be removed without corrupting the
-        // stream. Reconnect rather than dropping its unsent suffix.
-        if self.queue.iter().any(|v|v.kind==2&&v.offset>0){self.disconnect();return;}
+        // Finish a partially written record before the reset marker. Keeping
+        // its suffix preserves framing without dropping the phone session.
         self.prune(2);self.prune(6);self.wait_key=true;self.push(6,0,&[],0);
     }
     fn session(&mut self,active:bool){if self.queue.iter().any(|v|v.offset>0){self.disconnect();}self.active=active;self.established=false;self.clear();self.push(4,u8::from(active),&[],0);self.push(1,0,&[800u32.to_le_bytes(),480u32.to_le_bytes(),30u32.to_le_bytes()].concat(),0);if self.audio{self.push(5,self.audio_role,&[1],0);}if active{if let Some(v)=self.microphone.clone(){self.push(7,0,&v,0);}}else{self.microphone=None;self.mic_pcm.clear();}}
@@ -365,6 +364,11 @@ fn audio_port_allowed(ports:&BTreeMap<String,u16>,role:u8,port:u16)->bool{
     let mut link=Link::new(PathBuf::from("/unused"));let (a,_b)=UnixStream::pair().unwrap();link.socket=Some(a);link.active=true;link.established=true;
     link.push(3,0,&[0;32],1);link.queue.front_mut().unwrap().offset=4;link.size-=4;link.push(3,0,&[0;32],2);link.audio(false);
     assert!(link.socket.is_some());assert!(link.established);assert_eq!(link.queue.len(),2);assert_eq!(link.queue[0].offset,4);assert_eq!(link.queue[1].kind,5);
+}
+#[test]fn video_backpressure_finishes_partial_frame_before_reset_marker(){
+    let mut link=Link::new(PathBuf::from("/unused"));let (a,_b)=UnixStream::pair().unwrap();link.socket=Some(a);link.active=true;link.established=true;
+    link.push(2,0,&[0;32],1);link.queue.front_mut().unwrap().offset=4;link.size-=4;link.push(2,0,&[0;32],2);link.recover();
+    assert!(link.socket.is_some());assert!(link.established);assert!(link.wait_key);assert_eq!(link.queue.len(),2);assert_eq!(link.queue[0].offset,4);assert_eq!(link.queue[1].kind,6);
 }
 #[test]fn microphone_burst_drops_old_complete_blocks_without_resetting_projection(){
     let mut link=Link::new(PathBuf::from("/unused"));let (a,mut b)=UnixStream::pair().unwrap();a.set_nonblocking(true).unwrap();link.socket=Some(a);link.active=true;link.established=true;
