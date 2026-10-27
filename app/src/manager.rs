@@ -202,6 +202,11 @@ impl Owner{
         self.stop_backend()?;self.session_epoch=0;self.closed_hicar_epoch=None;self.status.generation=self.status.generation.checked_add(1).ok_or("generation exhausted")?;
         let mut args=if choice.protocol==Protocol::Carplay{self.config.carplay.clone()}else{self.config.hicar.clone()};
         if choice.pairing {args.extend(["--pair".into(),self.config.pair_seconds.to_string()]);}
+        if choice.protocol==Protocol::Hicar&&choice.pairing&&choice.device.is_none(){
+            let hint=self.store.preferred.as_ref().or(self.store.last.as_ref()).and_then(|preferred|self.store.devices.iter().find(|d|d.protocol==Protocol::Hicar&&d.auto&&d.address.eq_ignore_ascii_case(&preferred.address)))
+                .or_else(||self.store.devices.iter().filter(|d|d.protocol==Protocol::Hicar&&d.auto).max_by_key(|d|d.last_used));
+            if let Some(hint)=hint{args.extend(["--reconnect-peer".into(),hint.address.clone()]);}
+        }
         if let Some(d)=&choice.device{args.extend([if choice.protocol==Protocol::Carplay{"--iphone".into()}else{"--peer".into()},d.address.clone()]);}
         if choice.protocol==Protocol::Hicar {
             let epoch=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_|"invalid system clock")?.as_secs();
@@ -345,7 +350,7 @@ impl Owner{
                 self.retry_at=Instant::now();self.show_recovery_menu();
             },
             "default_protocol"=>{let mode:BootProtocol=serde_json::from_value(v["mode"].clone()).map_err(|_|"invalid default protocol")?;self.store.boot_protocol=mode;self.status.default_protocol=mode;save(&self.config.state,&self.store)?;},
-            "connect_device"=>{self.store.paused=false;self.status.paused=false;self.store.policy=Policy::Last;self.tried.clear();save(&self.config.state,&self.store)?;
+            "connect_device"=>{if self.status.pairing&&self.backend.is_some(){return Ok(json!({"ok":true,"status":self.status}));}self.store.paused=false;self.status.paused=false;self.store.policy=Policy::Last;self.tried.clear();save(&self.config.state,&self.store)?;
                 if !self.status.active{self.select(Choice{protocol:self.selected_protocol(),device:None,pairing:true})?;self.menu_idle=true;}
             },
             "connect"=>{let address=v["address"].as_str().ok_or("missing target address")?;
@@ -745,6 +750,20 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         owner.command(json!({"op":"connect_device"})).unwrap();assert!(!owner.store.paused);assert!(owner.status.pairing);
         let until=Instant::now()+Duration::from_secs(2);let args=loop{if let Ok(args)=fs::read_to_string(root.join("receiver-args")){if args.lines().any(|arg|arg=="--pair"){break args;}}assert!(Instant::now()<until);thread::sleep(Duration::from_millis(5));};
         assert!(args.lines().any(|arg|arg=="--pair"));assert!(!args.lines().any(|arg|arg=="--new-device-only"));
+        let pid=owner.status.backend_pid;let generation=owner.status.generation;owner.command(json!({"op":"connect_device"})).unwrap();assert_eq!(owner.status.backend_pid,pid);assert_eq!(owner.status.generation,generation);
+        owner.stop_backend().unwrap();fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn hicar_pair_window_wakes_saved_peer_without_locking_new_device_enrollment(){
+        let root=test_root("hicar-reconnect-hint");let mut owner=test_owner(&root);let script=root.join("receiver");let identity=root.join("identity.json");
+        fs::write(&script,b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0%/*}/receiver-args\"\nexec sleep 60\n").unwrap();
+        fs::set_permissions(&script,fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&identity,json!({"schema":1,"device_id":"ab".repeat(32),"pin":"012345","name":"CarLink"}).to_string()).unwrap();fs::set_permissions(&identity,fs::Permissions::from_mode(0o600)).unwrap();
+        owner.config.hicar=vec![script.to_string_lossy().into_owned(),"--identity".into(),identity.to_string_lossy().into_owned()];owner.store.selected_protocol=Some(Protocol::Hicar);
+        let saved=Device{protocol:Protocol::Hicar,address:"02:00:00:00:00:02".into(),name:"saved Huawei".into(),auto:true,last_used:5};owner.store.devices.push(saved.clone());owner.store.last=Some(saved.clone());
+        owner.command(json!({"op":"disconnect"})).unwrap();owner.command(json!({"op":"connect_device"})).unwrap();
+        let until=Instant::now()+Duration::from_secs(2);let args=loop{if let Ok(args)=fs::read_to_string(root.join("receiver-args")){if args.lines().any(|arg|arg=="--reconnect-peer"){break args;}}assert!(Instant::now()<until);thread::sleep(Duration::from_millis(5));};
+        let args=args.lines().collect::<Vec<_>>();let hint=args.iter().position(|v|*v=="--reconnect-peer").unwrap();assert_eq!(args[hint+1],saved.address);assert!(!args.contains(&"--peer"));assert!(args.contains(&"--pair"));
+        let pid=owner.status.backend_pid;let generation=owner.status.generation;owner.command(json!({"op":"connect_device"})).unwrap();assert_eq!(owner.status.backend_pid,pid);assert_eq!(owner.status.generation,generation);
         owner.stop_backend().unwrap();fs::remove_dir_all(root).unwrap();
     }
     #[test]fn boot_default_overrides_only_on_actual_boot_and_keeps_last_selection_option(){

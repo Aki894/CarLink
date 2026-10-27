@@ -88,14 +88,14 @@ impl AudioServices{
 }
 fn mac(s:&str)->Result<String>{let p:Vec<_>=s.split(':').collect();if p.len()!=6||p.iter().any(|s|s.len()!=2||!s.bytes().all(|b|b.is_ascii_hexdigit())){return Err("invalid peer address".into());}Ok(s.to_ascii_uppercase())}
 struct Config{model:String,identity:PathBuf,library:PathBuf,store:PathBuf,interface:String,live:PathBuf,audio_binary:PathBuf,
-    adapter:String,peer:Option<String>,excluded:Vec<String>,pair:bool,pair_seconds:u64,sequence:u8,duration:u64,power:i16,channel:u16,
+    adapter:String,peer:Option<String>,reconnect_peer:Option<String>,excluded:Vec<String>,pair:bool,pair_seconds:u64,sequence:u8,duration:u64,power:i16,channel:u16,
     test:bool,fds:[Option<i32>;3],test_ip:Option<Ipv4Addr>,test_port:Option<u16>}
 impl Config{
     fn parse(args:&[String])->Result<Self>{
         let mut c=Self{model:"00040A00".into(),identity:"/var/lib/carlink/hicar/production/identity.json".into(),
             library:"/usr/local/lib/carlink/hicar-native/libcarlink_hichain.so".into(),store:"/var/lib/carlink/hicar/production/keys".into(),
             interface:String::new(),live:"/run/carlink/live.sock".into(),audio_binary:"/usr/local/lib/carlink/carplay/bin/carlink-audio".into(),adapter:"/org/bluez/hci0".into(),
-            peer:None,excluded:vec![],pair:false,pair_seconds:120,sequence:0,duration:0,power:11,channel:23,test:false,fds:[None;3],test_ip:None,test_port:None};
+            peer:None,reconnect_peer:None,excluded:vec![],pair:false,pair_seconds:120,sequence:0,duration:0,power:11,channel:23,test:false,fds:[None;3],test_ip:None,test_port:None};
         let mut i=0;while i<args.len(){let name=args[i].as_str();i+=1;
             if matches!(name,"--pair"|"--test-mode"|"--managed"|"--allow-incoming"|"--reply-control"|"--reply-identity"|"--dmsdp-options"|"--audio"){
                 if name=="--pair"{c.pair=true;if args.get(i).is_some_and(|v|!v.starts_with("--")){c.pair_seconds=args[i].parse().map_err(|_|"invalid pairing duration")?;i+=1;}}
@@ -105,6 +105,7 @@ impl Config{
                 "--model"=>c.model=value.to_ascii_uppercase(),"--identity"=>c.identity=value.into(),"--auth-library"=>c.library=value.into(),
                 "--auth-store"=>c.store=value.into(),"--network-interface"=>c.interface=value.clone(),"--live-socket"=>c.live=value.into(),
                 "--audio-binary"=>c.audio_binary=value.into(),"--adapter"=>c.adapter=value.clone(),"--peer"=>c.peer=Some(mac(value)?),
+                "--reconnect-peer"=>c.reconnect_peer=Some(mac(value)?),
                 "--exclude-peer"=>c.excluded.push(mac(value)?),"--sequence"=>c.sequence=value.parse().map_err(|_|"invalid discovery sequence")?,
                 "--duration"=>c.duration=value.parse().map_err(|_|"invalid duration")?,"--pair-seconds"=>c.pair_seconds=value.parse().map_err(|_|"invalid pairing duration")?,
                 "--tx-power"=>c.power=value.parse().map_err(|_|"invalid transmit power")?,"--channel"=>c.channel=value.parse().map_err(|_|"invalid RFCOMM channel")?,
@@ -218,7 +219,7 @@ impl Owner{
         // Validate every inherited mock endpoint before opening any real worker.
         if config.test{for (i,fd)in config.fds.iter().enumerate(){validate_fd(fd.unwrap(),if i==0{libc::SOCK_SEQPACKET}else{libc::SOCK_STREAM})?;}}
         let mut radio=Radio::new(config.fds[0])?;
-        let prepared=radio.call(json!({"model":config.model,"sequence":config.sequence,"peer":config.peer,"exclude_peers":config.excluded,
+        let prepared=radio.call(json!({"model":config.model,"sequence":config.sequence,"peer":config.peer,"reconnect_peer":config.reconnect_peer,"exclude_peers":config.excluded,
             "pair_seconds":if config.pair{config.pair_seconds}else{0},"channel":config.channel,"tx_power":config.power,"interface":config.interface,
             "adapter":config.adapter,"network":true,"manage_controller":true}),Duration::from_secs(25))?;
         let address=mac(text(&prepared,"address")?)?;let offer=prepared["offer"].clone();

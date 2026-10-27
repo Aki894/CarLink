@@ -15,7 +15,7 @@ fn yes()->bool{true}fn adapter()->String{"/org/bluez/hci0".into()}fn one()->u8{1
 #[derive(Deserialize)]
 struct Config{
     #[serde(default="adapter")]adapter:String,model:String,#[serde(default="one")]sequence:u8,
-    #[serde(default)]peer:Option<String>,#[serde(default,alias="exclude_peer")]exclude_peers:Vec<String>,
+    #[serde(default)]peer:Option<String>,#[serde(default)]reconnect_peer:Option<String>,#[serde(default,alias="exclude_peer")]exclude_peers:Vec<String>,
     #[serde(default)]pair_seconds:u64,#[serde(default="channel")]channel:u16,
     #[serde(default="power")]tx_power:i16,#[serde(default)]interface:Option<String>,
     #[serde(default="yes")]network:bool,#[serde(default="yes")]manage_controller:bool,
@@ -29,7 +29,7 @@ fn validate(c:&Config)->Result<()>{
     if index.is_empty()||index.len()>5||!index.bytes().all(|b|b.is_ascii_digit())||index.parse::<u16>().is_err(){return Err("invalid adapter index".into());}
     if c.model.len()!=8||!c.model.bytes().all(|b|b.is_ascii_hexdigit())||!(1..=29).contains(&c.channel)||!(-127..=20).contains(&c.tx_power){return Err("invalid radio parameters".into());}
     if c.pair_seconds!=0&&!(5..=120).contains(&c.pair_seconds){return Err("invalid pairing window".into());}
-    if c.exclude_peers.len()>8{return Err("too many excluded peers".into());}for p in &c.exclude_peers{mac(p)?;}if let Some(p)=&c.peer{mac(p)?;}
+    if c.exclude_peers.len()>8{return Err("too many excluded peers".into());}for p in &c.exclude_peers{mac(p)?;}if let Some(p)=&c.peer{mac(p)?;}if let Some(p)=&c.reconnect_peer{mac(p)?;if c.exclude_peers.contains(&mac(p)?){return Err("reconnect peer is excluded".into());}}
     if c.peer.is_none()&&c.pair_seconds==0{return Err("selected peer or pairing window required".into());}
     if c.network&&c.interface.is_none(){return Err("wireless interface required".into());}
     if let Some(i)=&c.interface{if i.is_empty()||i.len()>15||i=="end0"||!i.bytes().all(|b|b.is_ascii_alphanumeric()||b"_.-".contains(&b)){return Err("invalid wireless interface".into());}}
@@ -210,7 +210,7 @@ impl Ipc{
     }
 }
 
-struct State{selection:Selection,payload:Vec<u8>,power:i16,instance:u8,stopped:bool,closing:bool,slots:BTreeSet<(String,String)>,origin:Instant,pending_connect:Option<(u32,Instant)>}
+struct State{selection:Selection,payload:Vec<u8>,power:i16,instance:u8,stopped:bool,closing:bool,slots:BTreeSet<(String,String)>,origin:Instant,pending_connect:Option<(u32,Instant)>,wake_peer:Option<String>}
 impl State{
     fn properties(&self)->Arg{dict(vec![("Type",text("peripheral")),("Discoverable",Arg::Bool(true)),("LocalName",text("CarLink")),("TxPower",Arg::I16(self.power)),("Instance",Arg::Byte(self.instance)),("ServiceData",dict(vec![(FDEE,Arg::Array("y".into(),self.payload.iter().copied().map(Arg::Byte).collect()))]))])}
     fn handle(&mut self,bus:&mut Bus,ipc:&mut Ipc,m:Msg)->Result<()>{
@@ -259,7 +259,7 @@ impl State{
                 if unsafe{libc::getpeername(fd.as_raw_fd(),&mut remote as *mut _ as *mut libc::sockaddr,&mut size)}!=0{return bus.reject(m,"org.bluez.Error.Rejected");}
                 if !self.selection.allows(device,true,self.origin.elapsed().as_millis() as u64){return bus.reject(m,"org.bluez.Error.Rejected");}
                 let address=self.selection.address(device).ok_or("invalid selected peer")?;
-                if ipc.send(&json!({"event":"rfcomm","stream":stream,"device":device,"address":address,"initiator":stream=="control"&&self.pending_connect.is_some()}),Some(fd.as_raw_fd())).is_err(){return bus.reject(m,"org.bluez.Error.Rejected");}
+                if ipc.send(&json!({"event":"rfcomm","stream":stream,"device":device,"address":address,"initiator":stream=="control"&&self.pending_connect.is_some()&&self.wake_peer.as_deref()==Some(device)}),Some(fd.as_raw_fd())).is_err(){return bus.reject(m,"org.bluez.Error.Rejected");}
                 self.slots.insert(slot);return bus.reply(m,vec![]);
             }
         }
@@ -348,11 +348,12 @@ impl Radio{
             if business{self.business=true;}else{self.profile=true;}
         }
         let p=self.c.adapter.clone();self.bluez(&p,"org.bluez.LEAdvertisingManager1","RegisterAdvertisement",vec![path(&format!("{ROOT}/advertisement")),dict(vec![])])?;self.advertisement=true;self.activated=true;
-        if let Some(peer)=self.state.selection.selected.clone(){self.reconnect_allowed=self.c.peer.is_some()&&self.property("org.bluez",&peer,"org.bluez.Device1","Paired").ok().and_then(|v|v.boolean())==Some(true);}Ok(())
+        if let Some(peer)=self.state.wake_peer.clone(){self.reconnect_allowed=self.property("org.bluez",&peer,"org.bluez.Device1","Paired").ok().and_then(|v|v.boolean())==Some(true);}Ok(())
     }
     fn reconnect(&mut self)->Result<()>{
         if !self.activated||!self.reconnect_allowed||self.projection_active||self.state.closing||!self.state.slots.is_empty()||Instant::now()<self.reconnect_at{return Ok(());}
-        let Some(peer)=self.state.selection.selected.clone()else{return Ok(());};
+        let Some(peer)=self.state.wake_peer.clone()else{return Ok(());};
+        if !self.state.selection.allows(&peer,false,self.state.origin.elapsed().as_millis() as u64){return Ok(());}
         // BlueZ may keep Connect pending while paging an absent phone. Never
         // queue parallel Connect requests or block Profile1/Agent dispatch.
         if let Some((_,since))=self.state.pending_connect{if since.elapsed()<Duration::from_secs(45){return Ok(());}self.state.pending_connect=None;}
@@ -364,7 +365,7 @@ impl Radio{
     }
     fn open_business(&mut self,port:u16)->Result<()>{
         if !self.reconnect_allowed||self.projection_active||self.business_connect.is_some()||!(1..=30).contains(&port){return Err("outgoing business connection unavailable".into());}
-        let peer=self.state.selection.selected.as_deref().and_then(|p|self.state.selection.address(p)).ok_or("selected peer missing")?;
+        let selected=self.state.selection.selected.as_deref().ok_or("selected peer missing")?;if self.state.wake_peer.as_deref()!=Some(selected){return Err("outgoing business peer no longer selected".into());}let peer=self.state.selection.address(selected).ok_or("invalid selected peer")?;
         if self.state.slots.iter().any(|(stream,_)|stream=="business"){return Err("business connection already present".into());}
         #[repr(C)]struct RcAddress{family:u16,address:[u8;6],channel:u8}
         let mut bytes=[0u8;6];for (dst,src)in bytes.iter_mut().rev().zip(peer.split(':')){*dst=u8::from_str_radix(src,16).map_err(|_|"invalid selected peer")?;}
@@ -411,7 +412,7 @@ pub fn run(fd:i32)->Result<()>{
     let mut ipc=Ipc::new(fd)?;unsafe{libc::signal(libc::SIGTERM,libc::SIG_IGN);}
     let until=Instant::now()+Duration::from_secs(15);let config=loop{if let Some(v)=ipc.receive()?{break v;}if Instant::now()>until{return Err("missing private radio configuration".into());}std::thread::sleep(Duration::from_millis(10));};
     let c:Config=serde_json::from_value(config.clone()).map_err(|_|"invalid radio configuration")?;validate(&c)?;
-    let state=State{selection:Selection::new(&c)?,payload:beacon(&c.model,c.sequence)?,power:c.tx_power,instance:0,stopped:false,closing:false,slots:BTreeSet::new(),origin:Instant::now(),pending_connect:None};
+    let state=State{selection:Selection::new(&c)?,payload:beacon(&c.model,c.sequence)?,power:c.tx_power,instance:0,stopped:false,closing:false,slots:BTreeSet::new(),origin:Instant::now(),pending_connect:None,wake_peer:c.peer.as_ref().or(c.reconnect_peer.as_ref()).map(|p|format!("{}/dev_{}",c.adapter,p.to_ascii_uppercase().replace(':',"_")))};
     let bus=Bus::open()?;let mut radio=Radio{bus,state,ipc,c,device:None,connection:None,previous:None,offer:None,agent:false,profile:false,business:false,advertisement:false,restore_connectable:false,restore_bondable:false,activated:false,startup_cancelled:false,startup_close_id:None,reconnect_at:Instant::now(),reconnect_attempts:0,projection_active:false,reconnect_allowed:false,business_connect:None};
     let result=(||{
         let address=radio.prepare()?;radio.ipc.send(&json!({"id":config.get("id"),"ok":true,"ready":true,"address":address,"offer":radio.offer}),None)?;
@@ -450,6 +451,12 @@ pub fn run(fd:i32)->Result<()>{#[cfg(unix)]{linux::run(fd)}#[cfg(not(unix))]{let
         addresses[1]["addr_info"]=json!([{"family":"inet","local":"192.168.49.1","prefixlen":16}]);assert!(!hotspot_ipv4_ready(&addresses,"wlan0"));
         addresses[1]["addr_info"][0]["prefixlen"]=24.into();assert!(hotspot_ipv4_ready(&addresses,"wlan0"));
         addresses[1]["addr_info"][0]["family"]="inet6".into();assert!(!hotspot_ipv4_ready(&addresses,"wlan0"));
+    }
+    #[test]fn reconnect_hint_does_not_select_or_steal_a_pairing_window(){
+        let c:Config=serde_json::from_value(json!({"model":"00040A00","network":false,"manage_controller":false,"pair_seconds":120,"reconnect_peer":"02:00:00:00:00:01"})).unwrap();validate(&c).unwrap();
+        let mut s=Selection::new(&c).unwrap();s.deadline=Some(120000);assert!(s.selected.is_none());
+        let old="/org/bluez/hci0/dev_02_00_00_00_00_01";let new="/org/bluez/hci0/dev_02_00_00_00_00_02";
+        assert!(s.allows(old,false,0));assert!(s.selected.is_none());assert!(s.allows(new,true,100));assert!(!s.allows(old,true,101));assert!(s.allows(new,true,102));
     }
     #[test]fn selection_is_sticky_and_agent_cannot_claim(){let c:Config=serde_json::from_value(json!({"model":"00040A00","network":false,"manage_controller":false,"pair_seconds":10,"exclude_peers":["02:00:00:00:00:01"]})).unwrap();validate(&c).unwrap();let mut s=Selection::new(&c).unwrap();s.deadline=Some(10000);
         assert!(!s.allows("/org/bluez/hci0/dev_02_00_00_00_00_01",true,0));assert!(s.allows("/org/bluez/hci0/dev_02_00_00_00_00_02",false,0));assert!(s.selected.is_none());assert!(s.allows("/org/bluez/hci0/dev_02_00_00_00_00_03",true,0));assert!(!s.allows("/org/bluez/hci0/dev_02_00_00_00_00_02",true,0));assert!(s.allows("/org/bluez/hci0/dev_02_00_00_00_00_03",false,20000));}
