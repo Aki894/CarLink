@@ -197,6 +197,9 @@ impl Endpoint {
         let now = self.clock.elapsed();
         if let Some(live)=self.live.as_mut(){
             live.poll_io()?;
+            // MODULE_CONTROL MUSIC=1 is a status query, not resume. A new
+            // source player activation is the event that releases HU mute.
+            if live.take_music_resume(){self.hu_muted=false;}
             live.clock_floor(now.as_millis() as u32);
         }
         // Video liveness has its own deadline. Continuous PCM must not keep
@@ -411,4 +414,16 @@ mod tests {
         endpoint.transport_ready(false);assert!(!endpoint.live.as_ref().unwrap().accepts_input());
         assert!(poll(&mut endpoint).contains(&0x10023));
     }
+    #[test]
+    fn hu_music_query_does_not_resume_but_new_player_activation_does(){
+        let path=std::env::temp_dir().join(format!("carlink-mute-resume-{}",std::process::id()));
+        let mut endpoint=Endpoint::with_source(None,Some(path.clone())).unwrap();
+        let module=|status|Message::command(ids::MODULE_CONTROL,vec![8,3,16,status]).unwrap().encode().unwrap();
+        endpoint.receive(&module(0)).unwrap();assert!(endpoint.hu_muted);
+        endpoint.receive(&module(1)).unwrap();assert!(endpoint.hu_muted);
+        let mut producer=std::os::unix::net::UnixStream::connect(path).unwrap();
+        let mut packet=13u32.to_le_bytes().to_vec();packet.extend([5,0,0,0]);packet.extend(0u64.to_le_bytes());packet.push(1);
+        producer.write_all(&packet).unwrap();endpoint.poll_media().unwrap();assert!(!endpoint.hu_muted);
+    }
+
 }

@@ -29,8 +29,10 @@ struct Config{schema:u32,socket:PathBuf,live_socket:PathBuf,state:PathBuf,carlif
 fn connect_seconds()->u64{30}fn stable_seconds()->u64{10}fn pair_seconds()->u64{120}
 #[derive(Default,Clone,Copy,PartialEq,Deserialize,Serialize)]
 #[serde(rename_all="lowercase")]enum Policy{#[default]Last,Favorite,Manual}
+#[derive(Default,Clone,Copy,PartialEq,Deserialize,Serialize)]
+#[serde(rename_all="lowercase")]enum BootProtocol{#[default]Last,Carplay,Hicar}
 #[derive(Default,Deserialize,Serialize)]
-struct Store{#[serde(default)]devices:Vec<Device>,#[serde(default)]last:Option<Device>,#[serde(default)]paused:bool,#[serde(default)]policy:Policy,#[serde(default)]favorite:Option<Device>,#[serde(default)]preferred:Option<Device>,#[serde(default)]boot_id:Option<String>}
+struct Store{#[serde(default)]selected_protocol:Option<Protocol>,#[serde(default)]boot_protocol:BootProtocol,#[serde(default)]devices:Vec<Device>,#[serde(default)]last:Option<Device>,#[serde(default)]paused:bool,#[serde(default)]policy:Policy,#[serde(default)]favorite:Option<Device>,#[serde(default)]preferred:Option<Device>,#[serde(default)]boot_id:Option<String>}
 fn private_dir(path:&Path)->Result<()>{
     fs::create_dir_all(path).map_err(|_|"cannot create private manager directory")?;
     let meta=fs::symlink_metadata(path).map_err(|_|"cannot inspect private manager directory")?;
@@ -75,10 +77,10 @@ fn save(path:&Path,store:&Store)->Result<()>{
     if result.is_err(){let _=fs::remove_file(&tmp);}result
 }
 #[derive(Clone,Serialize)]
-struct Status{schema:u32,generation:u64,protocol:Option<Protocol>,target:Option<Device>,active:bool,pairing:bool,paused:bool,call_active:bool,
+struct Status{schema:u32,generation:u64,default_protocol:BootProtocol,protocol:Option<Protocol>,target:Option<Device>,active:bool,pairing:bool,paused:bool,call_active:bool,
     carlife_pid:Option<u32>,backend_pid:Option<u32>,usb_connected:bool,menu_visible:bool,last_error:Option<String>,last_stage:Option<String>}
 fn event(name:&str){println!("{}",json!({"event":name}));}
-fn diagnostic_stage(name:&str)->bool{matches!(name,"ready"|"controller_setting"|"rfcomm_connected"|"rust_connection_worker_ready"|"rust_hisight_ready"|"rust_dmsdp_ready"|"rust_media_ready"|"rust_radio_ready"|"tcp_connected"|"hisight_connected"|"auth_parse_stopped"|"control_parse_stopped"|"control_peer_timeout"|"hisight_parse_stopped"|"parse_stopped"|"stream_error"|"tcp_stream_error"|"hisight_error"|"stopped")}
+fn diagnostic_stage(name:&str)->bool{matches!(name,"bluetooth_reconnect_ready"|"bluetooth_reconnect_failed"|"ready"|"controller_setting"|"rfcomm_connected"|"rust_connection_worker_ready"|"rust_hisight_ready"|"rust_dmsdp_ready"|"rust_media_ready"|"rust_radio_ready"|"tcp_connected"|"hisight_connected"|"auth_parse_stopped"|"control_parse_stopped"|"control_peer_timeout"|"hisight_parse_stopped"|"parse_stopped"|"stream_error"|"tcp_stream_error"|"hisight_error"|"stopped")}
 fn stage_summary(v:&Value)->Option<Value>{
     let stage=v["event"].as_str().filter(|s|diagnostic_stage(s))?;
     // Reconstruct, never forward the source object or its dynamic fields.
@@ -134,7 +136,7 @@ struct PairPin(String);
 impl Drop for PairPin{fn drop(&mut self){unsafe{crate::hicar::crypto::wipe(self.0.as_bytes_mut());}}}
 struct Owner{config:Config,store:Store,status:Status,life:Option<Process>,backend:Option<Process>,choice:Option<Choice>,
     life_started:Instant,life_retry_at:Instant,life_failures:u8,life_ready:bool,last_media_report:Option<Instant>,
-    started:Instant,ready:Option<Instant>,seen_media:bool,committed:bool,pair_deadline:Option<Instant>,repair_used:bool,
+    started:Instant,recovery_deadline:Option<Instant>,ready:Option<Instant>,seen_media:bool,committed:bool,pair_deadline:Option<Instant>,repair_used:bool,
     retry_at:Instant,tried:VecDeque<String>,last_auth:Option<Instant>,refusals:u8,mux:Option<crate::manager_menu::Mux>,menu_focus:usize,menu_pending:Option<Value>,menu_idle:bool,wireless_ready:bool,source_ready:bool,session_epoch:u64,pair_pin:Option<PairPin>}
 impl Owner{
     fn new(config:Config)->Result<Self>{
@@ -148,19 +150,24 @@ impl Owner{
         for d in config.devices.iter().filter(|_|!config.state.exists()){if !store.devices.iter().any(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address)){store.devices.push(d.clone());}}
         if store.devices.len()>8{return Err("too many configured devices".into());}
         let boot=fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|s|s.trim().to_owned());
-        if boot.is_some()&&store.boot_id!=boot{store.paused=false;store.boot_id=boot;}
-        let paused=store.paused;
-        Ok(Self{config,store,status:Status{schema:1,generation:0,protocol:None,target:None,active:false,pairing:false,paused,call_active:false,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,last_error:None,last_stage:None},
-            life:None,backend:None,choice:None,life_started:Instant::now(),life_retry_at:Instant::now(),life_failures:0,life_ready:false,last_media_report:None,started:Instant::now(),ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,wireless_ready:false,source_ready:false,session_epoch:0,pair_pin:None})
+        if boot.is_some()&&store.boot_id!=boot{store.paused=false;store.boot_id=boot;
+            store.selected_protocol=match store.boot_protocol{BootProtocol::Carplay=>Some(Protocol::Carplay),BootProtocol::Hicar=>Some(Protocol::Hicar),BootProtocol::Last=>store.selected_protocol.or(store.preferred.as_ref().or(store.last.as_ref()).map(|d|d.protocol))};
+        }
+        let paused=store.paused;let protocol=store.selected_protocol.or(store.preferred.as_ref().or(store.last.as_ref()).map(|d|d.protocol)).or(config.initial).unwrap_or(Protocol::Carplay);let default_protocol=store.boot_protocol;
+        Ok(Self{config,store,status:Status{schema:1,generation:0,default_protocol,protocol:Some(protocol),target:None,active:false,pairing:false,paused,call_active:false,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,last_error:None,last_stage:None},
+            life:None,backend:None,choice:None,life_started:Instant::now(),life_retry_at:Instant::now(),life_failures:0,life_ready:false,last_media_report:None,started:Instant::now(),recovery_deadline:None,ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,wireless_ready:false,source_ready:false,session_epoch:0,pair_pin:None})
     }
+    fn selected_protocol(&self)->Protocol{self.store.selected_protocol.or(self.status.protocol).or(self.store.preferred.as_ref().or(self.store.last.as_ref()).map(|d|d.protocol)).or(self.config.initial).unwrap_or(Protocol::Carplay)}
     fn automatic(&self)->Option<Choice>{
         if self.store.paused||self.store.policy==Policy::Manual{return None;}
-        if self.store.policy==Policy::Favorite {return self.store.favorite.as_ref().and_then(|d|self.store.devices.iter().find(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address))).filter(|d|d.auto&&!self.tried.contains(&d.address)).cloned().map(|d|Choice{protocol:d.protocol,device:Some(d),pairing:false});}
-        let eligible=|d:&&Device|d.auto&&!self.tried.contains(&d.address);
-        let device=self.store.preferred.as_ref().or(self.store.last.as_ref()).and_then(|d|self.store.devices.iter().find(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address))).filter(|d|d.auto&&!self.tried.contains(&d.address)).cloned()
+        let protocol=self.selected_protocol();
+        let eligible=|d:&&Device|d.protocol==protocol&&d.auto&&!self.tried.contains(&d.address);
+        let device=self.store.preferred.as_ref().or(self.store.last.as_ref()).and_then(|d|self.store.devices.iter().find(|v|v.protocol==protocol&&v.address.eq_ignore_ascii_case(&d.address))).filter(eligible).cloned()
             .or_else(||self.store.devices.iter().filter(eligible).max_by_key(|d|d.last_used).cloned());
-        device.map(|d|Choice{protocol:d.protocol,device:Some(d),pairing:false})
-            .or_else(||if self.store.devices.is_empty(){self.config.initial.map(|protocol|Choice{protocol,device:None,pairing:true})}else{None})
+        if let Some(device)=device{return Some(Choice{protocol,device:Some(device),pairing:false});}
+        // Never fall back to another protocol. Retry the current set instead.
+        if self.store.devices.iter().any(|d|d.protocol==protocol){return None;}
+        Some(Choice{protocol,device:None,pairing:true})
     }
     fn stop_backend(&mut self)->Result<()>{
         self.status.call_active=false;
@@ -193,11 +200,6 @@ impl Owner{
         self.stop_backend()?;self.session_epoch=0;self.status.generation=self.status.generation.checked_add(1).ok_or("generation exhausted")?;
         let mut args=if choice.protocol==Protocol::Carplay{self.config.carplay.clone()}else{self.config.hicar.clone()};
         if choice.pairing {args.extend(["--pair".into(),self.config.pair_seconds.to_string()]);}
-        if choice.protocol==Protocol::Carplay&&choice.pairing&&choice.device.is_none(){args.push("--new-device-only".into());}
-        if choice.protocol==Protocol::Hicar&&choice.pairing&&choice.device.is_none(){
-            for d in self.store.devices.iter().filter(|d|d.protocol==Protocol::Hicar){args.extend(["--exclude-peer".into(),d.address.clone()]);}
-        }
-
         if let Some(d)=&choice.device{args.extend([if choice.protocol==Protocol::Carplay{"--iphone".into()}else{"--peer".into()},d.address.clone()]);}
         if choice.protocol==Protocol::Hicar {
             let epoch=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_|"invalid system clock")?.as_secs();
@@ -205,9 +207,10 @@ impl Owner{
         }
         if choice.protocol==Protocol::Hicar{if let Some(path)=&self.config.source_socket{if let Some(i)=args.iter().position(|v|v=="--live-socket"){args[i+1]=path.to_string_lossy().into_owned();}}}
         let process=spawn(&args,self.status.generation,self.config.source_socket.as_deref())?;
+        self.store.selected_protocol=Some(choice.protocol);save(&self.config.state,&self.store)?;
         self.status.protocol=Some(choice.protocol);self.status.target=choice.device.clone();self.status.pairing=choice.pairing;
         self.status.backend_pid=Some(process.child.id());self.status.menu_visible=true;self.menu_idle=true;self.status.last_error=None;self.status.last_stage=None;self.backend=Some(process);self.choice=Some(choice.clone());
-        self.started=Instant::now();self.ready=None;self.seen_media=false;self.committed=false;self.repair_used=false;self.refusals=0;
+        self.started=Instant::now();self.recovery_deadline=None;self.ready=None;self.seen_media=false;self.committed=false;self.repair_used=false;self.refusals=0;
         self.pair_pin=pair_pin;self.pair_deadline=choice.pairing.then(||Instant::now()+Duration::from_secs(self.config.pair_seconds));event("manager_backend_started");Ok(())
     }
     fn read_pair_pin(&self)->Result<PairPin>{
@@ -219,7 +222,7 @@ impl Owner{
     }
     fn cancel_pairing(&mut self)->Result<()>{
         if !self.status.pairing{return Err("no pairing window is active".into());}
-        self.stop_backend()?;self.choice=None;self.status.protocol=None;self.status.target=None;
+        self.stop_backend()?;self.choice=None;self.status.protocol=Some(self.selected_protocol());self.status.target=None;
         self.status.pairing=false;self.pair_deadline=None;self.tried.clear();self.retry_at=Instant::now();
         self.show_recovery_menu();event("manager_pairing_cancelled");Ok(())
     }
@@ -238,11 +241,11 @@ impl Owner{
         if !success{return Err("Bluetooth control failed".into());}Ok(())
     }
     fn show_recovery_menu(&mut self){let explicit=self.status.menu_visible&&!self.menu_idle;self.status.menu_visible=true;self.menu_idle=!explicit;self.menu_pending=None;self.menu_focus=0;if let Some(mux)=&self.mux{let (rows,_)=self.menu_model();let _=mux.set_menu(rows,0,true);}}
-    fn source_lost(&mut self){self.status.call_active=false;self.wireless_ready=false;self.status.active=false;self.ready=None;self.seen_media=false;self.show_recovery_menu();self.started=Instant::now()-Duration::from_secs(self.config.connect_seconds.saturating_sub(8));}
+    fn source_lost(&mut self){self.recovery_deadline=Some(Instant::now()+Duration::from_secs(8));self.status.call_active=false;self.wireless_ready=false;self.status.active=false;self.ready=None;self.seen_media=false;self.show_recovery_menu();self.started=Instant::now()-Duration::from_secs((if self.status.protocol==Some(Protocol::Hicar){120}else{self.config.connect_seconds}).saturating_sub(8));}
     fn mark_active(&mut self)->Result<()>{
         if self.wireless_ready&&(self.mux.is_none()||self.source_ready){
             if !self.status.active {
-                self.ready=Some(Instant::now());self.status.active=true;self.status.last_error=None;
+                self.recovery_deadline=None;self.ready=Some(Instant::now());self.status.active=true;self.status.last_error=None;
                 if let Some(d)=self.status.target.as_ref().filter(|d|self.store.devices.iter().any(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address))){
                     self.store.preferred=Some(d.clone());save(&self.config.state,&self.store)?;
                 }
@@ -296,7 +299,7 @@ impl Owner{
             None=>false,
         };
         if ready {self.wireless_ready=true;self.mark_active()?;}
-        if self.status.protocol==Some(Protocol::Hicar)&&name=="bridge_stats"&&v["active"]==false&&self.status.active{self.source_lost();}
+        if self.status.protocol==Some(Protocol::Hicar)&&name=="bridge_stats"&&v["connected"]==false&&v["video_ended"]==true&&self.status.active{self.source_lost();}
         if name=="forward_latency"&&v["sent"].as_u64().unwrap_or(0)>0||name=="bridge_stats"&&v["connected"]==true&&v["video_frames"].as_u64().unwrap_or(0)>0{self.seen_media=true;}
         if name=="stage"&&v["stage"]=="ConnectingBluetooth"{
             if let Some(address)=v["address"].as_str().filter(|s|mac(s)){
@@ -308,7 +311,9 @@ impl Owner{
             }
         }
         if name=="target_selected"&&self.status.pairing&&self.status.protocol==Some(Protocol::Hicar){
-            if let Some(address)=v["address"].as_str().filter(|s|mac(s)){if self.status.target.is_none()&&!self.store.devices.iter().any(|d|d.protocol==Protocol::Hicar&&d.address.eq_ignore_ascii_case(address)){self.status.target=Some(Device{protocol:Protocol::Hicar,address:address.to_uppercase(),name:format!("Huawei · {}",&address[address.len()-5..].to_uppercase()),auto:true,last_used:0});}}
+            if let Some(address)=v["address"].as_str().filter(|s|mac(s)){if self.status.target.is_none(){
+                self.status.target=Some(self.store.devices.iter().find(|d|d.protocol==Protocol::Hicar&&d.address.eq_ignore_ascii_case(address)).cloned().unwrap_or(Device{protocol:Protocol::Hicar,address:address.to_uppercase(),name:format!("Huawei · {}",&address[address.len()-5..].to_uppercase()),auto:true,last_used:0}));
+            }}
         }
         if name=="hisight_closed" {self.wireless_ready=false;self.source_lost();}
         Ok(())
@@ -321,6 +326,16 @@ impl Owner{
             "remember"=>{let d:Device=serde_json::from_value(v["device"].clone()).map_err(|_|"invalid device record")?;d.validate()?;
                 self.store.devices.retain(|x|!(x.protocol==d.protocol&&x.address.eq_ignore_ascii_case(&d.address)));
                 if self.store.devices.len()>=8{return Err("device store is full".into());}self.store.devices.push(d);save(&self.config.state,&self.store)?;},
+            "switch_protocol"=>{
+                let protocol=if v.get("protocol").is_some(){serde_json::from_value(v["protocol"].clone()).map_err(|_|"invalid protocol")?}else{match self.selected_protocol(){Protocol::Carplay=>Protocol::Hicar,Protocol::Hicar=>Protocol::Carplay}};
+                if self.status.call_active{return Err("finish the active call before switching protocols".into());}
+                self.stop_backend()?;self.choice=None;self.store.selected_protocol=Some(protocol);self.status.protocol=Some(protocol);self.status.target=None;self.status.pairing=false;self.pair_deadline=None;self.tried.clear();self.store.paused=false;self.status.paused=false;self.store.policy=Policy::Last;save(&self.config.state,&self.store)?;
+                self.retry_at=Instant::now();self.show_recovery_menu();
+            },
+            "default_protocol"=>{let mode:BootProtocol=serde_json::from_value(v["mode"].clone()).map_err(|_|"invalid default protocol")?;self.store.boot_protocol=mode;self.status.default_protocol=mode;save(&self.config.state,&self.store)?;},
+            "connect_device"=>{self.store.paused=false;self.status.paused=false;self.store.policy=Policy::Last;self.tried.clear();save(&self.config.state,&self.store)?;
+                if !self.status.active{self.select(Choice{protocol:self.selected_protocol(),device:None,pairing:true})?;self.menu_idle=true;}
+            },
             "connect"=>{let address=v["address"].as_str().ok_or("missing target address")?;
                 let protocol:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing protocol")?;
                 let d=self.store.devices.iter().find(|d|d.protocol==protocol&&d.address.eq_ignore_ascii_case(address)).cloned().ok_or("unknown target device")?;
@@ -331,12 +346,13 @@ impl Owner{
             "cancel_pair"=>self.cancel_pairing()?,
             "policy"=>{let mode:Policy=serde_json::from_value(v["mode"].clone()).map_err(|_|"invalid connection policy")?;
                 if mode==Policy::Favorite{let p:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing favorite protocol")?;let a=v["address"].as_str().ok_or("missing favorite target")?;
+                    self.store.selected_protocol=Some(p);if self.backend.is_none(){self.status.protocol=Some(p);}
                     self.store.favorite=Some(self.store.devices.iter().find(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)).cloned().ok_or("unknown favorite target")?);}
                 self.store.policy=mode;save(&self.config.state,&self.store)?;},
             "forget"=>{if v["confirm"]!=true{return Err("forget requires explicit confirmation".into());}
                 let p:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing target protocol")?;let a=v["address"].as_str().ok_or("missing target")?;
                 if !self.store.devices.iter().any(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)){return Err("unknown target device".into());}
-                if self.status.target.as_ref().is_some_and(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)){self.stop_backend()?;self.choice=None;self.status.target=None;self.status.protocol=None;self.status.pairing=false;self.pair_deadline=None;}
+                if self.status.target.as_ref().is_some_and(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)){self.stop_backend()?;self.choice=None;self.status.target=None;self.status.protocol=Some(self.selected_protocol());self.status.pairing=false;self.pair_deadline=None;}
                 if !self.store.devices.iter().any(|d|d.protocol!=p&&d.address.eq_ignore_ascii_case(a)){self.bluetooth(&["--timeout","5","remove",a])?;}
                 self.store.devices.retain(|d|!(d.protocol==p&&d.address.eq_ignore_ascii_case(a)));
                 if self.store.last.as_ref().is_some_and(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)){self.store.last=None;}
@@ -344,7 +360,7 @@ impl Owner{
                 if self.store.favorite.as_ref().is_some_and(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)){self.store.favorite=None;}
                 self.store.paused=true;self.status.paused=true;save(&self.config.state,&self.store)?;},
             "repair"=>self.repair()?,
-            "disconnect"=>{self.stop_backend()?;self.choice=None;self.status.protocol=None;self.status.target=None;self.status.pairing=false;self.pair_deadline=None;
+            "disconnect"=>{self.stop_backend()?;self.choice=None;self.status.protocol=Some(self.selected_protocol());self.status.target=None;self.status.pairing=false;self.pair_deadline=None;
                 self.store.paused=true;self.status.paused=true;save(&self.config.state,&self.store)?;},
             "pause"=>{self.store.paused=true;self.status.paused=true;save(&self.config.state,&self.store)?;},
             "resume"=>{self.store.paused=false;self.status.paused=false;self.tried.clear();save(&self.config.state,&self.store)?;
@@ -353,21 +369,16 @@ impl Owner{
         }Ok(json!({"ok":true,"status":self.status}))
     }
     fn menu_model(&self)->(Vec<String>,Vec<Value>){
-        if let Some(v)=&self.menu_pending{return (vec!["确认停止当前投屏并继续".into(),"取消".into()],vec![v.clone(),json!({"op":"menu_cancel"})]);}
-        if self.status.pairing&&self.status.protocol==Some(Protocol::Hicar){if let Some(pin)=&self.pair_pin{
-            return (vec!["添加华为 HiCar".into(),format!("固定配对码：{}",pin.0),"手机上选择 CarLink 并输入配对码".into(),"取消添加".into()],
-                vec![json!({"op":"status"}),json!({"op":"status"}),json!({"op":"status"}),json!({"op":"cancel_pair"})]);
-        }}
-        let mut labels=vec![];let mut commands=vec![];
-        for d in &self.store.devices{labels.push(format!("{} · {}{}",d.name,if d.protocol==Protocol::Carplay{"CarPlay"}else{"HiCar"},if self.status.active&&self.status.target.as_ref().is_some_and(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address)){" · 已连接"}else{""}));commands.push(json!({"op":"connect","protocol":d.protocol,"address":d.address}));}
-        for (label,command) in [("添加 iPhone",json!({"op":"pair","protocol":"carplay"})),("添加华为 HiCar",json!({"op":"pair","protocol":"hicar"})),
-            ("自动连接：优先上次使用",json!({"op":"policy","mode":"last"})),("自动连接：每次选择",json!({"op":"policy","mode":"manual"})),
-            (if self.store.paused{"恢复自动连接"}else{"暂停自动连接"},json!({"op":if self.store.paused{"resume"}else{"pause"}})),
-            ("断开当前手机",json!({"op":"disconnect"})),("返回投屏",json!({"op":"menu","visible":false}))]{labels.push(label.into());commands.push(command);}
-        let state=if let Some(error)=&self.status.last_error{Some(format!("连接状态：{}",error.chars().filter(|c|!c.is_control()).take(96).collect::<String>()))}
-            else if self.status.pairing{Some("等待手机配对".into())}else if self.backend.is_some()&&!self.status.active{Some("正在连接".into())}else{None};
-        if let Some(state)=state{labels.push(state);commands.push(json!({"op":"status"}));}
-        (labels,commands)
+        let protocol=self.selected_protocol();let current=if protocol==Protocol::Carplay{"CarPlay"}else{"HiCar"};let other=if protocol==Protocol::Carplay{"HiCar"}else{"CarPlay"};
+        let first=format!("当前协议：{current}，点击切换到 {other}");
+        let (second,action)=if self.status.active{
+            (format!("断开 {}",self.status.target.as_ref().map(|d|d.name.as_str()).unwrap_or(current)),json!({"op":"disconnect"}))
+        }else if self.store.paused{("连接设备".into(),json!({"op":"connect_device"}))}
+        else if self.status.pairing{
+            (if let Some(pin)=&self.pair_pin{format!("配对中 · PIN：{}",pin.0)}else{"配对中".into()},json!({"op":"connect_device"}))
+        }else{("连接设备 · 正在自动重连".into(),json!({"op":"connect_device"}))};
+        let (label,next)=match self.store.boot_protocol{BootProtocol::Last=>("上一次选择","hicar"),BootProtocol::Hicar=>("华为 HiCar","carplay"),BootProtocol::Carplay=>("苹果 CarPlay","last")};
+        (vec![first,second,format!("默认协议：{label}")],vec![json!({"op":"switch_protocol"}),action,json!({"op":"default_protocol","mode":next})])
     }
     fn menu_input(&mut self,v:Value)->Result<()>{
         if v["type"]=="call-state"{self.status.call_active=v["active"]==true;return Ok(());}
@@ -383,7 +394,6 @@ impl Owner{
         if kind=="menu-select"{chosen=v["index"].as_u64().map(|n|n as usize);}
         if let Some(i)=chosen.filter(|i|*i<actions.len()){let action=actions[i].clone();match action["op"].as_str(){
             Some("menu_cancel")=>{self.menu_pending=None;self.menu_focus=0;},
-            Some("pair"|"disconnect") if self.menu_pending.is_none()&&self.status.active=>{self.menu_pending=Some(action);self.menu_focus=0;},
             _=>{self.menu_pending=None;self.menu_focus=0;let close=action["op"]=="connect";self.command(action)?;if close{self.status.menu_visible=true;self.menu_idle=true;}}
         }}Ok(())
     }
@@ -437,7 +447,7 @@ impl Owner{
         if self.pair_deadline.is_some_and(|t|Instant::now()>=t)&&!self.status.active{
             self.stop_backend()?;self.pair_deadline=None;self.status.pairing=false;self.choice=None;self.retry_at=Instant::now()+Duration::from_secs(8);
         }
-        if !self.status.active&&!self.status.pairing&&self.backend.is_some()&&self.started.elapsed()>Duration::from_secs(self.config.connect_seconds+if self.refusals>0{15}else{0}){
+        if !self.status.active&&!self.status.pairing&&self.backend.is_some()&&(if self.status.protocol==Some(Protocol::Hicar){self.recovery_deadline.is_some_and(|t|Instant::now()>=t)}else{self.started.elapsed()>Duration::from_secs(self.config.connect_seconds+if self.refusals>0{15}else{0})}){
             if let Some(d)=&self.status.target{self.tried.push_back(d.address.clone());}
             self.stop_backend()?;self.retry_at=Instant::now()+Duration::from_secs(2);
         }
@@ -532,11 +542,12 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
             owner.store.paused=paused;owner.status.paused=paused;owner.store.policy=policy;
             let device=Device{protocol:Protocol::Carplay,address:"02:00:00:00:00:01".into(),name:"saved phone".into(),auto:true,last_used:1};
             owner.store.devices.push(device.clone());owner.store.last=Some(device);
-            let (rows,actions)=owner.menu_model();assert_eq!(rows.len(),4);assert_eq!(rows[0],"添加华为 HiCar");assert_eq!(rows[1],"固定配对码：012345");assert_eq!(actions[3],json!({"op":"cancel_pair"}));
+            let (rows,actions)=owner.menu_model();assert_eq!(rows.len(),3);assert_eq!(actions.len(),3);
+            if !paused{assert!(rows[1].contains("012345"));}
             assert!(!serde_json::to_string(&owner.status).unwrap().contains("012345"));
             assert!(!owner.command(json!({"op":"status"})).unwrap().to_string().contains("012345"));
             assert!(!stage_summary(&json!({"event":"ready","pin":"012345"})).unwrap().to_string().contains("012345"));
-            owner.menu_input(json!({"type":"menu-select","index":3,"menu_rows":rows})).unwrap();
+            owner.command(json!({"op":"cancel_pair"})).unwrap();
             assert!(owner.pair_pin.is_none());assert!(!owner.status.pairing);assert!(owner.status.menu_visible);assert_eq!(owner.store.paused,paused);assert!(owner.store.policy==policy);assert_eq!(owner.store.devices.len(),1);
             assert_eq!(owner.automatic().is_some(),!paused&&policy==Policy::Last);assert_eq!(fs::read_to_string(&path).unwrap(),record);
             fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
@@ -657,7 +668,7 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
     #[test]fn inactive_hicar_and_previous_epoch_cannot_hide_recovery_menu(){
         let root=test_root("hicar-disconnect");let mut owner=test_owner(&root);owner.status.protocol=Some(Protocol::Hicar);
         owner.wireless_ready=true;owner.status.active=true;owner.status.menu_visible=false;
-        owner.ingest(0,json!({"event":"bridge_stats","active":false,"video_frames":90,"epoch_video_frames":0})).unwrap();
+        owner.ingest(0,json!({"event":"hisight_closed"})).unwrap();
         assert!(!owner.status.active&&!owner.wireless_ready&&owner.status.menu_visible);
         owner.ingest(0,json!({"event":"bridge_stats","active":true,"video_frames":90,"epoch_video_frames":0})).unwrap();
         assert!(!owner.status.active&&owner.status.menu_visible);
@@ -666,9 +677,36 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         owner.ingest(0,json!({"event":"bridge_stats","session_epoch":2,"active":true,"epoch_video_frames":1})).unwrap();
         owner.ingest(0,json!({"event":"hisight_closed","session_epoch":1})).unwrap();assert!(owner.status.active);
         owner.ingest(0,json!({"event":"manager_backend_stage","session_epoch":1,"stage":"control_peer_timeout"})).unwrap();assert!(owner.status.active);
-        owner.ingest(0,json!({"event":"bridge_stats","session_epoch":2,"active":false})).unwrap();assert!(!owner.status.active&&owner.status.menu_visible);
+        owner.ingest(0,json!({"event":"hisight_closed","session_epoch":2})).unwrap();assert!(!owner.status.active&&owner.status.menu_visible);
         owner.ingest(0,json!({"event":"bridge_stats","session_epoch":1,"active":true,"epoch_video_frames":9})).unwrap();assert!(!owner.status.active);
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn selection_remains_on_requested_protocol_when_phone_is_offline(){
+        let root=test_root("protocol-stickiness");let mut owner=test_owner(&root);
+        let apple=Device{protocol:Protocol::Carplay,address:"02:00:00:00:00:01".into(),name:"apple".into(),auto:true,last_used:200};
+        let huawei=Device{protocol:Protocol::Hicar,address:"02:00:00:00:00:02".into(),name:"huawei".into(),auto:true,last_used:100};
+        owner.store.devices=vec![apple.clone(),huawei.clone()];owner.store.last=Some(apple);
+        owner.store.selected_protocol=Some(Protocol::Hicar);owner.status.protocol=Some(Protocol::Hicar);
+        assert_eq!(owner.automatic().unwrap().protocol,Protocol::Hicar);owner.tried.push_back(huawei.address);
+        assert!(owner.automatic().is_none());owner.tried.clear();assert_eq!(owner.automatic().unwrap().protocol,Protocol::Hicar);
+        owner.command(json!({"op":"disconnect"})).unwrap();assert_eq!(owner.status.protocol,Some(Protocol::Hicar));assert!(owner.automatic().is_none());
+        owner.command(json!({"op":"default_protocol","mode":"carplay"})).unwrap();assert!(owner.store.boot_protocol==BootProtocol::Carplay);
+        let (rows,actions)=owner.menu_model();assert_eq!(rows.len(),3);assert_eq!(actions.len(),3);assert_eq!(actions[1]["op"],"connect_device");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn boot_default_overrides_only_on_actual_boot_and_keeps_last_selection_option(){
+        let root=test_root("boot-protocol");let mut owner=test_owner(&root);
+        owner.store.selected_protocol=Some(Protocol::Hicar);owner.store.boot_protocol=BootProtocol::Carplay;owner.store.boot_id=Some("previous-boot".into());save(&owner.config.state,&owner.store).unwrap();
+        let mut restarted=test_owner(&root);assert_eq!(restarted.status.protocol,Some(Protocol::Carplay));assert_eq!(restarted.automatic().unwrap().protocol,Protocol::Carplay);
+        restarted.store.selected_protocol=Some(Protocol::Hicar);save(&restarted.config.state,&restarted.store).unwrap();
+        let same_boot=test_owner(&root);assert_eq!(same_boot.status.protocol,Some(Protocol::Hicar));
+        restarted.store.boot_protocol=BootProtocol::Last;restarted.store.boot_id=Some("previous-boot".into());save(&restarted.config.state,&restarted.store).unwrap();
+        let last=test_owner(&root);assert_eq!(last.status.protocol,Some(Protocol::Hicar));fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn video_presentation_pause_does_not_end_authenticated_hicar_session(){
+        let root=test_root("presentation-pause");let mut owner=test_owner(&root);owner.status.protocol=Some(Protocol::Hicar);owner.wireless_ready=true;owner.status.active=true;owner.status.menu_visible=false;
+        owner.ingest(0,json!({"event":"bridge_stats","active":false,"connected":true,"video_frames":100})).unwrap();assert!(owner.status.active);assert!(!owner.status.menu_visible);
+        owner.ingest(0,json!({"event":"hisight_closed"})).unwrap();assert!(!owner.status.active);assert!(owner.status.menu_visible);fs::remove_dir_all(root).unwrap();
     }
     #[test]fn ordinary_offline_does_not_erase_pairing(){for s in ["Host is down","Connection timed out","No route to host","AirPlay session ended"]{assert!(!auth_mismatch(s));}assert!(auth_mismatch("org.bluez.Error.AuthenticationFailed"));}
     #[test]fn stale_generation_cannot_steal_active_backend(){

@@ -38,6 +38,8 @@ impl AudioServices{
         let ready=!self.speakers.is_empty();
         self.role=if self.microphones.contains_key("modemMic")||self.speakers.values().any(|m|*m){3}else{0};
         let mut commands=vec![];
+        if e["audio_ready"]==true&&e["port"].as_u64().is_some(){commands.push(json!({"op":"audio-service","service":service,"active":true,"port":e["port"]}));}
+        if e["audio_stopped"]==true&&was_ready{commands.push(json!({"op":"audio-service","service":service,"active":false}));}
         if old_mic!=new_mic{
             if let Some((name,_))=old_mic{commands.push(json!({"op":"microphone-stop","service":name}));}
             if let Some((name,v))=new_mic{commands.push(json!({"op":"microphone-start","service":name,"port":v["port"],"session":v["session"]}));}
@@ -59,7 +61,7 @@ impl AudioServices{
         s.apply(&mic("modemMic",42000));
         let commands=s.apply(&json!({"microphone_stopped":true,"service":"modemMic","modem":true}));
         assert_eq!(s.role,3);assert_eq!(commands,vec![json!({"op":"microphone-stop","service":"modemMic"})]);
-        assert!(s.apply(&json!({"audio_stopped":true,"service":"speaker1"})).is_empty());
+        assert_eq!(s.apply(&json!({"audio_stopped":true,"service":"speaker1"}))[0]["op"],"audio-service");
         assert_eq!(s.role,3);assert!(!s.speakers.is_empty());
         let commands=s.apply(&json!({"audio_stopped":true,"service":"modemSpeaker","modem":true}));
         assert!(commands.contains(&json!({"op":"audio-role","role":0})));
@@ -80,8 +82,8 @@ impl AudioServices{
         let mut s=AudioServices::default();s.apply(&ready("modemSpeaker",true));
         assert!(s.apply(&json!({"audio_setup_sent":true})).is_empty());
         assert!(s.apply(&ready("speaker1",false)).is_empty());assert_eq!(s.role,3);
-        assert!(s.apply(&json!({"audio_stopped":true})).is_empty());
-        assert_eq!(s.apply(&json!({"audio_stopped":true,"service":"modemSpeaker","modem":true})).len(),2);
+        assert_eq!(s.apply(&json!({"audio_stopped":true}))[0]["op"],"audio-service");
+        assert_eq!(s.apply(&json!({"audio_stopped":true,"service":"modemSpeaker","modem":true})).len(),3);
     }
 }
 fn mac(s:&str)->Result<String>{let p:Vec<_>=s.split(':').collect();if p.len()!=6||p.iter().any(|s|s.len()!=2||!s.bytes().all(|b|b.is_ascii_hexdigit())){return Err("invalid peer address".into());}Ok(s.to_ascii_uppercase())}
@@ -239,7 +241,7 @@ impl Owner{
         if self.media.is_some(){return Err("projection already active".into());}
         if self.config.test&&self.mock_media.is_none(){return Err("mock media descriptor already consumed".into());}
         let mut media=Rpc::new("media-worker",self.mock_media.take(),65536)?;let mut config=json!({"key":hex(&self.key),"local_ip":self.local,"peer_ip":self.peer_ip,"live_socket":self.config.live,"audio_binary":self.config.audio_binary});
-        let ready=media.call(&config);wipe_field(&mut config,"key");let ready=ready?;self.media=Some(media);self.video_set=false;self.clock_set=false;self.audio_services=AudioServices::default();Ok(ready)
+        let ready=media.call(&config);wipe_field(&mut config,"key");let ready=ready?;if !self.config.test{self.radio.call(json!({"op":"projection","active":true}),Duration::from_secs(1))?;}self.media=Some(media);self.video_set=false;self.clock_set=false;self.audio_services=AudioServices::default();Ok(ready)
     }
     fn media_call(&mut self,v:Value)->Result<Value>{self.media.as_mut().ok_or("media worker unavailable")?.call(&v)}
     fn auth_close(&mut self){if let Some(generation)=self.auth.take(){let _=self.worker.call(&json!({"op":"auth-close","generation":generation}));}self.authenticated=false;wipe(&mut self.key);self.key.clear();}
@@ -258,6 +260,7 @@ impl Owner{
                 self.channels.push(channel);event("rfcomm_connected",self.epoch);
             },
             Some("request-disconnection")=>{let stream=v["stream"].as_str();let device=v["device"].as_str();for c in &mut self.channels{if c.radio_stream.as_deref()==stream&&c.device.as_deref()==device{c.closing=true;}}},
+            Some("reconnect-result")=>event(if v["success"]==true{"bluetooth_reconnect_ready"}else{"bluetooth_reconnect_failed"},self.epoch),
             Some("stopped")=>return Err("radio registration ended".into()),
             // ACL disconnect also occurs during normal Wi-Fi handoff.
             Some("disconnected")=>{},_=>if packet.fd.is_some(){return Err("unexpected radio descriptor".into());},
@@ -352,7 +355,7 @@ impl Owner{
         // Flush RTSP TEARDOWN while its authenticated worker still exists.
         for c in &mut self.channels{if c.kind==Kind::Sight&&!c.closing{if let Ok(v)=self.worker.call(&json!({"op":"hisight-teardown","session":c.token})){if let Some(w)=v["teardown"].as_str(){if let Ok(w)=unhex(w){let _=c.enqueue(w);}}let _=pending(c,&v);}let until=Instant::now()+Duration::from_millis(150);while !c.output.is_empty()&&Instant::now()<until{let _=c.flush();std::thread::sleep(Duration::from_millis(2));}let _=self.worker.call(&json!({"op":"hisight-close","session":c.token}));c.closing=true;}}
         for c in &mut self.channels{if c.kind==Kind::Control&&!c.closing{if let Ok(v)=self.worker.call(&json!({"op":"dmsdp-stop-audio","session":c.token})){let _=pending(c,&v);let _=c.flush();}let _=self.worker.call(&json!({"op":"dmsdp-close","session":c.token}));c.closing=true;}}
-        if let Some(mut media)=self.media.take(){media.close();println!("{}",json!({"event":"bridge_stats","session_epoch":self.epoch,"active":false,"connected":false,"video_frames":0,"epoch_video_frames":0}));event("hisight_closed",self.epoch);}
+        if let Some(mut media)=self.media.take(){media.close();if !self.config.test{let _=self.radio.call(json!({"op":"projection","active":false}),Duration::from_secs(1));}println!("{}",json!({"event":"bridge_stats","session_epoch":self.epoch,"active":false,"connected":false,"video_frames":0,"epoch_video_frames":0}));event("hisight_closed",self.epoch);}
         self.video_set=false;self.clock_set=false;self.audio_services=AudioServices::default();self.closing=false;
     }
     fn run(&mut self)->Result<()>{let started=Instant::now();loop{

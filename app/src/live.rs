@@ -50,7 +50,7 @@ pub struct LiveSource {
     input: Vec<u8>, output: VecDeque<Vec<u8>>, output_offset: usize,
     queue: VecDeque<Frame>, queued: usize,
     active: bool, configured: bool, playing: bool, audio_ready:bool, waiting_key: bool,
-    audio_active: [bool; 4], audio_pending: VecDeque<Message>, voice:crate::voice::Voice,
+    music_resumed:bool, audio_active: [bool; 4], audio_pending: VecDeque<Message>, voice:crate::voice::Voice,
     base_pts: Option<u64>, origin_ms: u32, last_ms: u32, stamps: [u32;5], generation: u64,
     report_at:Instant, video_dropped:u64, age_max_us:u64, audio_generation:u64, keyframe_at:Option<Instant>,call_media:bool,
 }
@@ -63,7 +63,7 @@ impl LiveSource {
             std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600)).map_err(|e|e.to_string())?;
             listener.set_nonblocking(true).map_err(|e|e.to_string())?;
             Ok(Self {listener,peer:None,path:path.into(),input:Vec::new(),output:VecDeque::new(),output_offset:0,queue:VecDeque::new(),queued:0,
-                active:false,configured:false,playing:false,audio_ready:false,waiting_key:true,audio_active:[false;4],audio_pending:VecDeque::new(),voice:crate::voice::Voice::default(),base_pts:None,origin_ms:0,last_ms:0,stamps:[0;5],generation:0,report_at:Instant::now(),video_dropped:0,age_max_us:0,audio_generation:0,keyframe_at:None,call_media:std::env::var("CARLINK_CALL_AUDIO_LANE").as_deref()==Ok("media")})
+                active:false,configured:false,playing:false,audio_ready:false,waiting_key:true,music_resumed:false,audio_active:[false;4],audio_pending:VecDeque::new(),voice:crate::voice::Voice::default(),base_pts:None,origin_ms:0,last_ms:0,stamps:[0;5],generation:0,report_at:Instant::now(),video_dropped:0,age_max_us:0,audio_generation:0,keyframe_at:None,call_media:std::env::var("CARLINK_CALL_AUDIO_LANE").as_deref()==Ok("media")})
         }
     }
     pub fn generation(&self)->[u64;2] { [self.generation,self.audio_generation] }
@@ -71,9 +71,27 @@ impl LiveSource {
     pub fn microphone(&mut self,message:&Message){
         if !self.active || !self.configured || !self.audio_ready{return;}
         if let Some(wire)=self.voice.pcm(message){
-            if self.output.len()>=32{self.disconnect();return;}
+            // Microphone PCM is disposable under downstream backpressure. Keep
+            // the partially transmitted frame and all input/control messages.
+            // At most 120 ms of complete microphone blocks, independent
+            // from the control-message queue budget.
+            while self.output.iter().filter(|p|p.get(4)==Some(&130)).count()>=6 {
+                if !self.discard_microphone(){return;}
+            }
+            if !self.make_output_room(){return;}
             self.output.push_back(wire);
         }
+    }
+    pub fn take_music_resume(&mut self)->bool{std::mem::take(&mut self.music_resumed)}
+    fn discard_microphone(&mut self)->bool {
+        let start=usize::from(self.output_offset>0);
+        if let Some(index)=self.output.iter().enumerate().skip(start)
+            .find_map(|(i,packet)|(packet.get(4)==Some(&130)).then_some(i)) {
+            self.output.remove(index);true
+        }else{false}
+    }
+    fn make_output_room(&mut self)->bool {
+        self.output.len()<32||self.discard_microphone()
     }
     pub fn clock_floor(&mut self, ms:u32) {if self.base_pts.is_none(){self.origin_ms=self.last_ms.max(ms);}}
     pub fn heartbeat(&mut self, ms:u32)->u32 {self.stamps[0]=self.stamps[0].max(ms);self.last_ms=self.last_ms.max(ms);self.stamps[0]}
@@ -84,11 +102,11 @@ impl LiveSource {
         }
         // A slow consumer must not grow controls without bound. Dropping the
         // connection resets touch state at the receiver on reconnect.
-        if self.output.len()>=32 { self.disconnect(); return; }
+        if !self.make_output_room() { self.disconnect(); return; }
         self.output.push_back(wire(json));
     }
     pub fn reset(&mut self) {
-        self.voice.stop();
+        self.voice.stop();self.music_resumed=false;
         self.queue.clear(); self.queued=0; self.audio_pending.clear(); self.base_pts=None; self.origin_ms=self.last_ms; self.waiting_key=true; self.generation=self.generation.wrapping_add(1);
         self.audio_generation=self.audio_generation.wrapping_add(1);
         self.stop_audio(); self.feedback("{\"type\":\"keyframe\",\"screen\":0}");
@@ -144,6 +162,7 @@ impl LiveSource {
             },
             4 => { let active=f.flags==1; if active!=self.active {self.active=active;self.reset();} },
             5 => {
+                if f.flags==0&&f.payload[0]==1{self.music_resumed=true;}
                 if self.voice.call&&f.flags==2{return Ok(());}
                 if f.flags==3&&f.payload[0]==1&&!self.voice.call{
                     self.audio_generation=self.audio_generation.wrapping_add(1);
@@ -186,12 +205,22 @@ impl LiveSource {
         Ok(())
     }
     pub fn poll_io(&mut self)->Result<(),String> {
+        // A failed local producer must not tear down the independent USB
+        // CarLife session. Reset this IPC peer and accept its replacement.
+        if let Err(error)=self.poll_io_inner(){
+            self.disconnect();
+            crate::runtime::log("live_ingress_rejected",&error);
+        }
+        Ok(())
+    }
+    fn poll_io_inner(&mut self)->Result<(),String> {
         #[cfg(unix)] {
             if self.peer.is_none() { match self.listener.accept() { Ok((peer,_))=>{peer.set_nonblocking(true).map_err(|e|e.to_string())?;self.peer=Some(peer);self.feedback("{\"type\":\"keyframe\",\"screen\":0}");}, Err(e) if e.kind()==io::ErrorKind::WouldBlock=>return Ok(()), Err(e)=>return Err(e.to_string()) } }
             // Budget protects command handling from a continuously writing producer.
             for _ in 0..16 {
                 let mut bytes=[0u8;16384];
-                match self.peer.as_mut().unwrap().read(&mut bytes) {
+                let Some(peer)=self.peer.as_mut()else{return Ok(());};
+                match peer.read(&mut bytes) {
                     Ok(0)=>{self.disconnect();return Ok(());},
                     Ok(n)=>{self.input.extend_from_slice(&bytes[..n]);if self.input.len()>MAX_FRAME+4 {self.disconnect();return Err("live receive buffer exceeded".into());}},
                     Err(e) if e.kind()==io::ErrorKind::WouldBlock=>break,
@@ -207,7 +236,8 @@ impl LiveSource {
             }
             for _ in 0..16 {
                 let Some(data)=self.output.front() else{break;};
-                match self.peer.as_mut().unwrap().write(&data[self.output_offset..]) {
+                let Some(peer)=self.peer.as_mut()else{return Ok(());};
+                match peer.write(&data[self.output_offset..]) {
                     Ok(0)=>{self.disconnect();break;}, Ok(n)=>{self.output_offset+=n;if self.output_offset==data.len(){self.output.pop_front();self.output_offset=0;}},
                     Err(e) if e.kind()==io::ErrorKind::WouldBlock=>break,
                     Err(e) if e.kind()==io::ErrorKind::Interrupted=>continue,
@@ -391,4 +421,21 @@ fn varint(bytes:&[u8],pos:&mut usize)->Result<u64,String>{let mut out=0u64;for s
   assert!(s.audio_pending.is_empty());
  }
 
+ #[test]#[cfg(unix)]fn microphone_pressure_preserves_partial_frame_and_session(){
+  let mut s=source();s.active=true;s.configured=true;s.audio_ready=true;s.voice.microphone(1,true);
+  s.output.clear();s.output.push_back(vec![1,2,3]);s.output_offset=1;
+  for _ in 0..31 {let mut packet=vec![0;25];packet[4]=130;s.output.push_back(packet);}
+  let message=Message{channel:Channel::Vr,id:0x58001,timestamp_ms:Some(1),reserved:0,payload:vec![1;640]};
+  for _ in 0..100{s.microphone(&message);}
+  s.feedback(r#"{"type":"key-press","code":1}"#);
+  assert!(s.active);assert!(s.output.len()<=8);assert_eq!(s.output.front().unwrap(),&vec![1,2,3]);assert_eq!(s.output_offset,1);
+ }
+ #[test]#[cfg(unix)]fn malformed_local_source_does_not_fail_usb_poll(){
+  use std::os::unix::net::UnixStream;
+  let mut s=source();let mut peer=UnixStream::connect(&s.path).unwrap();
+  peer.write_all(&[1,0,0,0,0]).unwrap();
+  assert!(s.poll_io().is_ok());assert!(s.peer.is_none());
+  let _replacement=UnixStream::connect(&s.path).unwrap();
+  assert!(s.poll_io().is_ok());assert!(s.peer.is_some());
+ }
 }

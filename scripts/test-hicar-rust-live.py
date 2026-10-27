@@ -253,6 +253,33 @@ while True:
             assert rpc(ipc, dict(op='status'))['state']['audio_streams'] == 2
             assert status['input_events'] == 6
             assert status['epoch_video_frames'] == 3
+            # A route can restart sequence zero on the same SSRC. Its fresh
+            # session must not wait for the old route's sequence to catch up.
+            call_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            call_udp.bind(('127.0.0.1', 0))
+            try:
+                rpc(ipc, dict(op='audio-service', service='speaker1', active=True, port=udp.getsockname()[1]))
+                before_route = rpc(ipc, dict(op='status'))['state']['audio_frames']
+                udp.sendto(audio_packet(cipher, 0), ('127.0.0.1', audio_port))
+                until_frame(live, 3)
+                assert rpc(ipc, dict(op='status'))['state']['audio_frames'] == before_route+1
+                rpc(ipc, dict(op='audio-service', service='modemSpeaker', active=True, port=call_udp.getsockname()[1]))
+                rpc(ipc, dict(op='audio-role', role=3))
+                rpc(ipc, dict(op='audio-ready'))
+                during_call = rpc(ipc, dict(op='status'))['state']['audio_frames']
+                udp.sendto(audio_packet(cipher, 1), ('127.0.0.1', audio_port))
+                call_udp.sendto(audio_packet(cipher, 0), ('127.0.0.1', audio_port))
+                until_frame(live, 3, lambda f: f[1] == 3)
+                assert rpc(ipc, dict(op='status'))['state']['audio_frames'] == during_call+1
+                rpc(ipc, dict(op='audio-role', role=0))
+                rpc(ipc, dict(op='audio-ready'))
+                udp.sendto(audio_packet(cipher, 0), ('127.0.0.1', audio_port))
+                until_frame(live, 3, lambda f: f[1] == 0)
+                assert rpc(ipc, dict(op='status'))['state']['audio_frames'] == during_call+2
+                rpc(ipc, dict(op='audio-service', service='modemSpeaker', active=False))
+                rpc(ipc, dict(op='audio-service', service='speaker1', active=False))
+            finally:
+                call_udp.close()
             # Datagram framing and selected source checks reject unexpected
             # senders independently of the connected TCP control session.
             udp.sendto(b'\xab\0\0wrong', ('127.0.0.1', audio_port))
@@ -335,14 +362,22 @@ while True:
                 assert request['active'] and request['sample_rate'] == 16000
                 payload = struct.pack('<Q', request['generation']) + bytes(640)
                 packet = struct.pack('<IBBHQ', 12+len(payload),130,0,0,0)+payload
+                capture_before = time.monotonic_ns() // 1000
                 live.sendall(packet + packet)
+                origin = None
                 for sequence in range(2):
                     encrypted, _ = microphone_peer.recvfrom(1500)
                     assert encrypted[0] == 0xab and int.from_bytes(encrypted[1:3],'big') == len(encrypted)-3
                     rtp = cipher.decrypt(encrypted[3:])
                     assert rtp[:2] == b'\x80\x60' and int.from_bytes(rtp[8:12],'big') == 7
                     assert int.from_bytes(rtp[2:4],'big') == sequence
-                    assert int.from_bytes(rtp[4:8],'big') == sequence * 1920
+                    stamp = int.from_bytes(rtp[4:8], 'big')
+                    if origin is None:
+                        origin = stamp
+                        lower = capture_before * 90000 // 1000000 & 0xffffffff
+                        upper = time.monotonic_ns() // 1000 * 90000 // 1000000 & 0xffffffff
+                        assert (stamp-lower) & 0xffffffff <= (upper-lower) & 0xffffffff
+                    assert (stamp-origin) & 0xffffffff == sequence * 1920
                     assert rtp[12:16] == bytes([255,241,76,128])  # AAC-LC, 48k stereo
                 rpc(ipc, dict(op='microphone-stop'))
                 assert not json.loads(until_frame(live,7)[3])['active']

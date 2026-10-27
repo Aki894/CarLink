@@ -38,7 +38,7 @@ impl Speaker{
     fn new()->Self{Self::named("speaker1",3)}
     fn named(name:&'static str,kind:u8)->Self{Self{name,kind,remote:None,ports:None,session:None,sequence:0,setup:None,format:None,ready:false,mic_phase:MicPhase::Idle,retired:VecDeque::new()}}
     fn microphone(&self)->bool{matches!(self.kind,2|9)}
-    fn notify(&self,name:&str)->Value{let mut v=json!({});v[format!("{}_{}",if self.microphone(){"microphone"}else{"audio"},name)]=true.into();if self.name!="speaker1"{v["service"]=self.name.into();v["modem"]=(self.kind>=9).into();if let Some(p)=self.remote{v["port"]=p.into();}if let Some(id)=self.session{v["session"]=id.into();}}v}
+    fn notify(&self,name:&str)->Value{let mut v=json!({});v[format!("{}_{}",if self.microphone(){"microphone"}else{"audio"},name)]=true.into();v["service"]=self.name.into();v["modem"]=(self.kind>=9).into();if let Some(p)=self.remote{v["port"]=p.into();}if let Some(id)=self.session{v["session"]=id.into();}v}
     fn request(&mut self,method:&str,extra:&[(&str,String)])->Result<Vec<u8>>{
         self.sequence=self.sequence.checked_add(1).filter(|n|*n<=999999999).ok_or("speaker sequence exhausted")?;
         let mut fields=vec![("ServiceID",self.name.into()),("ServiceType",self.kind.to_string()),("DataSessionID",self.session.ok_or("no speaker session")?.to_string()),("CSeq",self.sequence.to_string())];fields.extend_from_slice(extra);

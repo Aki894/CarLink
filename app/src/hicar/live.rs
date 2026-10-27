@@ -39,7 +39,7 @@ impl Link{
     fn new(path:PathBuf)->Self{Self{path,socket:None,input:vec![],queue:VecDeque::new(),size:0,retry:Instant::now(),wait_key:true,established:false,active:false,audio:false,audio_role:0,microphone:None,mic_pcm:VecDeque::new(),sent:0,dropped:0,reconnects:0}}
     fn clear(&mut self){self.queue.clear();self.size=0;self.wait_key=true;}
     fn push(&mut self,kind:u8,flags:u8,data:&[u8],pts:u64){let wire=live(kind,flags,data,pts);if self.queue.len()>=128||self.size+wire.len()>MAX_QUEUE{self.disconnect();}self.size+=wire.len();self.queue.push_back(Queued{kind,wire,offset:0,at:Instant::now()});}
-    fn prune(&mut self,kind:u8){if self.queue.iter().any(|v|v.kind==kind&&v.offset>0){self.disconnect();return;}self.queue.retain(|v|v.kind!=kind);self.size=self.queue.iter().map(|v|v.wire.len()-v.offset).sum();}
+    fn prune(&mut self,kind:u8){self.queue.retain(|v|v.kind!=kind||v.offset>0);self.size=self.queue.iter().map(|v|v.wire.len()-v.offset).sum();}
     fn recover(&mut self){
         // A partially written record cannot be removed without corrupting the
         // stream. Reconnect rather than dropping its unsent suffix.
@@ -68,9 +68,13 @@ impl Link{
         for _ in 0..16{
             let Some(item)=self.queue.front_mut()else{break;};
             if matches!(item.kind,2|3)&&item.at.elapsed()>Duration::from_millis(120){
-                if item.offset>0{broken=true;break;}
+                if item.offset>0{
+                    // The peer already owns the frame prefix. Finish this one
+                    // frame; expiry only removes records not yet written.
+                    if item.at.elapsed()>Duration::from_secs(2){broken=true;break;}
+                }else{
                 let video=item.kind==2;self.size-=item.wire.len();self.queue.pop_front();self.dropped+=1;
-                if video{recover=true;break;}continue;
+                if video{recover=true;break;}continue;}
             }
             match socket.write(&item.wire[item.offset..]){
                 Ok(0)=>{broken=true;break;},Ok(n)=>{item.offset+=n;self.size-=n;if item.offset==item.wire.len(){self.queue.pop_front();self.sent+=1;}else{break;}},
@@ -87,8 +91,8 @@ impl Link{
             if !(12..=16404).contains(&n){broken=true;break;}if self.input.len()<n+4{break;}
             if self.input[4..8]==[130,0,0,0]{
                 let payload=&self.input[16..n+4];
-                if !(10..=16392).contains(&payload.len())||payload.len()%2!=0||self.mic_pcm.len()>=6{broken=true;break;}
-                let generation=u64::from_le_bytes(payload[..8].try_into().unwrap());self.mic_pcm.push_back((generation,payload[8..].to_vec()));self.input.drain(..n+4);continue;
+                if !(10..=16392).contains(&payload.len())||payload.len()%2!=0{broken=true;break;}
+                let generation=u64::from_le_bytes(payload[..8].try_into().unwrap());if self.mic_pcm.len()>=6{self.mic_pcm.pop_front();self.dropped+=1;}self.mic_pcm.push_back((generation,payload[8..].to_vec()));self.input.drain(..n+4);continue;
             }
             if n>4096{broken=true;break;}
             if self.input[4..8]!=[129,0,0,0]{broken=true;break;}
@@ -101,7 +105,7 @@ impl Link{
 }
 
 struct AudioPacket{data:Vec<u8>,offset:usize,at:Instant}
-struct Decoder{child:Child,input:ChildStdin,output:ChildStdout,queue:VecDeque<AudioPacket>,pcm:Vec<u8>,origin:u64,samples:u64,rate:u32,channels:u8}
+struct Decoder{child:Child,input:ChildStdin,output:ChildStdout,queue:VecDeque<AudioPacket>,pcm:Vec<u8>,origin:u64,samples:u64,submitted_us:u64,rate:u32,channels:u8}
 impl Drop for Decoder{fn drop(&mut self){let _=self.child.kill();let _=self.child.wait();}}
 impl Decoder{
     fn new(binary:&Path,rate:u32,channels:u8,pts:u64)->Result<Self>{
@@ -109,9 +113,12 @@ impl Decoder{
         let mut child=Command::new(binary).args(["-hide_banner","-loglevel","error","-nostdin","-threads","1","-probesize","32","-analyzeduration","0","-f","aac","-i","pipe:0","-vn","-threads","1","-ac","2","-ar","44100","-c:a","pcm_s16le","-f","s16le","-flush_packets","1","pipe:1"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|_|"cannot start native AAC decoder")?;
         let input=child.stdin.take().ok_or("missing decoder input")?;let output=child.stdout.take().ok_or("missing decoder output")?;
         if nonblocking(input.as_raw_fd()).is_err()||nonblocking(output.as_raw_fd()).is_err(){let _=child.kill();let _=child.wait();return Err("cannot configure decoder IO".into());}
-        Ok(Self{child,input,output,queue:VecDeque::new(),pcm:vec![],origin:pts,samples:0,rate,channels})
+        Ok(Self{child,input,output,queue:VecDeque::new(),pcm:vec![],origin:pts,samples:0,submitted_us:0,rate,channels})
     }
-    fn feed(&mut self,data:Vec<u8>)->Result<()>{if self.queue.len()>=16||data.len()>65536{return Err("decoder backpressure".into());}self.queue.push_back(AudioPacket{data,offset:0,at:Instant::now()});Ok(())}
+    fn feed(&mut self,data:Vec<u8>,samples:u32)->Result<()>{
+        let submitted=self.submitted_us+samples as u64*1_000_000/self.rate as u64;
+        if self.queue.len()>=16||data.len()>65536||submitted.saturating_sub(self.samples*1_000_000/44100)>250_000{return Err("decoder latency budget exceeded".into());}
+        self.submitted_us=submitted;self.queue.push_back(AudioPacket{data,offset:0,at:Instant::now()});Ok(())}
     fn step(&mut self)->Result<()>{
         if self.child.try_wait().map_err(|_|"decoder status failed")?.is_some(){return Err("decoder exited".into());}
         for _ in 0..4{
@@ -182,7 +189,7 @@ struct Engine{
     key:Vec<u8>,crypto:Crypto,local:Ipv4Addr,peer:Ipv4Addr,audio_binary:PathBuf,udp:UdpSocket,link:Link,
     video:Option<TcpStream>,video_bytes:Vec<u8>,video_decoder:media::Video,video_open:bool,video_ended:bool,
     input:Option<TcpStream>,input_port:Option<u16>,input_queue:VecDeque<InputPacket>,contact:Option<(u16,u16)>,keys:BTreeSet<String>,input_next:Instant,input_start:Instant,
-    audio:media::Audio,audio_ready:bool,audio_generation:u64,decoders:BTreeMap<u32,Decoder>,playout:AudioPlayout,parameters:[Option<Vec<u8>>;2],
+    audio_ports:BTreeMap<String,u16>,audio:media::Audio,audio_ready:bool,audio_generation:u64,decoders:BTreeMap<u32,Decoder>,playout:AudioPlayout,parameters:[Option<Vec<u8>>;2],
     clock:Option<Clock>,clock_offset:Option<i64>,clock_updated:Option<u64>,clock_rtt:Option<i64>,video_frames:u64,epoch_video_frames:u64,key_frames:u64,input_events:u64,audio_frames:u64,pcm_blocks:u64,invalid:u64,audio_resets:u64,
 }
 impl Drop for Engine{fn drop(&mut self){self.stop_video();self.decoders.clear();self.link.session(false);let until=Instant::now()+Duration::from_millis(100);while !self.link.queue.is_empty()&&Instant::now()<until{let _=self.link.step();std::thread::sleep(Duration::from_millis(2));}wipe(&mut self.key);}}
@@ -196,7 +203,7 @@ impl Engine{
         let mut key=unhex(string(config,"key")?)?;if !matches!(key.len(),16|32){wipe(&mut key);return Err("invalid authenticated media key".into());}
         if let Some(Value::String(text))=config.get_mut("key"){unsafe{wipe(text.as_bytes_mut());}}
         if key.len()>16{wipe(&mut key[16..]);key.truncate(16);}
-        Ok(Self{uplink:None,mic_generation:0,mic_packets:0,mic_service:None,key,crypto,local,peer,audio_binary,udp,link:Link::new(source),video:None,video_bytes:vec![],video_decoder:media::Video::new(),video_open:false,video_ended:false,input:None,input_port:None,input_queue:VecDeque::new(),contact:None,keys:BTreeSet::new(),input_next:Instant::now(),input_start:Instant::now(),audio:media::Audio::new(),audio_ready:false,audio_generation:0,decoders:BTreeMap::new(),playout:AudioPlayout::default(),parameters:[None,None],clock:None,clock_offset:None,clock_updated:None,clock_rtt:None,video_frames:0,epoch_video_frames:0,key_frames:0,input_events:0,audio_frames:0,pcm_blocks:0,invalid:0,audio_resets:0})
+        Ok(Self{uplink:None,mic_generation:0,mic_packets:0,mic_service:None,key,crypto,local,peer,audio_binary,udp,link:Link::new(source),video:None,video_bytes:vec![],video_decoder:media::Video::new(),video_open:false,video_ended:false,input:None,input_port:None,input_queue:VecDeque::new(),contact:None,keys:BTreeSet::new(),input_next:Instant::now(),input_start:Instant::now(),audio_ports:BTreeMap::new(),audio:media::Audio::new(),audio_ready:false,audio_generation:0,decoders:BTreeMap::new(),playout:AudioPlayout::default(),parameters:[None,None],clock:None,clock_offset:None,clock_updated:None,clock_rtt:None,video_frames:0,epoch_video_frames:0,key_frames:0,input_events:0,audio_frames:0,pcm_blocks:0,invalid:0,audio_resets:0})
     }
     fn state(&self)->Value{json!({"active":self.link.active&&self.link.socket.is_some()&&self.link.established,"connected":self.link.socket.is_some(),"waiting_key":self.link.wait_key,"video_open":self.video_open,"video_ended":self.video_ended,"input_connected":self.input.is_some(),"video_frames":self.video_frames,"epoch_video_frames":self.epoch_video_frames,"key_frames":self.key_frames,"audio_frames":self.audio_frames,"pcm_blocks":self.pcm_blocks,"input_events":self.input_events,"audio_generation":self.audio_generation,"audio_ready":self.audio_ready,"audio_packets":self.audio.packets,"audio_lost":self.audio.lost,"audio_duplicates":self.audio.duplicates,"rejected":self.invalid,"audio_resets":self.audio_resets,"audio_underruns":self.playout.underruns,"mix_late":self.playout.late,"pcm_queued_blocks":self.decoders.values().map(|d|d.pcm.len()/PCM).sum::<usize>(),"pending":self.link.queue.len(),"pending_bytes":self.link.size,"sent":self.link.sent,"dropped":self.link.dropped,"reconnects":self.link.reconnects,"clock_offset_us":self.clock_offset,"clock_updated_us":self.clock_updated,"clock_rtt_us":self.clock_rtt,"microphone_active":self.uplink.is_some(),"microphone_packets":self.mic_packets,"audio_streams":self.decoders.len(),"call_active":self.link.audio_role==3&&(self.audio_ready||self.mic_service.as_deref()==Some("modemMic"))})}
     fn stop_audio(&mut self){self.audio_ready=false;self.decoders.clear();self.playout.reset();self.link.audio(false);}
@@ -211,7 +218,16 @@ impl Engine{
             self.uplink=Some(super::super::uplink::Uplink::new(&self.audio_binary,self.mic_generation,remote,stream)?);self.mic_service=Some(service.into());self.link.microphone(self.mic_generation,true);
         },
         "microphone-stop"=>{if v["service"].is_null()||v["service"].as_str()==self.mic_service.as_deref(){self.stop_microphone();}},
-        "audio-role"=>{let role=v["role"].as_u64().filter(|n|*n==0||*n==3).ok_or("invalid call audio role")? as u8;if self.link.audio_role!=role{self.stop_audio();self.link.audio_role=role;if role==3{self.link.audio(true);}}},
+        "audio-service"=>{
+            let service=string(v,"service")?;if !matches!(service,"speaker1"|"modemSpeaker"){return Err("invalid audio service".into());}
+            let active=v["active"].as_bool().ok_or("invalid audio service state")?;
+            if active{self.audio_ports.insert(service.into(),port(v,"port")?);}else{self.audio_ports.remove(service);}
+            // A new DMSDP stream may restart sequence numbers on the same SSRC.
+            // Flush that audio epoch instead of rejecting fresh audio as a replay
+            // until its sequence catches up with the previous route.
+            if (service=="modemSpeaker")== (self.link.audio_role==3){self.decoders.clear();self.playout.reset();self.audio=media::Audio::new();self.link.prune(3);}
+        },
+        "audio-role"=>{let role=v["role"].as_u64().filter(|n|*n==0||*n==3).ok_or("invalid call audio role")? as u8;if self.link.audio_role!=role{self.stop_audio();self.audio=media::Audio::new();self.link.audio_role=role;if role==3{self.link.audio(true);}}},
         "set-video"=>{
             if self.video.is_some(){return Err("video transport already open".into());}
             let video=connect(self.local,self.peer,port(v,"media_port")?,Duration::from_secs(2))?;
@@ -253,6 +269,10 @@ impl Engine{
         let mut bytes=[0u8;65536];for _ in 0..16{
             let (n,peer)=match self.udp.recv_from(&mut bytes){Ok(v)=>v,Err(e)if e.kind()==ErrorKind::WouldBlock=>break,Err(_)=>break};
             if peer.ip()!=std::net::IpAddr::V4(self.peer)||!self.audio_ready{continue;}
+            // DMSDP advertises each sender UDP port. During a call, discard
+            // normal music/navigation datagrams before decoding, and vice versa.
+            // Keep fallback compatibility for senders that choose another port.
+            if !audio_port_allowed(&self.audio_ports,self.link.audio_role,peer.port()){continue;}
             if n<20||bytes[0]!=0xab||u16::from_be_bytes([bytes[1],bytes[2]]) as usize!=n-3{self.invalid+=1;continue;}
             let decoded=match decrypt(&self.crypto,&self.key,&bytes[3..n]){Ok(v)=>v,Err(_)=>{self.invalid+=1;continue;}};
             let frames=match self.audio.receive(&decoded){Ok(v)=>v,Err(_)=>{self.invalid+=1;continue;}};
@@ -267,7 +287,7 @@ impl Engine{
                     if self.decoders.len()>=4{self.invalid+=1;continue;}
                     match Decoder::new(&self.audio_binary,format.0,format.1,pts){Ok(d)=>{let first=self.decoders.is_empty();self.decoders.insert(id,d);if first{self.link.audio(true);self.playout.reset();}},Err(_)=>{self.invalid+=1;continue;}}
                 }
-                if self.decoders.get_mut(&id).is_some_and(|d|d.feed(frame.aac.data).is_err()){self.reset_decoder(id);}self.audio_frames+=1;
+                if self.decoders.get_mut(&id).is_some_and(|d|d.feed(frame.aac.data,frame.aac.samples).is_err()){self.reset_decoder(id);}self.audio_frames+=1;
             }
         }
     }
@@ -331,6 +351,27 @@ impl Engine{
         for d in self.decoders.values().filter(|d|d.pcm.len()<6*PCM){fds.push(libc::pollfd{fd:d.output.as_raw_fd(),events:libc::POLLIN,revents:0});}fds
     }
 }
+fn audio_port_allowed(ports:&BTreeMap<String,u16>,role:u8,port:u16)->bool{
+    let normal=ports.get("speaker1").copied();let call=ports.get("modemSpeaker").copied();
+    if normal==call{return true;} // Some receivers multiplex both services.
+    if role==3{normal!=Some(port)}else{call!=Some(port)}
+}
+#[test]fn service_ports_isolate_call_and_media_without_unknown_port_lockout(){
+    let ports=BTreeMap::from([("speaker1".into(),1000),("modemSpeaker".into(),2000)]);
+    assert!(!audio_port_allowed(&ports,3,1000));assert!(audio_port_allowed(&ports,3,2000));
+    assert!(audio_port_allowed(&ports,0,1000));assert!(!audio_port_allowed(&ports,0,2000));assert!(audio_port_allowed(&ports,0,3000));
+}
+#[test]fn pruning_audio_keeps_partial_record_without_disconnecting_the_source(){
+    let mut link=Link::new(PathBuf::from("/unused"));let (a,_b)=UnixStream::pair().unwrap();link.socket=Some(a);link.active=true;link.established=true;
+    link.push(3,0,&[0;32],1);link.queue.front_mut().unwrap().offset=4;link.size-=4;link.push(3,0,&[0;32],2);link.audio(false);
+    assert!(link.socket.is_some());assert!(link.established);assert_eq!(link.queue.len(),2);assert_eq!(link.queue[0].offset,4);assert_eq!(link.queue[1].kind,5);
+}
+#[test]fn microphone_burst_drops_old_complete_blocks_without_resetting_projection(){
+    let mut link=Link::new(PathBuf::from("/unused"));let (a,mut b)=UnixStream::pair().unwrap();a.set_nonblocking(true).unwrap();link.socket=Some(a);link.active=true;link.established=true;
+    let mut packets=vec![];for i in 0..10u64{let mut pcm=i.to_le_bytes().to_vec();pcm.extend([0;640]);packets.extend(live(130,0,&pcm,0));}b.write_all(&packets).unwrap();link.step();
+    assert!(link.socket.is_some());assert!(link.established);assert_eq!(link.mic_pcm.len(),6);assert_eq!(link.mic_pcm.front().unwrap().0,4);assert_eq!(link.dropped,4);
+}
+
 fn mix_pcm<'a>(blocks:impl Iterator<Item=&'a [u8]>)->Vec<u8>{let mut mixed=vec![0i32;PCM/2];for block in blocks{for (sample,data) in mixed.iter_mut().zip(block.chunks_exact(2)){*sample+=i16::from_le_bytes([data[0],data[1]])as i32;}}mixed.into_iter().flat_map(|sample|(sample.clamp(i16::MIN as i32,i16::MAX as i32)as i16).to_le_bytes()).collect()}
 #[test]fn pcm_mixer_saturates_without_changing_sample_layout(){let a=[30000i16.to_le_bytes(),(-30000i16).to_le_bytes()].concat();let output=mix_pcm([a.as_slice(),a.as_slice()].into_iter());assert_eq!(output.len(),PCM);assert_eq!(&output[..4],&[i16::MAX.to_le_bytes(),i16::MIN.to_le_bytes()].concat());}
 #[test]fn playout_clock_has_no_scheduler_drift_or_pcm_overwrite(){

@@ -157,6 +157,13 @@ impl Drop for Bus{fn drop(&mut self){unsafe{(self.api.connection_close)(self.con
 impl Bus{
     fn open()->Result<Self>{let api=Api::load()?;let connection=unsafe{(api.bus_get)(1,ptr::null_mut())};if connection.is_null(){return Err("cannot connect system D-Bus".into());}unsafe{(api.exit_on_disconnect)(connection,0);(api.max_message)(connection,262144);(api.max_received)(connection,1048576);}Ok(Self{api,connection,bluez:String::new(),nm:String::new()})}
     fn send(&self,m:Msg)->Result<u32>{let mut serial=0;if unsafe{(self.api.send)(self.connection,m,&mut serial)}==0{return Err("D-Bus send failed".into());}unsafe{(self.api.flush)(self.connection);}Ok(serial)}
+    fn connect_peer(&self,object:&str)->Result<u32>{
+        // Queue the ACL/profile wake-up without blocking the radio dispatcher.
+        // Profile1.NewConnection and Agent callbacks must still be serviced.
+        let d=cstring("org.bluez")?;let o=cstring(object)?;let i=cstring("org.bluez.Device1")?;let n=cstring("Connect")?;
+        let raw=unsafe{(self.api.new_call)(d.as_ptr(),o.as_ptr(),i.as_ptr(),n.as_ptr())};if raw.is_null(){return Err("D-Bus allocation failed".into());}
+        let m=Message{api:&self.api,raw};self.send(m.raw)
+    }
     fn reply(&self,request:Msg,values:Vec<Arg>)->Result<()>{let raw=unsafe{(self.api.new_return)(request)};if raw.is_null(){return Err("D-Bus allocation failed".into());}let m=Message{api:&self.api,raw};let mut iter=Iter::new();unsafe{(self.api.iter_append)(raw,&mut iter);}for a in &values{append(&self.api,&mut iter,a)?;}self.send(m.raw)?;Ok(())}
     fn reject(&self,request:Msg,name:&str)->Result<()>{let name=cstring(name)?;let detail=cstring("request rejected")?;let raw=unsafe{(self.api.new_error)(request,name.as_ptr(),detail.as_ptr())};if raw.is_null(){return Err("D-Bus allocation failed".into());}let m=Message{api:&self.api,raw};self.send(m.raw)?;Ok(())}
     fn call(&mut self,state:&mut State,ipc:&mut Ipc,destination:&str,object:&str,interface:&str,member:&str,values:Vec<Arg>,timeout:Duration)->Result<Vec<Arg>>{
@@ -203,11 +210,14 @@ impl Ipc{
     }
 }
 
-struct State{selection:Selection,payload:Vec<u8>,power:i16,instance:u8,stopped:bool,closing:bool,slots:BTreeSet<(String,String)>,origin:Instant}
+struct State{selection:Selection,payload:Vec<u8>,power:i16,instance:u8,stopped:bool,closing:bool,slots:BTreeSet<(String,String)>,origin:Instant,pending_connect:Option<(u32,Instant)>}
 impl State{
     fn properties(&self)->Arg{dict(vec![("Type",text("peripheral")),("Discoverable",Arg::Bool(true)),("LocalName",text("CarLink")),("TxPower",Arg::I16(self.power)),("Instance",Arg::Byte(self.instance)),("ServiceData",dict(vec![(FDEE,Arg::Array("y".into(),self.payload.iter().copied().map(Arg::Byte).collect()))]))])}
     fn handle(&mut self,bus:&mut Bus,ipc:&mut Ipc,m:Msg)->Result<()>{
         let kind=unsafe{(bus.api.message_type)(m)};let sender=unsafe{ctext((bus.api.sender)(m))};let object=unsafe{ctext((bus.api.path)(m))};let interface=unsafe{ctext((bus.api.interface)(m))};let member=unsafe{ctext((bus.api.member)(m))};
+        if matches!(kind,2|3)&&sender==bus.bluez&&self.pending_connect.as_ref().is_some_and(|(serial,_)|unsafe{(bus.api.reply_serial)(m)}==*serial){
+            self.pending_connect=None;let _=ipc.send(&json!({"event":"reconnect-result","success":kind==2}),None);return Ok(());
+        }
         if kind==4&&sender=="org.freedesktop.DBus"&&interface=="org.freedesktop.DBus"&&member=="NameOwnerChanged"{
             let a=args(&bus.api,m)?;if let (Some(name),Some(new))=(a.first().and_then(Arg::text),a.get(2).and_then(Arg::text)){
                 if name=="org.bluez"&&new!=bus.bluez||name=="org.freedesktop.NetworkManager"&&!bus.nm.is_empty()&&new!=bus.nm{self.stopped=true;}
@@ -258,7 +268,7 @@ impl State{
 }
 
 #[derive(Serialize)]struct Offer{ssid:String,bssid:String,password:String,owner_ip:&'static str,client_ip:&'static str,frequency:u32,port:u16}
-struct Radio{bus:Bus,state:State,ipc:Ipc,c:Config,device:Option<String>,connection:Option<String>,previous:Option<String>,offer:Option<Offer>,agent:bool,profile:bool,business:bool,advertisement:bool,restore_connectable:bool,restore_bondable:bool,activated:bool,startup_cancelled:bool,startup_close_id:Option<Value>}
+struct Radio{bus:Bus,state:State,ipc:Ipc,c:Config,device:Option<String>,connection:Option<String>,previous:Option<String>,offer:Option<Offer>,agent:bool,profile:bool,business:bool,advertisement:bool,restore_connectable:bool,restore_bondable:bool,activated:bool,startup_cancelled:bool,startup_close_id:Option<Value>,reconnect_at:Instant,reconnect_attempts:u8,projection_active:bool}
 impl Radio{
     fn call(&mut self,d:&str,p:&str,i:&str,m:&str,a:Vec<Arg>,timeout:Duration)->Result<Vec<Arg>>{self.bus.call(&mut self.state,&mut self.ipc,d,p,i,m,a,timeout)}
     fn bluez(&mut self,p:&str,i:&str,m:&str,a:Vec<Arg>)->Result<Vec<Arg>>{self.call("org.bluez",p,i,m,a,Duration::from_secs(5))}
@@ -339,6 +349,18 @@ impl Radio{
         }
         let p=self.c.adapter.clone();self.bluez(&p,"org.bluez.LEAdvertisingManager1","RegisterAdvertisement",vec![path(&format!("{ROOT}/advertisement")),dict(vec![])])?;self.advertisement=true;self.activated=true;Ok(())
     }
+    fn reconnect(&mut self)->Result<()>{
+        if !self.activated||self.projection_active||self.state.closing||!self.state.slots.is_empty()||Instant::now()<self.reconnect_at{return Ok(());}
+        let Some(peer)=self.state.selection.selected.clone()else{return Ok(());};
+        // BlueZ may keep Connect pending while paging an absent phone. Never
+        // queue parallel Connect requests or block Profile1/Agent dispatch.
+        if let Some((_,since))=self.state.pending_connect{if since.elapsed()<Duration::from_secs(45){return Ok(());}self.state.pending_connect=None;}
+        self.reconnect_attempts=self.reconnect_attempts.saturating_add(1);
+        // A retained phone is paged immediately, then at a bounded cadence.
+        // Discovery remains active; an offline phone never tears down the AP.
+        self.reconnect_at=Instant::now()+Duration::from_secs(match self.reconnect_attempts{1=>3,2=>5,_=>10});
+        let serial=self.bus.connect_peer(&peer)?;self.state.pending_connect=Some((serial,Instant::now()));Ok(())
+    }
     fn index(&self)->Result<u16>{self.c.adapter.rsplit("hci").next().ok_or("invalid adapter")?.parse().map_err(|_|"invalid adapter index".into())}
     fn setting(&self,opcode:u16,mask:u32,enabled:bool,timeout:Duration)->Result<()>{let result=mgmt(self.index()?,opcode,&[u8::from(enabled)],timeout)?;if result.len()<4||(u32::from_le_bytes(result[..4].try_into().unwrap())&mask!=0)!=enabled{return Err("controller setting not applied".into());}Ok(())}
     fn cleanup(&mut self){self.state.closing=true;
@@ -366,8 +388,8 @@ pub fn run(fd:i32)->Result<()>{
     let mut ipc=Ipc::new(fd)?;unsafe{libc::signal(libc::SIGTERM,libc::SIG_IGN);}
     let until=Instant::now()+Duration::from_secs(15);let config=loop{if let Some(v)=ipc.receive()?{break v;}if Instant::now()>until{return Err("missing private radio configuration".into());}std::thread::sleep(Duration::from_millis(10));};
     let c:Config=serde_json::from_value(config.clone()).map_err(|_|"invalid radio configuration")?;validate(&c)?;
-    let state=State{selection:Selection::new(&c)?,payload:beacon(&c.model,c.sequence)?,power:c.tx_power,instance:0,stopped:false,closing:false,slots:BTreeSet::new(),origin:Instant::now()};
-    let bus=Bus::open()?;let mut radio=Radio{bus,state,ipc,c,device:None,connection:None,previous:None,offer:None,agent:false,profile:false,business:false,advertisement:false,restore_connectable:false,restore_bondable:false,activated:false,startup_cancelled:false,startup_close_id:None};
+    let state=State{selection:Selection::new(&c)?,payload:beacon(&c.model,c.sequence)?,power:c.tx_power,instance:0,stopped:false,closing:false,slots:BTreeSet::new(),origin:Instant::now(),pending_connect:None};
+    let bus=Bus::open()?;let mut radio=Radio{bus,state,ipc,c,device:None,connection:None,previous:None,offer:None,agent:false,profile:false,business:false,advertisement:false,restore_connectable:false,restore_bondable:false,activated:false,startup_cancelled:false,startup_close_id:None,reconnect_at:Instant::now(),reconnect_attempts:0,projection_active:false};
     let result=(||{
         let address=radio.prepare()?;radio.ipc.send(&json!({"id":config.get("id"),"ok":true,"ready":true,"address":address,"offer":radio.offer}),None)?;
         loop{
@@ -375,13 +397,14 @@ pub fn run(fd:i32)->Result<()>{
                 let reply:Result<Value>=match op{
                     "activate"=>radio.activate().map(|_|json!({"active":true})),
                     "release"=>{let stream=v["stream"].as_str().ok_or("missing stream")?;let device=v["device"].as_str().ok_or("missing device")?;radio.state.slots.remove(&(stream.into(),device.into()));Ok(json!({}))},
+                    "projection"=>{radio.projection_active=v["active"].as_bool().ok_or("projection active flag required")?;if !radio.projection_active{radio.reconnect_at=Instant::now();radio.reconnect_attempts=0;}Ok(json!({}))},
                     "status"=>Ok(json!({"active":radio.activated,"streams":radio.state.slots.len()})),
                     "close"=>{radio.cleanup();let _=radio.ipc.send(&json!({"id":v.get("id"),"ok":true,"closed":true}),None);break;},
                     _=>Err("unknown radio operation".into()),
                 };
                 match reply{Ok(mut value)=>{value["ok"]=true.into();value["id"]=v.get("id").cloned().unwrap_or(Value::Null);radio.ipc.send(&value,None)?;},Err(error)=>{radio.ipc.send(&json!({"id":v.get("id"),"ok":false,"error":error}),None)?;if op=="activate"{return Err("radio activation failed".into());}}}
             }
-            radio.bus.poll(&mut radio.state,&mut radio.ipc)?;if radio.state.stopped{let _=radio.ipc.send(&json!({"event":"stopped"}),None);break;}
+            radio.bus.poll(&mut radio.state,&mut radio.ipc)?;radio.reconnect()?;if radio.state.stopped{let _=radio.ipc.send(&json!({"event":"stopped"}),None);break;}
             let mut busfd=0;unsafe{(radio.bus.api.get_fd)(radio.bus.connection,&mut busfd);}
             let mut fds=[libc::pollfd{fd:radio.ipc.fd.as_raw_fd(),events:libc::POLLIN,revents:0},libc::pollfd{fd:busfd,events:libc::POLLIN,revents:0}];unsafe{libc::poll(fds.as_mut_ptr(),2,50);}
         }Ok(())

@@ -129,12 +129,12 @@ fn keyframe()->Frame{feedback(json!({"type":"keyframe","screen":0}))}
 fn menu_frame(payload:Vec<u8>)->Frame{let mut clock=libc::timespec{tv_sec:0,tv_nsec:0};let ok=unsafe{libc::clock_gettime(libc::CLOCK_MONOTONIC,&mut clock)}==0;
     Frame{kind:2,flags:if ok{3}else{1},pts:if ok{clock.tv_sec as u64*1_000_000+clock.tv_nsec as u64/1000}else{0},payload}}
 struct Pending {data:Vec<u8>,offset:usize,kind:u8,queued_at:Instant}
-struct Pipe {socket:UnixStream,input:Vec<u8>,output:VecDeque<Pending>,queued:usize}
+struct Pipe {socket:UnixStream,input:Vec<u8>,output:VecDeque<Pending>,queued:usize,stalled_since:Option<Instant>}
 impl Pipe {
     fn new(socket:UnixStream)->Result<Self>{socket.set_nonblocking(true).map_err(|_|"mux socket setup failed")?;
         let bytes:libc::c_int=32768;let size=std::mem::size_of_val(&bytes)as libc::socklen_t;
         if unsafe{libc::setsockopt(socket.as_raw_fd(),libc::SOL_SOCKET,libc::SO_SNDBUF,&bytes as *const _ as *const c_void,size)}!=0{return Err("mux send buffer setup failed".into());}
-        Ok(Self{socket,input:vec![],output:VecDeque::new(),queued:0})}
+        Ok(Self{socket,input:vec![],output:VecDeque::new(),queued:0,stalled_since:None})}
     fn push(&mut self,frame:Frame)->Result<()>{let data=frame.wire();if self.queued+data.len()>MAX_QUEUE || self.output.len()>=96{return Err("mux peer is too slow".into());}self.queued+=data.len();self.output.push_back(Pending{data,offset:0,kind:frame.kind,queued_at:Instant::now()});Ok(())}
     fn discard_media(&mut self){self.output.retain(|p|p.offset>0);self.queued=self.output.iter().map(|p|p.data.len()-p.offset).sum();}
     fn discard_video(&mut self){self.output.retain(|p|p.kind!=2 || p.offset>0);self.queued=self.output.iter().map(|p|p.data.len()-p.offset).sum();}
@@ -165,13 +165,20 @@ impl Pipe {
         }
         for _ in 0..16 {
             let Some(p)=self.output.front_mut()else{break};
-            // Never cut a written frame. A peer stalled in the middle of one
-            // is disconnected, so recovery starts with a new framed stream.
-            if p.queued_at.elapsed()>Duration::from_millis(300){return Err("mux write stalled".into());}
+            // Drop stale PCM before writing any header. Queue residence is not
+            // a transport failure: only a socket making no progress is stalled.
+            if p.kind==3&&p.offset==0&&p.queued_at.elapsed()>Duration::from_millis(80){
+                self.queued-=p.data.len();self.output.pop_front();continue;
+            }
             match self.socket.write(&p.data[p.offset..]){
-                Ok(0)=>return Err("mux write disconnected".into()),Ok(n)=>{p.offset+=n;self.queued-=n;if p.offset==p.data.len(){self.output.pop_front();}},
-                Err(e) if e.kind()==ErrorKind::WouldBlock=>break,Err(e) if e.kind()==ErrorKind::Interrupted=>continue,Err(_)=>return Err("mux write failed".into())}
-        }Ok(result)
+                Ok(0)=>return Err("mux write disconnected".into()),Ok(n)=>{self.stalled_since=None;p.offset+=n;self.queued-=n;if p.offset==p.data.len(){self.output.pop_front();}},
+                Err(e) if e.kind()==ErrorKind::WouldBlock=>{
+                    let since=self.stalled_since.get_or_insert_with(Instant::now);
+                    if since.elapsed()>Duration::from_millis(300){return Err("mux write stalled".into());}break;
+                },Err(e) if e.kind()==ErrorKind::Interrupted=>continue,Err(_)=>return Err("mux write failed".into())}
+        }
+        if self.output.is_empty(){self.stalled_since=None;}
+        Ok(result)
     }
 }
 fn valid(f:&Frame,reverse:bool)->bool{
@@ -230,7 +237,15 @@ impl Worker {
         if f.kind==5&&f.flags==3{let _=self.events.try_send(json!({"type":"call-state","active":f.payload[0]==1}));}
         match f.kind {
         1=>{if !self.snapshot.visible {self.output(f);}},
-        4=>{self.source_active=f.flags==1;self.source_key=None;let _=self.events.try_send(json!({"type":"source-state","active":self.source_active}));self.waiting_key=true;if !self.source_active{self.stop_source_media();}else if !self.snapshot.visible {self.output(f);}},
+        4=>{
+            // Presentation pauses occur when HiCar replaces a surface (app,
+            // navigation or call UI). They do not end its wireless session.
+            let presenting=f.flags==1;let _=self.events.try_send(json!({"type":"presentation-state","active":presenting}));
+            if presenting&&!self.source_active{self.source_active=true;self.source_key=None;self.waiting_key=true;
+                let _=self.events.try_send(json!({"type":"source-state","active":true}));
+                if !self.snapshot.visible{self.output(f);}
+            }
+        },
         6=>{self.waiting_key=true;self.source_key=None;if !self.snapshot.visible {self.output(f);}},
         2=>{self.source_key=if self.source_active&&f.flags&1==1{Some(f.clone())}else{None};if !self.snapshot.visible && self.source_active {
             if self.waiting_key && f.flags&1==0{return;}
@@ -253,6 +268,9 @@ impl Worker {
     fn input(&mut self,f:Frame){
         if f.kind==130{self.source(f);return;}
         let Ok(v)=serde_json::from_slice::<Value>(&f.payload)else{return;};
+        if matches!(v["type"].as_str(),Some("key-press"|"key"))&&v["code"].as_u64().is_some_and(|code|(7..=12).contains(&code)){
+            self.flush_backs();self.source(f);return;
+        }
         if !self.snapshot.visible {
             let now=Instant::now();if self.back_expired(now){self.flush_backs();}
             if matches!(v["type"].as_str(),Some("key-press"|"key"))&&v["code"].as_u64()==Some(1){
@@ -352,6 +370,38 @@ fn touch_row(x:f64,y:f64,focus:usize,count:usize)->Option<usize>{
         assert_eq!(serde_json::from_slice::<Value>(&stop.data[16..]).unwrap()["active"],false);
         drop(w);fs::remove_dir_all(root).unwrap();
     }
+    #[test]fn presentation_pause_preserves_audio_capture_and_session_until_transport_closes(){
+        let root=std::env::temp_dir().join(format!("carlink-presentation-{}",std::process::id()));fs::create_dir(&root).unwrap();
+        let listener=UnixListener::bind(root.join("source")).unwrap();let(tx,rx)=mpsc::sync_channel(32);
+        let mut w=Worker::new(listener,root.join("live"),Arc::new(Mutex::new(View::default())),Arc::new(AtomicBool::new(false)),tx,Arc::new(Mutex::new(None)));
+        let(socket,_peer)=UnixStream::pair().unwrap();w.hu=Some(Pipe::new(socket).unwrap());
+        w.incoming(Frame::new(4,1,vec![]));w.incoming(Frame::new(5,3,vec![1]));
+        w.incoming(Frame::new(7,0,json!({"generation":1,"active":true,"sample_rate":16000,"channels":1}).to_string().into_bytes()));
+        while rx.try_recv().is_ok(){}let queued=w.hu.as_ref().unwrap().output.len();
+        w.incoming(Frame::new(4,0,vec![]));
+        assert!(w.source_active);assert!(w.audio_roles[3]);assert!(w.microphone.is_some());
+        assert_eq!(w.hu.as_ref().unwrap().output.len(),queued);
+        assert_eq!(rx.try_recv().unwrap(),json!({"type":"presentation-state","active":false}));assert!(rx.try_recv().is_err());
+        w.lose_source();assert!(!w.source_active);assert!(w.microphone.is_none());
+        assert_eq!(rx.try_recv().unwrap(),json!({"type":"source-state","active":false}));
+        drop(w);fs::remove_file(root.join("source")).unwrap();fs::remove_dir(root).unwrap();
+    }
+    #[test]fn stale_pcm_is_dropped_without_dropping_durable_control_or_restarting_socket(){
+        let(socket,mut peer)=UnixStream::pair().unwrap();let mut p=Pipe::new(socket).unwrap();
+        p.push(Frame::new(3,0,vec![0;128])).unwrap();p.output.back_mut().unwrap().queued_at=Instant::now()-Duration::from_secs(1);
+        p.push(Frame::new(5,3,vec![1])).unwrap();p.output.back_mut().unwrap().queued_at=Instant::now()-Duration::from_secs(1);
+        p.pump(false).unwrap();assert!(p.output.is_empty());assert_eq!(p.queued,0);
+        let received=recv(&mut peer);assert_eq!(received.kind,5);assert_eq!(received.flags,3);assert_eq!(received.payload,vec![1]);
+    }
+    #[test]fn menu_keeps_voice_media_and_phone_buttons_on_active_source(){
+        let root=std::env::temp_dir().join(format!("carlink-menu-keys-{}",std::process::id()));fs::create_dir(&root).unwrap();
+        let listener=UnixListener::bind(root.join("source")).unwrap();let(tx,rx)=mpsc::sync_channel(32);
+        let mut w=Worker::new(listener,root.join("live"),Arc::new(Mutex::new(View::default())),Arc::new(AtomicBool::new(false)),tx,Arc::new(Mutex::new(None)));
+        let(socket,_peer)=UnixStream::pair().unwrap();w.source=Some(Pipe::new(socket).unwrap());w.snapshot.visible=true;
+        for code in 7..=12{w.input(feedback(json!({"type":"key-press","code":code})));}
+        assert_eq!(w.source.as_ref().unwrap().output.len(),6);assert!(rx.try_recv().is_err());
+        drop(w);fs::remove_file(root.join("source")).unwrap();fs::remove_dir(root).unwrap();
+    }
     #[test]fn static_key_replays_only_while_it_is_latest_source_picture(){
         let root=std::env::temp_dir().join(format!("carlink-static-key-{}",std::process::id()));fs::create_dir(&root).unwrap();
         let listener=UnixListener::bind(root.join("source")).unwrap();let(tx,_rx)=mpsc::sync_channel(32);
@@ -361,7 +411,7 @@ fn touch_row(x:f64,y:f64,focus:usize,count:usize)->Option<usize>{
         assert!(!w.waiting_key);assert_eq!(w.hu.as_ref().unwrap().output.len(),1);
         w.incoming(Frame::new(2,0,vec![4]));assert!(w.source_key.is_none());
         w.incoming(Frame::new(2,1,vec![5]));w.incoming(Frame::new(6,0,vec![]));assert!(w.source_key.is_none());
-        w.incoming(Frame::new(2,1,vec![6]));w.incoming(Frame::new(4,0,vec![]));assert!(w.source_key.is_none());
+        w.incoming(Frame::new(2,1,vec![6]));w.incoming(Frame::new(4,0,vec![]));assert!(w.source_key.is_some());assert!(w.source_active);
         drop(w);fs::remove_dir_all(root).unwrap();
     }
     #[test]fn touch_maps_visible_scroll_rows(){assert_eq!(touch_row(0.5,0.2,0,3),Some(0));assert_eq!(touch_row(0.5,0.2,8,15),Some(2));assert_eq!(touch_row(0.01,0.2,0,3),None);assert_eq!(touch_row(0.5,0.95,0,3),None);}
@@ -397,8 +447,9 @@ fn touch_row(x:f64,y:f64,focus:usize,count:usize)->Option<usize>{
         p.output.front_mut().unwrap().offset=3;p.queued-=3;p.trim_audio();
         assert_eq!(p.output.len(),6);assert_eq!(p.output.front().unwrap().offset,3);
         p.output.front_mut().unwrap().queued_at=Instant::now()-Duration::from_millis(301);
-        assert!(p.pump(false).is_err());
         p.discard_media();assert_eq!(p.output.len(),1);assert_eq!(p.output.front().unwrap().offset,3);
+        // Old creation time does not terminate a socket which can still write.
+        assert!(p.pump(false).is_ok());assert!(p.output.is_empty());
     }
     #[test]fn full_output_accept_queue_never_blocks_connect(){
         let path=std::env::temp_dir().join(format!("carlink-menu-full-{}",std::process::id()));let server=UnixListener::bind(&path).unwrap();assert_eq!(unsafe{libc::listen(server.as_raw_fd(),1)},0);let start=Instant::now();let mut held=vec![];let mut full=false;
