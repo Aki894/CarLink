@@ -160,9 +160,9 @@ impl Bus{
     fn connect_peer(&self,object:&str)->Result<u32>{
         // Queue the ACL/profile wake-up without blocking the radio dispatcher.
         // Profile1.NewConnection and Agent callbacks must still be serviced.
-        let d=cstring("org.bluez")?;let o=cstring(object)?;let i=cstring("org.bluez.Device1")?;let n=cstring("Connect")?;
+        let d=cstring("org.bluez")?;let o=cstring(object)?;let i=cstring("org.bluez.Device1")?;let n=cstring("ConnectProfile")?;
         let raw=unsafe{(self.api.new_call)(d.as_ptr(),o.as_ptr(),i.as_ptr(),n.as_ptr())};if raw.is_null(){return Err("D-Bus allocation failed".into());}
-        let m=Message{api:&self.api,raw};self.send(m.raw)
+        let m=Message{api:&self.api,raw};let mut iter=Iter::new();unsafe{(self.api.iter_append)(raw,&mut iter);}append(&self.api,&mut iter,&text(FE35))?;self.send(m.raw)
     }
     fn reply(&self,request:Msg,values:Vec<Arg>)->Result<()>{let raw=unsafe{(self.api.new_return)(request)};if raw.is_null(){return Err("D-Bus allocation failed".into());}let m=Message{api:&self.api,raw};let mut iter=Iter::new();unsafe{(self.api.iter_append)(raw,&mut iter);}for a in &values{append(&self.api,&mut iter,a)?;}self.send(m.raw)?;Ok(())}
     fn reject(&self,request:Msg,name:&str)->Result<()>{let name=cstring(name)?;let detail=cstring("request rejected")?;let raw=unsafe{(self.api.new_error)(request,name.as_ptr(),detail.as_ptr())};if raw.is_null(){return Err("D-Bus allocation failed".into());}let m=Message{api:&self.api,raw};self.send(m.raw)?;Ok(())}
@@ -259,7 +259,7 @@ impl State{
                 if unsafe{libc::getpeername(fd.as_raw_fd(),&mut remote as *mut _ as *mut libc::sockaddr,&mut size)}!=0{return bus.reject(m,"org.bluez.Error.Rejected");}
                 if !self.selection.allows(device,true,self.origin.elapsed().as_millis() as u64){return bus.reject(m,"org.bluez.Error.Rejected");}
                 let address=self.selection.address(device).ok_or("invalid selected peer")?;
-                if ipc.send(&json!({"event":"rfcomm","stream":stream,"device":device,"address":address}),Some(fd.as_raw_fd())).is_err(){return bus.reject(m,"org.bluez.Error.Rejected");}
+                if ipc.send(&json!({"event":"rfcomm","stream":stream,"device":device,"address":address,"initiator":stream=="control"&&self.pending_connect.is_some()}),Some(fd.as_raw_fd())).is_err(){return bus.reject(m,"org.bluez.Error.Rejected");}
                 self.slots.insert(slot);return bus.reply(m,vec![]);
             }
         }
@@ -268,7 +268,7 @@ impl State{
 }
 
 #[derive(Serialize)]struct Offer{ssid:String,bssid:String,password:String,owner_ip:&'static str,client_ip:&'static str,frequency:u32,port:u16}
-struct Radio{bus:Bus,state:State,ipc:Ipc,c:Config,device:Option<String>,connection:Option<String>,previous:Option<String>,offer:Option<Offer>,agent:bool,profile:bool,business:bool,advertisement:bool,restore_connectable:bool,restore_bondable:bool,activated:bool,startup_cancelled:bool,startup_close_id:Option<Value>,reconnect_at:Instant,reconnect_attempts:u8,projection_active:bool}
+struct Radio{bus:Bus,state:State,ipc:Ipc,c:Config,device:Option<String>,connection:Option<String>,previous:Option<String>,offer:Option<Offer>,agent:bool,profile:bool,business:bool,advertisement:bool,restore_connectable:bool,restore_bondable:bool,activated:bool,startup_cancelled:bool,startup_close_id:Option<Value>,reconnect_at:Instant,reconnect_attempts:u8,projection_active:bool,reconnect_allowed:bool,business_connect:Option<(OwnedFd,Instant)>}
 impl Radio{
     fn call(&mut self,d:&str,p:&str,i:&str,m:&str,a:Vec<Arg>,timeout:Duration)->Result<Vec<Arg>>{self.bus.call(&mut self.state,&mut self.ipc,d,p,i,m,a,timeout)}
     fn bluez(&mut self,p:&str,i:&str,m:&str,a:Vec<Arg>)->Result<Vec<Arg>>{self.call("org.bluez",p,i,m,a,Duration::from_secs(5))}
@@ -344,13 +344,14 @@ impl Radio{
             self.restore_bondable=current&16==0;self.restore_connectable=current&2==0;
             if self.restore_bondable{self.setting(9,16,true,Duration::from_secs(3))?;}if self.restore_connectable{self.setting(7,2,true,Duration::from_secs(3))?;}}
         for (suffix,uuid,channel,business) in [("business",FE36,self.c.channel+1,true),("profile",FE35,self.c.channel,false)]{
-            self.bluez("/org/bluez","org.bluez.ProfileManager1","RegisterProfile",vec![path(&format!("{ROOT}/{suffix}")),text(uuid),dict(vec![("Name",text(if business{"NearbyBusinessSocket"}else{"NearbyServerSocket"})),("Role",text("server")),("Channel",Arg::U16(channel)),("ServiceRecord",text(&service_record(channel,uuid))),("RequireAuthentication",Arg::Bool(false)),("RequireAuthorization",Arg::Bool(false))])])?;
+            self.bluez("/org/bluez","org.bluez.ProfileManager1","RegisterProfile",vec![path(&format!("{ROOT}/{suffix}")),text(uuid),dict(vec![("Name",text(if business{"NearbyBusinessSocket"}else{"NearbyServerSocket"})),("Channel",Arg::U16(channel)),("ServiceRecord",text(&service_record(channel,uuid))),("RequireAuthentication",Arg::Bool(false)),("RequireAuthorization",Arg::Bool(false))])])?;
             if business{self.business=true;}else{self.profile=true;}
         }
-        let p=self.c.adapter.clone();self.bluez(&p,"org.bluez.LEAdvertisingManager1","RegisterAdvertisement",vec![path(&format!("{ROOT}/advertisement")),dict(vec![])])?;self.advertisement=true;self.activated=true;Ok(())
+        let p=self.c.adapter.clone();self.bluez(&p,"org.bluez.LEAdvertisingManager1","RegisterAdvertisement",vec![path(&format!("{ROOT}/advertisement")),dict(vec![])])?;self.advertisement=true;self.activated=true;
+        if let Some(peer)=self.state.selection.selected.clone(){self.reconnect_allowed=self.c.peer.is_some()&&self.property("org.bluez",&peer,"org.bluez.Device1","Paired").ok().and_then(|v|v.boolean())==Some(true);}Ok(())
     }
     fn reconnect(&mut self)->Result<()>{
-        if !self.activated||self.projection_active||self.state.closing||!self.state.slots.is_empty()||Instant::now()<self.reconnect_at{return Ok(());}
+        if !self.activated||!self.reconnect_allowed||self.projection_active||self.state.closing||!self.state.slots.is_empty()||Instant::now()<self.reconnect_at{return Ok(());}
         let Some(peer)=self.state.selection.selected.clone()else{return Ok(());};
         // BlueZ may keep Connect pending while paging an absent phone. Never
         // queue parallel Connect requests or block Profile1/Agent dispatch.
@@ -361,9 +362,31 @@ impl Radio{
         self.reconnect_at=Instant::now()+Duration::from_secs(match self.reconnect_attempts{1=>3,2=>5,_=>10});
         let serial=self.bus.connect_peer(&peer)?;self.state.pending_connect=Some((serial,Instant::now()));Ok(())
     }
+    fn open_business(&mut self,port:u16)->Result<()>{
+        if !self.reconnect_allowed||self.projection_active||self.business_connect.is_some()||!(1..=30).contains(&port){return Err("outgoing business connection unavailable".into());}
+        let peer=self.state.selection.selected.as_deref().and_then(|p|self.state.selection.address(p)).ok_or("selected peer missing")?;
+        if self.state.slots.iter().any(|(stream,_)|stream=="business"){return Err("business connection already present".into());}
+        #[repr(C)]struct RcAddress{family:u16,address:[u8;6],channel:u8}
+        let mut bytes=[0u8;6];for (dst,src)in bytes.iter_mut().rev().zip(peer.split(':')){*dst=u8::from_str_radix(src,16).map_err(|_|"invalid selected peer")?;}
+        let raw=unsafe{libc::socket(31,libc::SOCK_STREAM|libc::SOCK_NONBLOCK|libc::SOCK_CLOEXEC,3)};if raw<0{return Err("cannot create outgoing business socket".into());}let fd=unsafe{OwnedFd::from_raw_fd(raw)};
+        let address=RcAddress{family:31,address:bytes,channel:port as u8};let result=unsafe{libc::connect(raw,&address as *const _ as *const libc::sockaddr,mem::size_of_val(&address) as _)};
+        if result<0&&io::Error::last_os_error().raw_os_error()!=Some(libc::EINPROGRESS){return Err("outgoing business connection failed".into());}
+        self.business_connect=Some((fd,Instant::now()));Ok(())
+    }
+    fn poll_business(&mut self)->Result<()>{
+        let Some((fd,started))=self.business_connect.as_ref()else{return Ok(());};let mut p=libc::pollfd{fd:fd.as_raw_fd(),events:libc::POLLOUT,revents:0};
+        let n=unsafe{libc::poll(&mut p,1,0)};if n==0&&started.elapsed()<Duration::from_secs(12){return Ok(());}
+        let (fd,started)=self.business_connect.take().unwrap();let mut error=0i32;let mut len=mem::size_of::<i32>() as libc::socklen_t;
+        if n<=0||started.elapsed()>=Duration::from_secs(12)||unsafe{libc::getsockopt(fd.as_raw_fd(),libc::SOL_SOCKET,libc::SO_ERROR,&mut error as *mut _ as *mut c_void,&mut len)}!=0||error!=0{
+            let _=self.ipc.send(&json!({"event":"reconnect-result","success":false}),None);return Ok(());
+        }
+        let device=self.state.selection.selected.clone().ok_or("selected peer missing")?;let address=self.state.selection.address(&device).ok_or("invalid selected peer")?;
+        self.ipc.send(&json!({"event":"rfcomm","stream":"business","device":device,"address":address,"initiator":true}),Some(fd.as_raw_fd()))?;
+        self.state.slots.insert(("business".into(),device));Ok(())
+    }
     fn index(&self)->Result<u16>{self.c.adapter.rsplit("hci").next().ok_or("invalid adapter")?.parse().map_err(|_|"invalid adapter index".into())}
     fn setting(&self,opcode:u16,mask:u32,enabled:bool,timeout:Duration)->Result<()>{let result=mgmt(self.index()?,opcode,&[u8::from(enabled)],timeout)?;if result.len()<4||(u32::from_le_bytes(result[..4].try_into().unwrap())&mask!=0)!=enabled{return Err("controller setting not applied".into());}Ok(())}
-    fn cleanup(&mut self){self.state.closing=true;
+    fn cleanup(&mut self){self.state.closing=true;self.business_connect=None;
         let registrations=[(self.advertisement,self.c.adapter.clone(),"org.bluez.LEAdvertisingManager1","UnregisterAdvertisement",format!("{ROOT}/advertisement")),(self.profile,"/org/bluez".into(),"org.bluez.ProfileManager1","UnregisterProfile",format!("{ROOT}/profile")),(self.business,"/org/bluez".into(),"org.bluez.ProfileManager1","UnregisterProfile",format!("{ROOT}/business")),(self.agent,"/org/bluez".into(),"org.bluez.AgentManager1","UnregisterAgent",format!("{ROOT}/agent"))];
         self.advertisement=false;self.profile=false;self.business=false;self.agent=false;self.activated=false;
         for (active,p,i,m,arg) in registrations{if active{let _=self.call("org.bluez",&p,i,m,vec![path(&arg)],Duration::from_millis(500));}}
@@ -389,7 +412,7 @@ pub fn run(fd:i32)->Result<()>{
     let until=Instant::now()+Duration::from_secs(15);let config=loop{if let Some(v)=ipc.receive()?{break v;}if Instant::now()>until{return Err("missing private radio configuration".into());}std::thread::sleep(Duration::from_millis(10));};
     let c:Config=serde_json::from_value(config.clone()).map_err(|_|"invalid radio configuration")?;validate(&c)?;
     let state=State{selection:Selection::new(&c)?,payload:beacon(&c.model,c.sequence)?,power:c.tx_power,instance:0,stopped:false,closing:false,slots:BTreeSet::new(),origin:Instant::now(),pending_connect:None};
-    let bus=Bus::open()?;let mut radio=Radio{bus,state,ipc,c,device:None,connection:None,previous:None,offer:None,agent:false,profile:false,business:false,advertisement:false,restore_connectable:false,restore_bondable:false,activated:false,startup_cancelled:false,startup_close_id:None,reconnect_at:Instant::now(),reconnect_attempts:0,projection_active:false};
+    let bus=Bus::open()?;let mut radio=Radio{bus,state,ipc,c,device:None,connection:None,previous:None,offer:None,agent:false,profile:false,business:false,advertisement:false,restore_connectable:false,restore_bondable:false,activated:false,startup_cancelled:false,startup_close_id:None,reconnect_at:Instant::now(),reconnect_attempts:0,projection_active:false,reconnect_allowed:false,business_connect:None};
     let result=(||{
         let address=radio.prepare()?;radio.ipc.send(&json!({"id":config.get("id"),"ok":true,"ready":true,"address":address,"offer":radio.offer}),None)?;
         loop{
@@ -397,6 +420,7 @@ pub fn run(fd:i32)->Result<()>{
                 let reply:Result<Value>=match op{
                     "activate"=>radio.activate().map(|_|json!({"active":true})),
                     "release"=>{let stream=v["stream"].as_str().ok_or("missing stream")?;let device=v["device"].as_str().ok_or("missing device")?;radio.state.slots.remove(&(stream.into(),device.into()));Ok(json!({}))},
+                    "open-business"=>{let port=v["port"].as_u64().and_then(|v|u16::try_from(v).ok()).ok_or("invalid business port")?;radio.open_business(port).map(|_|json!({"pending":true}))},
                     "projection"=>{radio.projection_active=v["active"].as_bool().ok_or("projection active flag required")?;if !radio.projection_active{radio.reconnect_at=Instant::now();radio.reconnect_attempts=0;}Ok(json!({}))},
                     "status"=>Ok(json!({"active":radio.activated,"streams":radio.state.slots.len()})),
                     "close"=>{radio.cleanup();let _=radio.ipc.send(&json!({"id":v.get("id"),"ok":true,"closed":true}),None);break;},
@@ -404,7 +428,7 @@ pub fn run(fd:i32)->Result<()>{
                 };
                 match reply{Ok(mut value)=>{value["ok"]=true.into();value["id"]=v.get("id").cloned().unwrap_or(Value::Null);radio.ipc.send(&value,None)?;},Err(error)=>{radio.ipc.send(&json!({"id":v.get("id"),"ok":false,"error":error}),None)?;if op=="activate"{return Err("radio activation failed".into());}}}
             }
-            radio.bus.poll(&mut radio.state,&mut radio.ipc)?;radio.reconnect()?;if radio.state.stopped{let _=radio.ipc.send(&json!({"event":"stopped"}),None);break;}
+            radio.bus.poll(&mut radio.state,&mut radio.ipc)?;radio.reconnect()?;radio.poll_business()?;if radio.state.stopped{let _=radio.ipc.send(&json!({"event":"stopped"}),None);break;}
             let mut busfd=0;unsafe{(radio.bus.api.get_fd)(radio.bus.connection,&mut busfd);}
             let mut fds=[libc::pollfd{fd:radio.ipc.fd.as_raw_fd(),events:libc::POLLIN,revents:0},libc::pollfd{fd:busfd,events:libc::POLLIN,revents:0}];unsafe{libc::poll(fds.as_mut_ptr(),2,50);}
         }Ok(())

@@ -77,26 +77,49 @@ fn request(v:&[u8],channel:u32,business:u32,protocol:u32)->Result<()>{
     std::str::from_utf8(&v[p..p+len]).map_err(|_|"invalid business tag")?;p+=len;
     if uint(v,&mut p)?!=protocol||p!=v.len(){return Err("unsupported business transport".into());}Ok(())
 }
-pub struct Negotiator {summary:Vec<u8>,business:Option<u32>,seen:u8}
+pub struct Negotiator {summary:Vec<u8>,business:Option<u32>,seen:u8,initiator:bool,requested:bool,pending:Vec<(u32,Vec<u8>)>,endpoint:Option<u16>}
 impl Negotiator {
     pub fn new(summary:Vec<u8>,business:Option<u32>)->Result<Self>{
         if !(1..=256).contains(&summary.len())||business.is_some_and(|n|!(1..=30).contains(&n)){return Err("invalid channel identity".into());}
-        Ok(Self{summary,business,seen:0})
+        Ok(Self{summary,business,seen:0,initiator:false,requested:false,pending:vec![],endpoint:None})
     }
+    pub fn start(&mut self)->Result<Vec<u8>>{
+        self.initiator=true;let mut out=wire::tlv(1,&[2])?;append(&mut out,3,&self.summary)?;append(&mut out,5,&[0])?;Ok(out)
+    }
+    fn pending(&mut self)->Vec<(u32,Vec<u8>)>{std::mem::take(&mut self.pending)}
+    fn endpoint(&mut self)->Option<u16>{self.endpoint.take()}
     pub fn complete(&self)->bool{self.seen==7}
     pub fn respond(&mut self,f:&Frame,resource:&mut Resource)->Result<Option<Vec<u8>>>{
         if f.flags&1!=0{return Ok(None);}
         if matches!(f.kind,4|33)&&self.complete(){return resource.respond(f);}
         let mut out=vec![];
-        if f.kind==2&&self.complete(){if let Some(channel)=self.business{for (tag,v) in wire::tlvs(&f.payload)?{if tag==3{
-            request(&v,2,19,0)?;let mut response=wire::uint(0)?;response.extend(wire::uint(channel)?);response.extend(v);response.extend(wire::uint(16)?);
-            response.extend([0,0,0xfe,0x36,0,0,0x10,0,0x80,0,0,0x80,0x5f,0x9b,0x34,0xfb]);append(&mut out,4,&response)?;
-        }}}}
+        if f.kind==2&&self.complete(){for (tag,v) in wire::tlvs(&f.payload)?{match tag{
+            3=>{if let Some(channel)=self.business{
+                request(&v,2,19,0)?;let mut response=wire::uint(0)?;response.extend(wire::uint(channel)?);response.extend(v);response.extend(wire::uint(16)?);
+                response.extend([0,0,0xfe,0x36,0,0,0x10,0,0x80,0,0,0x80,0x5f,0x9b,0x34,0xfb]);append(&mut out,4,&response)?;
+                // A simultaneous phone-originated connection wins over our wake-up.
+                self.initiator=false;self.pending.clear();self.endpoint=None;
+            }},
+            4 if self.initiator=>{
+                let mut p=0;if uint(&v,&mut p)?!=0{return Err("remote business request rejected".into());}let port=uint(&v,&mut p)?;
+                if !(1..=30).contains(&port)||uint(&v,&mut p)?!=2||uint(&v,&mut p)?!=19{return Err("invalid remote business channel".into());}
+                let n=uint(&v,&mut p)? as usize;if n>128||n>v.len()-p{return Err("invalid remote business tag".into());}p+=n;
+                if uint(&v,&mut p)?!=0||uint(&v,&mut p)?!=16||v.len()-p!=16{return Err("invalid remote business transport".into());}
+                self.endpoint=Some(port as u16);
+            },_=>{},
+        }}}
         else if f.kind==0 {let mut seen=self.seen;for (tag,v) in wire::tlvs(&f.payload)?{match tag{
             1=>{if v.len()!=1||v[0]<2{return Err("unsupported CCMP version".into());}append(&mut out,2,&[2])?;seen|=1;},
+            2=>{if v.len()!=1||v[0]<2{return Err("unsupported CCMP version response".into());}seen|=1;},
+            4=>{if !(1..=256).contains(&v.len()){return Err("invalid remote summary".into());}seen|=2;},
+            6=>{if v!=[0]{return Err("encrypted Nearby channel is unsupported".into());}seen|=4;},
             3=>{if !(1..=256).contains(&v.len()){return Err("invalid summary length".into());}append(&mut out,4,&self.summary)?;seen|=2;},
             5=>{if v.len()!=1||v[0]>2{return Err("invalid encryption preference".into());}append(&mut out,6,&[0])?;seen|=4;},_=>{},
         }}self.seen=seen;}
+        if self.initiator&&self.complete()&&!self.requested{
+            let mut request=wire::uint(2)?;request.extend(wire::uint(19)?);request.extend(wire::uint(0)?);request.extend(wire::uint(0)?);
+            self.pending.push((2,wire::tlv(3,&request)?));self.requested=true;
+        }
         Ok((!out.is_empty()).then_some(out))
     }
 }
@@ -151,10 +174,12 @@ pub fn differential(v:&Value)->Result<Value>{
             let op=text(&command,"op")?;let result:Result<Value>=(||{match op {
                 "open"=>{if channels.len()>=8{return Err("channel limit".into());}next=next.checked_add(1).ok_or("channel generation exhausted")?;
                     let channel=if command["business"]==true{Some(number(&config,"business_channel")?)}else{None};
-                    channels.insert(next,Negotiator::new(own.as_bytes().to_vec(),channel)?);Ok(value!({"channel":next}))},
+                    let mut n=Negotiator::new(own.as_bytes().to_vec(),channel)?;let initial=if command["initiator"]==true{Some(hex(&n.start()?))}else{None};
+                    channels.insert(next,n);Ok(value!({"channel":next,"initial":initial}))},
                 "nearby"=>{let n=channels.get_mut(&number(&command,"channel")?).ok_or("stale channel")?;
-                    let reply=n.respond(&frame(&command)?,&mut resource)?;Ok(value!({"reply":reply.map(|v|hex(&v)),"complete":n.complete(),
-                        "pending":resource.pending().iter().map(|(k,v)|value!([k,hex(v)])).collect::<Vec<_>>(),"credentials_sent":resource.credentials_sent}))},
+                    let reply=n.respond(&frame(&command)?,&mut resource)?;let mut commands=resource.pending();commands.extend(n.pending());
+                    Ok(value!({"reply":reply.map(|v|hex(&v)),"complete":n.complete(),"business_endpoint":n.endpoint(),
+                        "pending":commands.iter().map(|(k,v)|value!([k,hex(v)])).collect::<Vec<_>>(),"credentials_sent":resource.credentials_sent}))},
                 "close-channel"=>{channels.remove(&number(&command,"channel")?);Ok(value!({}))},
                 "auth-open"=>{if auth_open{return Err("business authentication already active".into());}
                     business.generation=business.generation.checked_add(1).ok_or("auth generation exhausted")?;sight=None;control=None;business.close(&mut resource);peer_seen=false;auth_open=true;
@@ -245,6 +270,23 @@ pub fn differential(v:&Value)->Result<Value>{
         let mut r=Resource::new(offer());let f=Frame{kind:33,flags:0,options:vec![],payload:wire::tlv(2,b"02:11:22:33:44:55").unwrap()};
         assert!(r.respond(&f).unwrap().is_none());r.authenticated=true;assert!(r.respond(&f).is_err());r.negotiated=true;
         assert!(r.respond(&f).unwrap().is_some());assert!(r.credentials_sent);r.reset();assert!(!r.credentials_sent&&!r.authenticated);
+    }
+    #[test]fn outgoing_nearby_handshake_and_business_endpoint_roundtrip(){
+        let mut client=Negotiator::new(vec![b'A';64],None).unwrap();let mut server=Negotiator::new(vec![b'B';64],Some(24)).unwrap();
+        let mut cr=Resource::new(offer());let mut sr=Resource::new(offer());
+        let frame=|kind,payload|Frame{kind,flags:0,options:vec![],payload};
+        let hello=client.start().unwrap();let response=server.respond(&frame(0,hello),&mut sr).unwrap().unwrap();assert!(server.complete());
+        assert!(client.respond(&frame(0,response),&mut cr).unwrap().is_none());assert!(client.complete());
+        let pending=client.pending();assert_eq!(pending.len(),1);assert_eq!(pending[0].0,2);
+        let reply=server.respond(&frame(2,pending[0].1.clone()),&mut sr).unwrap().unwrap();
+        client.respond(&frame(2,reply),&mut cr).unwrap();assert_eq!(client.endpoint(),Some(24));assert!(client.pending().is_empty());assert_eq!(client.endpoint(),None);
+    }
+    #[test]fn outgoing_nearby_rejects_unencrypted_mismatch_and_invalid_business_channel(){
+        let mut client=Negotiator::new(vec![b'A';64],None).unwrap();let mut r=Resource::new(offer());client.start().unwrap();
+        let mut response=wire::tlv(2,&[2]).unwrap();response.extend(wire::tlv(4,b"real peer summary").unwrap());response.extend(wire::tlv(6,&[1]).unwrap());
+        assert!(client.respond(&Frame{kind:0,flags:0,options:vec![],payload:response},&mut r).is_err());assert!(!client.complete());
+        client.seen=7;let mut reply=wire::uint(0).unwrap();reply.extend(wire::uint(31).unwrap());reply.extend([0;20]);
+        assert!(client.respond(&Frame{kind:2,flags:0,options:vec![],payload:wire::tlv(4,&reply).unwrap()},&mut r).is_err());assert_eq!(client.endpoint(),None);
     }
     #[test]fn negotiation_is_atomic_on_malformed_tlv(){let mut n=Negotiator::new(vec![65;64],Some(24)).unwrap();let mut r=Resource::new(offer());
         let mut payload=wire::tlv(1,&[2]).unwrap();payload.extend(wire::tlv(3,&[]).unwrap());assert!(n.respond(&Frame{kind:0,flags:0,options:vec![],payload},&mut r).is_err());assert_eq!(n.seen,0);}

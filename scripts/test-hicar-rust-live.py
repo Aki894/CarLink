@@ -374,8 +374,8 @@ while True:
                     stamp = int.from_bytes(rtp[4:8], 'big')
                     if origin is None:
                         origin = stamp
-                        lower = capture_before * 90000 // 1000000 & 0xffffffff
-                        upper = time.monotonic_ns() // 1000 * 90000 // 1000000 & 0xffffffff
+                        lower = (capture_before+synced["clock_offset_us"]) * 90000 // 1000000 & 0xffffffff
+                        upper = (time.monotonic_ns() // 1000+synced["clock_offset_us"]) * 90000 // 1000000 & 0xffffffff
                         assert (stamp-lower) & 0xffffffff <= (upper-lower) & 0xffffffff
                     assert (stamp-origin) & 0xffffffff == sequence * 1920
                     assert rtp[12:16] == bytes([255,241,76,128])  # AAC-LC, 48k stereo

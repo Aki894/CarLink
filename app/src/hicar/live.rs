@@ -338,7 +338,7 @@ impl Engine{
         let controls=self.link.step();for v in controls{self.feedback(v);}self.flush_input();
         let mut failed=false;
         while let Some((generation,pcm))=self.link.mic_pcm.pop_front(){if let Some(u)=self.uplink.as_mut(){if u.feed(generation,pcm).is_err(){failed=true;break;}}}
-        if let Some(u)=self.uplink.as_mut(){match u.poll(&self.crypto,&self.key){
+        if let Some(u)=self.uplink.as_mut(){match u.poll(&self.crypto,&self.key,self.clock_offset.unwrap_or(0)){
             Ok(packets)=>{for packet in packets{match self.udp.send_to(&packet,SocketAddrV4::new(self.peer,u.port)){Ok(n)if n==packet.len()=>self.mic_packets+=1,Err(e)if e.kind()==ErrorKind::WouldBlock=>{},_=>{failed=true;break;}}}},
             Err(_)=>failed=true,
         }}

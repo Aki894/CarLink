@@ -256,7 +256,7 @@ impl Owner{
                 let kind=if stream=="business"{Kind::Business}else{Kind::Nearby};
                 if kind==Kind::Business{self.stop_projection();self.auth_close();self.next_epoch()?;self.auth=Some(num(&self.worker.call(&json!({"op":"auth-open"}))?,"generation")?);}
                 let mut channel=Channel::new(fd,kind,self.epoch)?;channel.device=Some(device);channel.radio_stream=Some(stream.into());
-                if kind==Kind::Business{channel.token=self.auth;}else{channel.token=Some(num(&self.worker.call(&json!({"op":"open","business":true}))?,"channel")?);}
+                if kind==Kind::Business{channel.token=self.auth;}else{let opened=self.worker.call(&json!({"op":"open","business":true,"initiator":v["initiator"]==true}))?;channel.token=Some(num(&opened,"channel")?);if let Some(initial)=opened["initial"].as_str(){channel.enqueue(Frame{kind:0,flags:0,options:vec![],payload:unhex(initial)?}.encode(Format::Nearby)?)?;}}
                 self.channels.push(channel);event("rfcomm_connected",self.epoch);
             },
             Some("request-disconnection")=>{let stream=v["stream"].as_str();let device=v["device"].as_str();for c in &mut self.channels{if c.radio_stream.as_deref()==stream&&c.device.as_deref()==device{c.closing=true;}}},
@@ -286,6 +286,7 @@ impl Owner{
     }}Ok(())}
     fn receive_nearby(&mut self,c:&mut Channel,bytes:&[u8])->Result<()>{for frame in c.decoder.feed(bytes)?{
         let result=self.worker.call(&json!({"op":"nearby","channel":c.token,"kind":frame.kind,"flags":frame.flags,"payload":hex(&frame.payload)}))?;
+        if let Some(port)=result["business_endpoint"].as_u64(){self.radio.call(json!({"op":"open-business","port":port}),Duration::from_secs(1))?;}
         if let Some(reply)=result["reply"].as_str(){c.enqueue(Frame{kind:frame.kind,flags:0,options:vec![],payload:unhex(reply)?}.encode(Format::Nearby)?)?;}
         if let Some(commands)=result["pending"].as_array(){for command in commands{c.enqueue(Frame{kind:command[0].as_u64().ok_or("invalid resource command")?.try_into().map_err(|_|"invalid resource command")?,flags:0,options:vec![],payload:unhex(command[1].as_str().ok_or("invalid resource payload")?)?}.encode(Format::Nearby)?)?;}}
     }Ok(())}
