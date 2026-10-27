@@ -75,7 +75,7 @@ pub fn touch(x:u16,y:u16,action:u8,elapsed:u32)->Result<Vec<u8>>{
     let mut out=vec![action,0,11,1,0];out.extend(x.to_be_bytes());out.extend(y.to_be_bytes());out.extend(elapsed.to_be_bytes());out.push(0);Ok(out)
 }
 pub fn key(name:&str,down:bool)->Result<Vec<u8>>{
-    let code:u16=match name{"up"=>19,"down"=>20,"left"=>21,"right"=>22,"enter"=>23,"back"=>4,"home"=>3,"play_pause"=>85,_=>return Err("unsupported input key".into())};
+    let code:u16=match name{"up"=>19,"down"=>20,"left"=>21,"right"=>22,"enter"=>23,"back"=>4,"home"=>3,"play_pause"=>85,"next"=>87,"previous"=>88,_=>return Err("unsupported input key".into())};
     let mut out=vec![if down{3}else{4},0,9,0];out.extend(code.to_be_bytes());out.extend([0;6]);Ok(out)
 }
 

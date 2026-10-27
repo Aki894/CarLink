@@ -93,6 +93,8 @@ impl Input {
   assert!(p.handle(&event(0x68008,&[(1,0x14)]),200).unwrap().is_empty());
   assert_eq!(p.handle(&event(0x68008,&[(1,0x14)]),350).unwrap(),vec![2]);
   assert_eq!(p.handle(&event(0x68008,&[(1,0xe)]),351).unwrap(),vec![1]);
+  assert_eq!(p.handle(&event(0x68008,&[(1,0x0f)]),351).unwrap(),vec![9]);
+  assert_eq!(p.handle(&event(0x68008,&[(1,0x10)]),351).unwrap(),vec![8]);
   p.handle(&event(0x1005e,&[]),352).unwrap();assert!(p.down_at.is_none());
  }
  #[test]fn legacy_touch_channel_survives_wire_decoder_and_session(){

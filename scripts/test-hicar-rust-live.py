@@ -216,15 +216,21 @@ while True:
             feedback(live, dict(type='touch', contacts=[dict(x=.4, y=.6, down=True)]))
             feedback(live, dict(type='touch', contacts=[]))
             feedback(live, dict(type='key-press', code=1))
+            feedback(live, dict(type='key-press', code=8))
+            feedback(live, dict(type='key-press', code=9))
             actions = []
-            for _ in range(5):
+            keys = []
+            for _ in range(9):
                 header = exact(control, 4)
                 assert header[:2] == bytes(2)
                 size = int.from_bytes(header[2:], 'big')
                 body = cipher.decrypt(exact(control, size-4))
                 assert body[:6] == b'\xff'*6
                 actions.append(body[6])
-            assert actions == [0, 2, 1, 3, 4], 'touch/key edges differ from the observed source contract'
+                if body[6] in (3, 4):
+                    keys.append(int.from_bytes(body[10:12], 'big'))
+            assert actions == [0, 2, 1, 3, 4, 3, 4, 3, 4], 'touch/key edges differ from the observed source contract'
+            assert keys == [4, 4, 87, 87, 88, 88], 'media skip keys differ from the Android key contract'
             rpc(ipc, dict(op='audio-begin'))
             rpc(ipc, dict(op='audio-ready'))
             udp.sendto(audio_packet(cipher, 1), ('127.0.0.1', audio_port))
@@ -245,7 +251,7 @@ while True:
             mixed = until_frame(live, 3, lambda f: f[3][:4] == bytes([2,0,4,0]))
             assert len(mixed[3]) == 3528
             assert rpc(ipc, dict(op='status'))['state']['audio_streams'] == 2
-            assert status['input_events'] == 4
+            assert status['input_events'] == 6
             assert status['epoch_video_frames'] == 3
             # Datagram framing and selected source checks reject unexpected
             # senders independently of the connected TCP control session.
