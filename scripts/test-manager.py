@@ -38,7 +38,7 @@ try:
         for v in [dict(event='stage',stage='ConnectingBluetooth',address=address),dict(event='stage',stage='WirelessActive'),dict(event='forward_latency',sent=30)]:print(json.dumps(v),flush=True)
     elif role=='hicar':
         if scenario=='pair-hicar' and '--pair' in sys.argv:
-            for address in ['not-a-bluetooth-address','02:00:00:00:00:02','02:00:00:00:00:03','02:00:00:00:00:04']:
+            for address in ['not-a-bluetooth-address','02:00:00:00:00:03','02:00:00:00:00:02','02:00:00:00:00:04']:
                 print(json.dumps(dict(event='target_selected',address=address)),flush=True)
         print(json.dumps(dict(event='bridge_stats',active=True,connected=scenario!='no-hu',video_frames=20)),flush=True)
     usb_ready=False
@@ -286,8 +286,8 @@ def check(binary):
             # Unknown HiCar pairing creates a pending record only after a valid
             # selected transport; stable delivered media is the persistence gate.
             (root/'scenario').write_text('pair-hicar')
-            # Every registered HiCar is excluded from an add-new window, even
-            # when its auto-connect preference is already disabled.
+            # A connection window accepts new or registered phones. Here a new
+            # valid phone arrives first; later known/new candidates cannot steal it.
             ctl(op='remember',device=dict(hc,auto=False))
             ctl(op='pair',protocol='hicar')
             selected=until(lambda s:s['protocol']=='hicar' and s['active'] and s['target'] and s['target']['address']=='02:00:00:00:00:03')
