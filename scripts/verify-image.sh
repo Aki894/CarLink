@@ -68,6 +68,9 @@ if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("
 fi
 test -x "$mountdir/usr/local/bin/carlink"
 if [[ "$mode" == current ]]; then
+# HiCar resolves FE35 RFCOMM separately from same-UUID ATT records.
+test -x "$mountdir/usr/bin/sdptool"
+readelf -h "$mountdir/usr/bin/sdptool" | grep -q 'Machine:.*ARM'
 test -x "$mountdir/usr/local/bin/carlink-carplay"
 receiver="$mountdir/usr/local/lib/carlink/carplay"
 for name in openxplay-relay oxp-relay carlink-audio; do
