@@ -306,7 +306,7 @@ impl Engine{
         }
         if self.input_queue.len()>=32{self.release_inputs();return;}
         if v["type"]=="key-press"{
-            let name=match v["code"].as_u64(){Some(0)=>"home",Some(1)=>"back",Some(2)=>"enter",Some(3)=>"left",Some(4)=>"right",Some(5)=>"up",Some(6)=>"down",Some(8)=>"next",Some(9)=>"previous",_=>return};
+            let name=match v["code"].as_u64(){Some(0)=>"home",Some(1)=>"back",Some(2)=>"enter",Some(3)=>"left",Some(4)=>"right",Some(5)=>"up",Some(6)=>"down",Some(7)=>"play_pause",Some(8)=>"next",Some(9)=>"previous",_=>return};
             if let (Ok(down),Ok(up))=(media::key(name,true),media::key(name,false)){self.keys.insert(name.into());self.queue_input(down,Duration::from_millis(40),None);self.queue_input(up,Duration::from_millis(40),Some(name.into()));self.input_events+=1;}
         }else if v["type"]=="touch"{
             let Some(contacts)=v["contacts"].as_array().filter(|v|v.len()<=10)else{return;};

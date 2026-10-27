@@ -103,7 +103,7 @@ def control(stream, value):
         send_json(stream, value)
         return
     if value.get('type') == 'key-press':
-        if set(value) != {'type', 'code'} or type(value['code']) is not int or not 0 <= value['code'] <= 9:
+        if set(value) != {'type', 'code'} or type(value['code']) is not int or not 0 <= value['code'] <= 10:
             raise ValueError('invalid focus key')
         now = time.monotonic_ns() // 1000
         # One internal event owns the complete pulse; no queued held key remains

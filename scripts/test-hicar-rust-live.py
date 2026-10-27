@@ -216,11 +216,12 @@ while True:
             feedback(live, dict(type='touch', contacts=[dict(x=.4, y=.6, down=True)]))
             feedback(live, dict(type='touch', contacts=[]))
             feedback(live, dict(type='key-press', code=1))
+            feedback(live, dict(type='key-press', code=7))
             feedback(live, dict(type='key-press', code=8))
             feedback(live, dict(type='key-press', code=9))
             actions = []
             keys = []
-            for _ in range(9):
+            for _ in range(11):
                 header = exact(control, 4)
                 assert header[:2] == bytes(2)
                 size = int.from_bytes(header[2:], 'big')
@@ -229,8 +230,8 @@ while True:
                 actions.append(body[6])
                 if body[6] in (3, 4):
                     keys.append(int.from_bytes(body[10:12], 'big'))
-            assert actions == [0, 2, 1, 3, 4, 3, 4, 3, 4], 'touch/key edges differ from the observed source contract'
-            assert keys == [4, 4, 87, 87, 88, 88], 'media skip keys differ from the Android key contract'
+            assert actions == [0, 2, 1, 3, 4, 3, 4, 3, 4, 3, 4], 'touch/key edges differ from the observed source contract'
+            assert keys == [4, 4, 85, 85, 87, 87, 88, 88], 'media skip keys differ from the Android key contract'
             rpc(ipc, dict(op='audio-begin'))
             rpc(ipc, dict(op='audio-ready'))
             udp.sendto(audio_packet(cipher, 1), ('127.0.0.1', audio_port))

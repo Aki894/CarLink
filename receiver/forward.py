@@ -447,7 +447,7 @@ def run(args):
                 decoders=[dict(codecString='avc1.64001F', hardware=False)],
                 displays={'0': dict(widthPx=args.width, heightPx=args.height, densityDpi=160,
                     refreshHz=30, frameRate='FPS_30', safeArea=dict(left=0, top=0, right=0, bottom=0))},
-                touch=10, keys=list(range(10)), audio=[], microphone=True, prefersH264=True))
+                touch=10, keys=list(range(11)), audio=[], microphone=True, prefersH264=True))
             link = LiveLink(args.live_socket, feedback)
             microphone = voice.Microphone(send_microphone, link.microphone)
             link.start()

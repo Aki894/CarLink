@@ -139,7 +139,10 @@ class WireTests(unittest.TestCase):
             probe.control(left, {'type': 'key-press', 'code': 3})
             self.assertEqual(probe.receive(right)[-1], b'\x03\x00\x01')
             self.assertEqual(probe.receive(right)[-1], b'\x03\x00\x00')
-            for code in (-1, 10, True, '3'):
+            probe.control(left, {'type': 'key-press', 'code': 10})
+            self.assertEqual(probe.receive(right)[-1], b'\x0a\x00\x01')
+            self.assertEqual(probe.receive(right)[-1], b'\x0a\x00\x00')
+            for code in (-1, 11, True, '3'):
                 with self.assertRaises(ValueError):
                     probe.control(left, {'type': 'key-press', 'code': code})
 

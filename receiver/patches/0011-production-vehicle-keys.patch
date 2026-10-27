@@ -1,0 +1,233 @@
+diff --git a/rust/carplay-airplay/src/media_sink_decorator.rs b/rust/carplay-airplay/src/media_sink_decorator.rs
+--- a/rust/carplay-airplay/src/media_sink_decorator.rs
++++ b/rust/carplay-airplay/src/media_sink_decorator.rs
+@@ -18,6 +18,10 @@
+     fn show_view_area(&self, _index: usize) -> bool {
+         false
+     }
++    /// Delivers a complete momentary key press; a release must not duplicate it.
++    fn send_key(&self, _key: u16, _down: bool) -> Result<bool> {
++        Ok(false)
++    }
+     /// Errors propagate to the lifecycle owner.
+     fn send_touch(&self, contacts: &[AirPlayContact]) -> Result<bool>;
+ }
+diff --git a/rust/carplay-airplay/src/air_play_session.rs b/rust/carplay-airplay/src/air_play_session.rs
+--- a/rust/carplay-airplay/src/air_play_session.rs
++++ b/rust/carplay-airplay/src/air_play_session.rs
+@@ -416,6 +416,27 @@
+         )?;
+         Ok(())
+     }
++    /// OXP key vocabulary: home/back/select/arrows, play-pause/next/previous, Siri.
++    /// Existing HID helpers emit their own release, so external key-up is a no-op.
++    pub fn send_key(&self, key: u16, down: bool) -> Result<bool> {
++        if key > 10 { return Ok(false); }
++        if !down { return Ok(true); }
++        let mut knob = AirPlayKnobState::default();
++        match key {
++            0 => knob.home = true,
++            1 => knob.back = true,
++            2 => knob.select = true,
++            3 => knob.x = -1,
++            4 => knob.x = 1,
++            5 => knob.y = -1,
++            6 => knob.y = 1,
++            7..=9 => { self.send_media(match key { 7 => 3, 8 => 4, _ => 5 })?; return Ok(true); }
++            10 => { self.invoke_siri()?; return Ok(true); }
++            _ => return Ok(false),
++        }
++        self.send_knob(&knob, true)?;
++        Ok(true)
++    }
+     pub fn invoke_siri(&self) -> Result<()> {
+         for action in [2u64, 3] {
+             self.send_command(&dictionary([
+@@ -946,6 +967,9 @@
+     }
+ }
+ impl SessionControl for AirPlaySession {
++    fn send_key(&self, key: u16, down: bool) -> Result<bool> {
++        AirPlaySession::send_key(self, key, down)
++    }
+     fn show_view_area(&self, index: usize) -> bool {
+         AirPlaySession::show_view_area(self, index)
+     }
+@@ -1202,6 +1226,30 @@
+             commands(&socket),
+             vec![AirPlayInfoPlist::view_area_command(1, 2)]
+         );
++        session.close().unwrap();
++    }
++    #[test]
++    fn carlink_vehicle_keys_emit_hid_pulses_and_siri_without_duplicate_releases() {
++        let (session, socket) = session();
++        ready(&session, &socket);
++        for key in 0..=10 {
++            assert!(SessionControl::send_key(&*session, key, true).unwrap());
++            assert!(SessionControl::send_key(&*session, key, false).unwrap());
++        }
++        assert!(!session.send_key(11, true).unwrap());
++        let cmds = commands(&socket);
++        assert_eq!(cmds.len(), 22);
++        let knob = [[2,0,0,0], [4,0,0,0], [1,0,0,0], [0,255,0,0], [0,1,0,0], [0,0,255,0], [0,0,1,0]];
++        for (index, report) in knob.iter().enumerate() {
++            assert_eq!(cmds[index*2].get("hidReport").unwrap().as_data().unwrap(), report);
++            assert_eq!(cmds[index*2+1].get("hidReport").unwrap().as_data().unwrap(), &[0,0,0,0]);
++        }
++        for (index, report) in [3u8,4,5].iter().enumerate() {
++            assert_eq!(cmds[14+index*2].get("hidReport").unwrap().as_data().unwrap(), &[*report]);
++            assert_eq!(cmds[15+index*2].get("hidReport").unwrap().as_data().unwrap(), &[0]);
++        }
++        assert_eq!(cmds[20].get("type").unwrap().as_str(), Some("requestSiri"));
++        assert_eq!(cmds[21].get("type").unwrap().as_str(), Some("requestSiri"));
+         session.close().unwrap();
+     }
+     #[test]
+diff --git a/rust/carplay-airplay/src/car_play_media_engine.rs b/rust/carplay-airplay/src/car_play_media_engine.rs
+--- a/rust/carplay-airplay/src/car_play_media_engine.rs
++++ b/rust/carplay-airplay/src/car_play_media_engine.rs
+@@ -1315,8 +1315,11 @@
+             None => Ok(false),
+         }
+     }
+-    fn key(&self, _key: u16, _down: bool) -> Result<bool> {
+-        Ok(false)
++    fn key(&self, key: u16, down: bool) -> Result<bool> {
++        match self.current_session() {
++            Some(session) => session.send_key(key, down),
++            None => Ok(false),
++        }
+     }
+     fn request_keyframe(&self, screen: u16) -> Result<bool> {
+         if screen != 110 && screen != 0 {
+diff --git a/rust/direlay-linux/src/linux_air_play_server.rs b/rust/direlay-linux/src/linux_air_play_server.rs
+--- a/rust/direlay-linux/src/linux_air_play_server.rs
++++ b/rust/direlay-linux/src/linux_air_play_server.rs
+@@ -444,6 +444,13 @@
+ }
+ struct DeferredControl(Mutex<std::sync::Weak<AirPlaySession>>);
+ impl SessionControl for DeferredControl {
++    fn send_key(&self, key: u16, down: bool) -> Result<bool> {
++        let session = self.0.lock().unwrap().upgrade();
++        match session {
++            Some(session) => session.send_key(key, down),
++            None => Ok(false),
++        }
++    }
+     fn show_view_area(&self, index: usize) -> bool {
+         self.0
+             .lock()
+diff --git a/rust/direlay-linux/src/di_play_input.rs b/rust/direlay-linux/src/di_play_input.rs
+--- a/rust/direlay-linux/src/di_play_input.rs
++++ b/rust/direlay-linux/src/di_play_input.rs
+@@ -127,6 +127,7 @@
+ enum InputCommand {
+     Recovery(u64, u16),
+     Touch(u64, Vec<AirPlayContact>),
++    Key(u64, u16, bool),
+ }
+ pub struct DiPlayInput {
+     pub(crate) display: Arc<Mutex<crate::display::DisplayRuntime>>,
+@@ -243,6 +244,9 @@
+                         ));
+                     }
+                 }
++                Ok(InputCommand::Key(id, key, down)) => {
++                    Self::forward_key(state, id, key, down);
++                }
+                 Ok(InputCommand::Touch(id, contacts)) => {
+                     let control = {
+                         let s = state.lock().unwrap();
+@@ -265,6 +269,13 @@
+             }
+             Self::poll_view_area_state(display, state, clock());
+         }
++    }
++    fn forward_key(state: &Mutex<InputState>, id: u64, key: u16, down: bool) -> bool {
++        let control = {
++            let state = state.lock().unwrap();
++            if state.current == Some(id) { state.control.clone() } else { None }
++        };
++        control.is_some_and(|control| control.send_key(key, down).unwrap_or(false))
+     }
+     /// The handler to call again when a screen-0 key frame is still outstanding after
+     /// `KEYFRAME_REPEAT`, for H.264 and H.265 alike.
+@@ -951,11 +962,17 @@
+     }
+ 
+     fn key(&self, key: u16, down: bool) -> Result<bool> {
+-        let handler = {
+-            let s = self.state.lock().unwrap();
+-            s.current.and(s.keys.clone())
+-        };
+-        Ok(handler.is_some_and(|h| h(key, down)))
++        let (session, handler) = {
++            let state = self.state.lock().unwrap();
++            (state.current, state.keys.clone())
++        };
++        let Some(session) = session else { return Ok(false); };
++        // Replay sources retain their explicit handler. Production controls
++        // use the same bounded, generation-fenced IO worker as touch events.
++        if let Some(handler) = handler { return Ok(handler(key, down)); }
++        if key > 10 { return Ok(false); }
++        if !down { return Ok(true); }
++        Ok(self.recovery.try_send(InputCommand::Key(session, key, down)).is_ok())
+     }
+     fn request_keyframe(&self, screen: u16) -> Result<bool> {
+         let mut s = self.state.lock().unwrap();
+@@ -1730,3 +1747,54 @@
+         assert!(area["area"]["width"].as_u64().unwrap() < 1920);
+     }
+ }
++
++#[cfg(test)]
++mod carlink_production_key_tests {
++    use super::*;
++    struct Control(std::sync::mpsc::Sender<(u16,bool)>);
++    impl SessionControl for Control {
++        fn send_touch(&self, _: &[AirPlayContact]) -> Result<bool> { Ok(true) }
++        fn send_key(&self, key: u16, down: bool) -> Result<bool> {
++            self.0.send((key,down)).unwrap(); Ok(true)
++        }
++    }
++    fn input() -> DiPlayInput {
++        DiPlayInput::new(Arc::new(JsonEvents::new(Arc::new(|_| {}))))
++    }
++    #[test]
++    fn carlink_production_controls_receive_keys_without_replay_callback() {
++        let input = input();
++        assert!(!input.key(1,true).unwrap());
++        let (tx,rx) = std::sync::mpsc::channel();
++        let id = input.begin(Arc::new(Control(tx))).unwrap();
++        assert!(input.state.lock().unwrap().keys.is_none());
++        for key in 0..=10 {
++            assert!(input.key(key,true).unwrap());
++            assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), (key,true));
++            assert!(input.key(key,false).unwrap());
++        }
++        assert!(rx.try_recv().is_err());
++        assert!(!input.key(11,true).unwrap());
++        input.end(id).unwrap(); assert!(!input.key(1,true).unwrap());
++    }
++    #[test]
++    fn carlink_key_queue_is_bounded_and_old_session_commands_are_retired() {
++        let mut input = input();
++        let (queue,queued) = sync_channel(1); input.recovery = queue;
++        let (first,old_keys) = std::sync::mpsc::channel();
++        let old = input.begin(Arc::new(Control(first))).unwrap();
++        assert!(input.key(1,true).unwrap());
++        assert!(!input.key(2,true).unwrap());
++        let command = queued.recv().unwrap();
++        input.end(old).unwrap();
++        let (next,new_keys) = std::sync::mpsc::channel();
++        let current = input.begin(Arc::new(Control(next))).unwrap();
++        let InputCommand::Key(id,key,down) = command else { panic!("wrong queued command") };
++        assert_eq!(id,old);
++        assert!(!DiPlayInput::forward_key(&input.state,id,key,down));
++        assert!(old_keys.try_recv().is_err()); assert!(new_keys.try_recv().is_err());
++        assert!(DiPlayInput::forward_key(&input.state,current,1,true));
++        assert_eq!(new_keys.recv_timeout(Duration::from_secs(1)).unwrap(), (1,true));
++        input.end(current).unwrap();
++    }
++}
