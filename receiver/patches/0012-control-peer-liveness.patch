@@ -1,0 +1,141 @@
+diff --git a/rust/direlay-linux/src/linux_air_play_server.rs b/rust/direlay-linux/src/linux_air_play_server.rs
+--- a/rust/direlay-linux/src/linux_air_play_server.rs
++++ b/rust/direlay-linux/src/linux_air_play_server.rs
+@@ -25,6 +25,7 @@
+     read: Mutex<()>,
+     write: Mutex<()>,
+     closed: AtomicBool,
++    write_timeout: Duration,
+ }
+ impl TcpDuplex {
+     pub fn new(socket: TcpStream) -> std::io::Result<Self> {
+@@ -34,14 +35,23 @@
+             read: Mutex::new(()),
+             write: Mutex::new(()),
+             closed: AtomicBool::new(false),
++            write_timeout: Duration::from_secs(10),
+         })
++    }
++    /// Only the small AirPlay control stream uses this shorter write budget.
++    /// Event, video and buffered-audio sockets retain their existing budgets.
++    fn control(socket: TcpStream) -> std::io::Result<Self> {
++        let mut stream = Self::new(socket)?;
++        stream.write_timeout = Duration::from_secs(3);
++        stream.socket.set_write_timeout(Some(stream.write_timeout))?;
++        Ok(stream)
+     }
+ }
+ impl DuplexStream for TcpDuplex {
+     fn send(&self, data: &[u8]) -> Result<()> {
+         let _g = self.write.lock().unwrap();
+         self.socket
+-            .set_write_timeout(Some(Duration::from_secs(10)))?;
++            .set_write_timeout(Some(self.write_timeout))?;
+         (&self.socket).write_all(data)
+     }
+     fn recv(&self, max: usize, timeout: Duration) -> Result<Receive> {
+@@ -71,8 +81,9 @@
+     }
+ }
+ /// Detect a vanished phone on the control connection without treating an idle CarPlay screen as a
+-/// failure, as DiPlay's TcpLiveness does: probe after 10 s idle, every 3 s, give up after 3 probes,
+-/// and abandon unacknowledged data after 20 s.
++/// failure. Probe after 3 s idle, every second, give up after 3 probes,
++/// and abandon unacknowledged data after 6 s. A static screen still receives
++/// TCP acknowledgements, so no video-frame deadline is involved.
+ fn configure_peer_liveness(socket: &TcpStream) -> std::io::Result<()> {
+     #[cfg(not(target_os = "linux"))]
+     {
+@@ -86,10 +97,10 @@
+     {
+         for (level, name, value) in [
+             (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1),
+-            (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 10),
+-            (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 3),
++            (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 3),
++            (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 1),
+             (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3),
+-            (libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, 20_000),
++            (libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, 6_000),
+         ] {
+             let value: libc::c_int = value;
+             let r = unsafe {
+@@ -381,7 +392,7 @@
+                                     .map(|e| e.clone() as Arc<dyn AirPlayMediaHandler>)
+                                     .unwrap_or_else(|| media.clone());
+                                 let session = AirPlaySession::new(
+-                                    Arc::new(TcpDuplex::new(tcp)?),
++                                    Arc::new(TcpDuplex::control(tcp)?),
+                                     state.lock().unwrap().config.clone(),
+                                     identity.clone(),
+                                     pairings.clone(),
+@@ -390,7 +401,7 @@
+                                     listener.clone(),
+                                 )?;
+                                 session.log_debug(&match &liveness {
+-                                    Ok(()) => "TCP peer health enabled idle=10s interval=3s count=3 deadline=20000ms; no video-idle timeout".to_string(),
++                                    Ok(()) => "TCP peer health enabled idle=3s interval=1s count=3 deadline=6000ms; control-write=3s; no video-idle timeout".to_string(),
+                                     Err(e) => format!("TCP peer health tuning unavailable: {e}"),
+                                 });
+                                 *control.0.lock().unwrap() = Arc::downgrade(&session);
+@@ -480,3 +491,60 @@
+             .bind_datagram(SocketAddr::new(self.peer, peer.port()))
+     }
+ }
++
++#[cfg(all(test, target_os = "linux"))]
++mod carlink_control_liveness_tests {
++    use super::*;
++    fn pair() -> (TcpStream, TcpStream) {
++        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
++        let local = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
++        let (peer, _) = listener.accept().unwrap();
++        (local, peer)
++    }
++    fn option(socket: &TcpStream, level: i32, name: i32) -> i32 {
++        let mut value = 0i32;
++        let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
++        let result = unsafe {
++            libc::getsockopt(socket.as_raw_fd(), level, name,
++                &mut value as *mut _ as *mut libc::c_void, &mut len)
++        };
++        assert_eq!(result, 0);
++        assert_eq!(len as usize, std::mem::size_of::<i32>());
++        value
++    }
++    #[test]
++    fn carlink_control_socket_uses_bounded_peer_health_without_changing_media_defaults() {
++        let (socket, _peer) = pair();
++        configure_peer_liveness(&socket).unwrap();
++        let control = TcpDuplex::control(socket).unwrap();
++        for (level, name, expected) in [
++            (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1),
++            (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 3),
++            (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 1),
++            (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3),
++            (libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, 6_000),
++        ] { assert_eq!(option(&control.socket, level, name), expected); }
++        assert_eq!(control.socket.write_timeout().unwrap(), Some(Duration::from_secs(3)));
++        let (socket, _peer) = pair();
++        let media = TcpDuplex::new(socket).unwrap();
++        assert_eq!(media.write_timeout, Duration::from_secs(10));
++        assert_eq!(option(&media.socket, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 0);
++    }
++    #[test]
++    fn carlink_static_session_survives_peer_health_deadline_without_media_frames() {
++        let (socket, mut peer) = pair();
++        configure_peer_liveness(&socket).unwrap();
++        let control = TcpDuplex::control(socket).unwrap();
++        let until = Instant::now() + Duration::from_millis(6500);
++        // No RTSP, media packets, sleeps, or application keepalives. The peer's
++        // kernel acknowledges TCP probes, as a healthy static CarPlay screen does.
++        while Instant::now() < until {
++            assert!(matches!(control.recv(1, Duration::from_millis(100)).unwrap(), Receive::Timeout));
++            assert!(!control.closed.load(Ordering::Acquire));
++        }
++        peer.write_all(b"x").unwrap();
++        assert!(matches!(control.recv(1, Duration::from_secs(1)).unwrap(), Receive::Data(data) if data.as_slice() == b"x"));
++        control.close().unwrap();
++        assert!(matches!(control.recv(1, Duration::from_millis(1)).unwrap(), Receive::Eof));
++    }
++}
