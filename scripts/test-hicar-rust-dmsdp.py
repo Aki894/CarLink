@@ -133,6 +133,33 @@ def check(binary):
         compare(worker.call(dict(op='dmsdp-session',key=key.hex(),device_info=info,audio=False,steps=short)),key,info,False,short);count+=1
         key32=key+bytes(range(16,32))
         compare(worker.call(dict(op='dmsdp-session',key=key32.hex(),device_info=info,audio=True,steps=[dict(receive=negotiation.hex()),*tail])),key32,info,True,[dict(receive=negotiation.hex()),*tail]);count+=1
+        # mic1 is an RTP sender. The phone drives ordinary OPTIONS/crypto/SETUP/PLAY;
+        # its SETUP client port is the destination, rather than our bound port.
+        mic_info={**info,'properties':{**info['properties'],'5002':True}}
+        def mic(method,sequence,session=73,body=b'',**extra):
+            return message(method+' * DMSDP/1.0',dict(ServiceID='mic1',ServiceType=2,DataSessionID=session,CSeq=sequence,**extra),body)
+        mic_trigger=mic('SET_PARAMETER',1,body=b'msdp_trigger_method: OPTIONS',Simple=1)
+        mic_crypto=mic('SET_PARAMETER',11,CryptoVer=1,CryptoSwitch=222,CryptoAlg='aes128-ctr',Fillp=0,TCP=0)
+        mic_format=mic('SET_PARAMETER',12,AudioParameter='SampleRate=48000;Format=16;ChannelNum=2;Codec=0')
+        mic_setup=mic('SETUP',13,Transport='RTP/AVP/UDP;unicast;client_port=43000--1')
+        mic_play=mic('PLAY',14)
+        mic_steps=[dict(receive=negotiation.hex()),dict(ports=[40000,-1])]
+        mic_steps += [dict(receive=wire(data).hex()) for data in (mic_trigger,mic_crypto,mic_format,mic_setup,mic_play,mic_play)]
+        result=worker.call(dict(op='dmsdp-session',key=key.hex(),device_info=mic_info,audio=True,steps=mic_steps))
+        assert result.get('ok'), 'encrypted microphone transcript rejected'
+        result=result['result']['steps']
+        options=normalize(bytes.fromhex(result[2]['pending'][0]),cipher)
+        assert options['start']=='OPTIONS * DMSDP/1.0' and options['headers']['simple']=='0'
+        assert 'transport' not in options['headers']
+        crypto_ack=normalize(bytes.fromhex(result[3]['pending'][0]),cipher)
+        assert crypto_ack['headers']['cryptover']=='1' and crypto_ack['headers']['cseq']=='11'
+        assert result[4]['events'][-1]['audio_negotiated'] is True
+        setup_ack=normalize(bytes.fromhex(result[5]['pending'][0]),cipher)
+        assert setup_ack['headers']['transport']=='RTP/AVP/UDP;unicast;client_port=43000--1;server_port=40000--1'
+        assert not any(e.get('microphone_ready') for e in result[5]['events'])
+        assert result[6]['events'][-1]['microphone_ready'] is True and result[6]['events'][-1]['port']==43000
+        assert not any(e.get('microphone_ready') for e in result[7]['events']) and len(result[7]['pending'])==1
+        count+=1
         invalid=[
             [dict(receive=b'\x01\0\x01x'.hex())], [dict(receive=b'\0\0\0'.hex())],
             [dict(receive=(b'\0'+(1498).to_bytes(2,'big')).hex())],
