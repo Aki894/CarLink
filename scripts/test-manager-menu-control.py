@@ -65,7 +65,7 @@ try:
         pcm=struct.pack('<hh',600 if role=='carplay' else 1200,-600 if role=='carplay' else -1200)*882
         stream.sendall(wire(1,0,struct.pack('<III',800,480,30))+wire(4,1))
         if role=='carplay':
-            for event in [dict(event='stage',stage='WirelessActive'),dict(event='forward_latency',sent=1)]:
+            for event in [dict(event='stage',stage='ConnectingBluetooth',address='02:00:00:00:00:01'),dict(event='stage',stage='WirelessActive'),dict(event='forward_latency',sent=1)]:
                 print(json.dumps(event),flush=True)
         else:
             print(json.dumps(dict(event='bridge_stats',active=True,connected=True,video_frames=1)),flush=True)
@@ -211,10 +211,10 @@ def check(binary, library, font):
         cp=dict(protocol='carplay',address='02:00:00:00:00:01',name='Synthetic iPhone',auto=True,last_used=0)
         hc=dict(protocol='hicar',address='02:00:00:00:00:02',name='Synthetic Huawei',auto=True,last_used=0)
         state=root/'devices.json'
-        state.write_text(json.dumps(dict(devices=[cp,hc],policy='manual',paused=False)),encoding='utf-8');state.chmod(0o600)
+        state.write_text(json.dumps(dict(devices=[cp,hc],selected_protocol='carplay',boot_protocol='last',policy='manual',paused=False)),encoding='utf-8');state.chmod(0o600)
         config=dict(schema=1,socket=str(root/'control.sock'),live_socket=str(root/'live.sock'),
             source_socket=str(root/'source.sock'),menu_library=str(library),menu_font=str(font),
-            state=str(state),radio_lock=str(root/'manager-radio.lock'),media_socket=str(root/'media.sock'),
+            state=str(state),radio_lock=str(root/'manager-radio.lock'),media_socket=str(root/'media.sock'),bluetoothctl='/bin/true',
             carlife=[sys.executable,str(backend),str(root),'carlife'],
             carplay=[sys.executable,str(backend),str(root),'carplay'],
             hicar=[sys.executable,str(backend),str(root),'hicar','--live-socket',str(root/'live.sock')],
@@ -255,7 +255,8 @@ def check(binary, library, font):
             process=subprocess.Popen([*runner,str(binary),'manager','run','--config',str(config_path)],stdout=output,stderr=output)
             ready=until(lambda:status_where(lambda s:s['carlife_pid'] is not None and s['menu_visible']), 'initial menu state')
             first_life=ready['carlife_pid']
-            assert ready['backend_pid'] is None and ready['protocol'] is None, 'manual policy started a source'
+            assert ready['backend_pid'] is None and ready['protocol']=='carplay' and not ready['active'], 'manual policy must preserve selection without starting a source'
+            assert ready['default_protocol']=='last'
             assert not (root/'live.sock').exists(), 'fixture bound the HU before manager startup'
             listener=socket.socket(socket.AF_UNIX);listener.bind(str(root/'live.sock'));listener.listen(1);listener.settimeout(12)
             connection,_=listener.accept();hu=Headunit(connection)
@@ -264,8 +265,14 @@ def check(binary, library, font):
             # mux, which supplies its own menu_rows snapshot to the manager.
             marker=hu.mark();hu.feedback(dict(type='key-press',code=6))
             until(lambda:frame_where(lambda f:f['kind']==2 and f['sha256']!=initial['sha256'],marker), 'focused second menu row')
+            # The new three-row menu starts with protocol switching, followed
+            # by connect/disconnect and boot-default selection. Navigate back
+            # to row zero before selecting HiCar; row one is no longer a saved
+            # Huawei phone entry.
+            marker_focus=hu.mark();hu.feedback(dict(type='key-press',code=5))
+            until(lambda:frame_where(lambda f:f['kind']==2 and f['sha256']==initial['sha256'],marker_focus), 'focus returned to protocol row')
             hu.feedback(dict(type='key-press',code=2))
-            selected=until(lambda:status_where(lambda s:s['protocol']=='hicar' and s['active'] and not s['menu_visible']), 'HiCar selected by focus/enter')
+            selected=until(lambda:status_where(lambda s:s['protocol']=='hicar' and s['active'] and not s['menu_visible']), 'HiCar selected by protocol-row focus/enter')
             assert selected['target']['address']==hc['address'] and selected['carlife_pid']==first_life
             until(lambda:frame_where(lambda f:f['kind']==2 and f['sha256']==source_hash['hicar'],marker), 'HiCar source video')
             until(lambda:frame_where(lambda f:f['kind']==3 and f['sha256']==pcm_hash['hicar'],marker), 'HiCar PCM forwarding')
@@ -298,25 +305,61 @@ def check(binary, library, font):
             hu.feedback(dict(type='key-press',code=1))
             until(lambda:any(e['event']=='input' and e['role']=='carplay' and e['code']==1 for e in events()), 'projection input restored after menu exit')
             before_backs=len([e for e in events() if e['event']=='input' and e['role']=='carplay' and e['code']==1])
+            marker_backs=hu.mark()
             for _ in range(3):hu.feedback(dict(type='key-press',code=1));time.sleep(.1)
             until(lambda:status_where(lambda s:s['menu_visible'] and s['backend_pid']==selected['backend_pid']), 'triple back opens menu without disconnect')
+            until(lambda:frame_where(lambda f:f['kind']==2 and f['sha256'] not in source_hash.values(),marker_backs), 'triple-back menu is presented')
             assert len([e for e in events() if e['event']=='input' and e['role']=='carplay' and e['code']==1])==before_backs
-            ctl(op='menu',visible=False);ctl(op='policy',mode='last');marker=hu.mark()
-            os.kill(selected['backend_pid'],signal.SIGTERM)
+            # Exercise all three default-protocol choices through the rendered
+            # third row. Changing next-boot policy must not switch this session.
+            for expected in ('hicar','carplay','last'):
+                prior_menu=next(f for f in reversed(hu.snapshot()) if f['kind']==2 and f['sha256'] not in source_hash.values())
+                marker_default=hu.mark()
+                for down in (True,False):
+                    hu.feedback(dict(type='touch',contacts=[dict(id=0,x=.5,y=.4,down=down)]));time.sleep(.06)
+                current=until(lambda:status_where(lambda s:s['default_protocol']==expected), 'boot default '+expected)
+                assert current['protocol']=='carplay' and current['backend_pid']==selected['backend_pid'] and current['active']
+                until(lambda:frame_where(lambda f:f['kind']==2 and f['sha256'] not in source_hash.values() and f['sha256']!=prior_menu['sha256'],marker_default), 'updated default-protocol menu')
+
+            # Row two is a direct disconnect/resume action with no old
+            # confirmation page. A user-requested disconnect pauses reconnect.
+            prior_menu=next(f for f in reversed(hu.snapshot()) if f['kind']==2 and f['sha256'] not in source_hash.values())
+            marker_disconnect=hu.mark()
+            for down in (True,False):
+                hu.feedback(dict(type='touch',contacts=[dict(id=0,x=.5,y=.3,down=down)]));time.sleep(.06)
+            paused=until(lambda:status_where(lambda s:s['menu_visible'] and not s['active'] and s['paused'] and s['backend_pid'] is None), 'manual disconnect pauses current protocol')
+            assert paused['protocol']=='carplay' and paused['carlife_pid']==first_life
+            until(lambda:frame_where(lambda f:f['kind']==2 and f['sha256'] not in source_hash.values() and f['sha256']!=prior_menu['sha256'],marker_disconnect), 'paused reconnect menu')
+            connected_before=len([e for e in events() if e['event']=='connected'])
+            time.sleep(1)
+            paused=ctl(op='status')['status']
+            assert paused['backend_pid'] is None and paused['paused'] and paused['protocol']=='carplay'
+            assert len([e for e in events() if e['event']=='connected'])==connected_before, 'manual disconnect restarted the source'
+            # The same row resumes pairing/connection for the selected protocol.
+            marker_resume=hu.mark()
+            for down in (True,False):
+                hu.feedback(dict(type='touch',contacts=[dict(id=0,x=.5,y=.3,down=down)]));time.sleep(.06)
+            selected=until(lambda:status_where(lambda s:s['protocol']=='carplay' and s['active'] and not s['paused'] and not s['menu_visible']), 'connect-device row resumes current protocol')
+            assert selected['target']['address']==cp['address'] and selected['carlife_pid']==first_life
+            until(lambda:frame_where(lambda f:f['kind']==2 and f['sha256']==source_hash['carplay'],marker_resume), 'source video after manual resume')
+            until(lambda:frame_where(lambda f:f['kind']==3 and f['sha256']==pcm_hash['carplay'],marker_resume), 'PCM after manual resume')
+
+            marker=hu.mark();os.kill(selected['backend_pid'],signal.SIGTERM)
             until(lambda:status_where(lambda s:s['menu_visible'] and not s['active']), 'lost source returns to menu')
             until(lambda:frame_where(lambda f:f['kind']==2 and f['sha256'] not in source_hash.values(),marker), 'recovery menu replaces frozen source')
-            recovered=until(lambda:status_where(lambda s:s['protocol']=='hicar' and s['active']), 'automatic fallback to other protocol')
-            assert recovered['carlife_pid']==first_life
+            recovered=until(lambda:status_where(lambda s:s['protocol']=='carplay' and s['active']), 'automatic reconnect stays on selected protocol',timeout=25)
+            assert recovered['carlife_pid']==first_life and recovered['target']['address']==cp['address']
+            until(lambda:frame_where(lambda f:f['kind']==3 and f['sha256']==pcm_hash['carplay'],marker), 'PCM after unexpected-disconnect recovery')
             records=events()
             assert len([e for e in records if e['event']=='start' and e['role']=='carlife'])==1
-            assert [e['role'] for e in records if e['event']=='connected']==['hicar','carplay','hicar']
+            assert [e['role'] for e in records if e['event']=='connected']==['hicar','carplay','carplay','carplay']
             assert not any(e['event']=='overlap' for e in records), 'wireless source overlap'
             hu.snapshot();hu.close();hu=None
             ctl(op='shutdown');assert process.wait(timeout=12)==0;process=None
             assert not os.path.lexists(root/'control.sock') and not os.path.lexists(root/'source.sock'), 'manager left runtime sockets'
             print(json.dumps(dict(manager_menu_control='passed',native_idr=True,focus_enter_hicar=True,
                 touch_select_carplay=True,menu_audio_preserved=True,menu_pcm_max_gap_ms=round(menu_pcm_max_gap_ms,1),source_video_restored=True,
-                projection_input_restored=True,triple_back_menu=True,disconnect_recovery_menu=True,automatic_other_protocol=True,carlife_pid_preserved=True,source_overlap=False)))
+                projection_input_restored=True,triple_back_menu=True,default_protocol_cycle=True,manual_disconnect_pauses=True,menu_connect_resumes=True,disconnect_recovery_menu=True,automatic_same_protocol=True,carlife_pid_preserved=True,source_overlap=False)))
         except BaseException:
             output.flush()
             print((root/'manager.log').read_text(encoding='utf-8',errors='replace')[-12000:],file=sys.stderr)
