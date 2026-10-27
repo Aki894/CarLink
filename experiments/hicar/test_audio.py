@@ -23,7 +23,7 @@ class SpeakerTests(unittest.TestCase):
         speaker = Speaker()
         speaker.ports = (40000, -1)
         self.assertEqual(speaker.receive(command(body=b'msdp_trigger_method: OPTIONS\r\n', simple='1'), encode),
-                         [dict(audio_setup_sent=True)])
+                         [dict(audio_setup_sent=True, service="speaker1", modem=False, session=42)])
         request = Messages().feed(speaker.pending.pop())[0]
         self.assertEqual(request.start, 'SETUP * DMSDP/1.0')
         self.assertEqual(request.headers['simple'], '1')
@@ -32,14 +32,14 @@ class SpeakerTests(unittest.TestCase):
         response = Message('DMSDP/1.0 200 OK', dict(serviceid='speaker1', servicetype='3',
                            datasessionid='42', cseq=str(speaker.setup_sequence),
                            transport='RTP/AVP/UDP;unicast;client_port=40000--1;server_port=44000--1'), b'')
-        self.assertEqual(speaker.receive(response, encode), [dict(audio_ready=True)])
+        self.assertEqual(speaker.receive(response, encode), [dict(audio_ready=True, service="speaker1", modem=False, port=44000, session=42)])
         self.assertEqual(speaker.pending, [])
         event = speaker.receive(command(audioparameter='SampleRate=48000;Format=16;ChannelNum=2;Codec=0'), encode)
         self.assertEqual(event[0]['codec'], 'aac-adts')
         self.assertTrue(speaker.ready)
         speaker.pending.clear()
         self.assertEqual(speaker.receive(command(body=b'msdp_trigger_method: TEARDOWN'), encode),
-                         [dict(audio_stopped=True)])
+                         [dict(audio_stopped=True, service="speaker1", modem=False)])
         self.assertTrue(speaker.pending[0].startswith(b'TEARDOWN '))
         self.assertIsNone(speaker.teardown(encode))
 

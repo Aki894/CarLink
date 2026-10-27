@@ -64,6 +64,7 @@ class Harness:
         self.sight.settimeout(15)
         self.sight_port = self.sight.getsockname()[1]
         self.trace = []
+        self.audio_commands = []
         self.events = []
         self.errors = queue.Queue()
         self.ended = threading.Event()
@@ -198,8 +199,14 @@ class Harness:
             assert value['session'] == 2 and self.control_open
             self.control_open = False
         if operation == 'dmsdp-receive':
-            valid = bytes.fromhex(value['data']) == b'VALID'
-            return {'events': [{'valid': True}] if valid else [], 'pending': [],
+            data = bytes.fromhex(value['data'])
+            audio = {
+                b'MEDIA_READY': dict(audio_ready=True, service='speaker1', modem=False, port=55100, session=42),
+                b'CALL_READY': dict(audio_ready=True, service='modemSpeaker', modem=True, port=55200, session=43),
+                b'MEDIA_STOP': dict(audio_stopped=True, service='speaker1', modem=False),
+                b'CALL_STOP': dict(audio_stopped=True, service='modemSpeaker', modem=True),
+            }
+            return {'events': [audio[data]] if data in audio else ([{'valid': True}] if data == b'VALID' else []), 'pending': [],
                     'state': {'negotiated': True, 'media_port': self.sight_port}}
         if operation == 'dmsdp-heartbeat':
             return {'heartbeat': b'H'.hex(), 'pending': []}
@@ -217,6 +224,8 @@ class Harness:
     def media(self, value):
         operation = value.get('op', 'init')
         self.trace.append(('media', operation))
+        if operation.startswith('audio-'):
+            self.audio_commands.append(dict(value))
         if operation == 'init':
             assert value['key'] == bytes(range(16)).hex()
             assert value['audio_binary'] == '/usr/local/lib/carlink/carplay/bin/carlink-audio'
@@ -297,6 +306,20 @@ def run(binary):
     try:
         owner.authenticate()
         control = owner.project()
+        # Independent speaker lifetimes must reach the media owner with their
+        # advertised UDP endpoints, including call takeover and resume cleanup.
+        stages = (
+            (b'MEDIA_READY', [dict(op='audio-service', service='speaker1', active=True, port=55100), dict(op='audio-ready')]),
+            (b'CALL_READY', [dict(op='audio-service', service='modemSpeaker', active=True, port=55200), dict(op='audio-role', role=3), dict(op='audio-ready')]),
+            (b'MEDIA_STOP', [dict(op='audio-service', service='speaker1', active=False)]),
+            (b'CALL_STOP', [dict(op='audio-service', service='modemSpeaker', active=False), dict(op='audio-role', role=0), dict(op='audio-stop')]),
+        )
+        expected_audio = []
+        for record, expected in stages:
+            expected_audio.extend(expected)
+            control.sendall(record)
+            owner.wait(lambda: len(owner.audio_commands) >= len(expected_audio))
+            assert owner.audio_commands == expected_audio, 'speaker route/lifetime command mismatch'
         # A second control connection must be rejected without touching the owner.
         with socket.create_connection(('127.0.0.1', owner.base + 2), 2) as duplicate:
             duplicate.settimeout(2)

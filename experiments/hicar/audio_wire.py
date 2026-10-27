@@ -12,6 +12,15 @@ class Speaker:
         self.pending = []
         self.format = None
         self.ready = False
+        self.remote = None
+
+    def notify(self, name):
+        event = {'audio_'+name: True, 'service': 'speaker1', 'modem': False}
+        if self.remote is not None:
+            event['port'] = self.remote
+        if self.session_id is not None:
+            event['session'] = self.session_id
+        return event
 
     def request(self, method, encode, extra=None):
         self.sequence += 1
@@ -26,6 +35,7 @@ class Speaker:
         record = self.request('TEARDOWN', encode)
         self.session_id = None
         self.ready = False
+        self.remote = None
         return record
 
     def receive(self, message, encode):
@@ -58,21 +68,23 @@ class Speaker:
                 if session == self.session_id:
                     return []
                 self.session_id, self.ready, self.format = session, False, None
+                self.remote = None
                 self.pending.append(self.request('SETUP', encode, dict(
                     Transport='RTP/AVP/UDP;unicast;client_port=%d--1' % self.ports[0],
                     Simple=1, CryptoVer=1, CryptoAbility=222, CryptoAlg='aes128-ctr',
                     Fillp=0, TCP=0, Codec=0)))
                 self.setup_sequence = self.sequence
-                events.append(dict(audio_setup_sent=True))
+                events.append(self.notify("setup_sent"))
             elif trigger[1] == b'TEARDOWN':
                 if session == self.session_id:
                     record = self.teardown(encode)
                     if record:
                         self.pending.append(record)
-                    events.append(dict(audio_stopped=True))
+                    events.append(self.notify("stopped"))
             elif trigger[1] == b'CLOSE':
-                self.session_id, self.ready = None, False
-                events.append(dict(audio_stopped=True))
+                if session == self.session_id:
+                    events.append(self.notify("stopped"))
+                    self.session_id, self.ready, self.remote = None, False, None
             else:
                 raise ProtocolError('unsupported speaker trigger')
         elif message.start.startswith('DMSDP/1.0 '):
@@ -85,8 +97,9 @@ class Speaker:
             if (not transport or int(transport[1]) != self.ports[0]
                     or not 1 <= int(transport[2]) <= 65535):
                 raise ProtocolError('invalid speaker server endpoint')
+            self.remote = int(transport[2])
             self.ready = True
-            events.append(dict(audio_ready=True))
+            events.append(self.notify("ready"))
         elif session != self.session_id:
             raise ProtocolError('speaker session mismatch')
         elif message.start.startswith('SET_PARAMETER '):
@@ -100,8 +113,8 @@ class Speaker:
             events.append(dict(audio_negotiated=True, **self.format))
         elif message.start.startswith('TEARDOWN '):
             acknowledge()
-            self.session_id, self.ready = None, False
-            events.append(dict(audio_stopped=True))
+            events.append(self.notify("stopped"))
+            self.session_id, self.ready, self.remote = None, False, None
         elif message.start.startswith('GET_PARAMETER ') and not message.body:
             acknowledge()
         else:
