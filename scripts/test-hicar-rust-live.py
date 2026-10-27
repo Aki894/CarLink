@@ -116,7 +116,29 @@ def check(binary):
         source.settimeout(4)
         video_server, input_server = listener(), listener()
         fake = root/'decoder.py'
-        fake.write_text('#!/usr/bin/env python3\nimport os,sys\nwhile True:\n data=os.read(0,8192)\n if not data:break\n os.write(1,bytes([255,241,96,64,1,127,252,0,0,0,0]) if "adts" in sys.argv else b"\\x01\\x00\\x02\\x00"*2646)\n', encoding='utf8')
+        fake.write_text('''#!/usr/bin/env python3
+import os,sys
+encoder = 'adts' in sys.argv
+if encoder:
+    split = sys.argv.index('-i')
+    before, after = sys.argv[:split], sys.argv[split+1:]
+    assert before[before.index('-ar')+1] == '16000'
+    assert before[before.index('-ac')+1] == '1'
+    assert after[after.index('-ar')+1] == '48000'
+    assert after[after.index('-ac')+1] == '2'
+pending = bytearray()
+while True:
+    data = os.read(0,8192)
+    if not data:
+        break
+    if encoder:
+        pending.extend(data)
+        while len(pending) >= 640:
+            del pending[:640]
+            os.write(1,bytes([255,241,76,128,1,127,252,0,0,0,0]))
+    else:
+        os.write(1,b"\\x01\\x00\\x02\\x00"*2646)
+''', encoding='utf8')
         fake.chmod(0o755)
         ipc, child = socket.socketpair()
         ipc.settimeout(5)
@@ -306,12 +328,16 @@ def check(binary):
                 request = json.loads(until_frame(live, 7)[3])
                 assert request['active'] and request['sample_rate'] == 16000
                 payload = struct.pack('<Q', request['generation']) + bytes(640)
-                live.sendall(struct.pack('<IBBHQ', 12+len(payload),130,0,0,0)+payload)
-                encrypted, _ = microphone_peer.recvfrom(1500)
-                assert encrypted[0] == 0xab and int.from_bytes(encrypted[1:3],'big') == len(encrypted)-3
-                rtp = cipher.decrypt(encrypted[3:])
-                assert rtp[:2] == b'\x80\x60' and int.from_bytes(rtp[8:12],'big') == 7
-                assert rtp[12:15] == bytes([255,241,96])
+                packet = struct.pack('<IBBHQ', 12+len(payload),130,0,0,0)+payload
+                live.sendall(packet + packet)
+                for sequence in range(2):
+                    encrypted, _ = microphone_peer.recvfrom(1500)
+                    assert encrypted[0] == 0xab and int.from_bytes(encrypted[1:3],'big') == len(encrypted)-3
+                    rtp = cipher.decrypt(encrypted[3:])
+                    assert rtp[:2] == b'\x80\x60' and int.from_bytes(rtp[8:12],'big') == 7
+                    assert int.from_bytes(rtp[2:4],'big') == sequence
+                    assert int.from_bytes(rtp[4:8],'big') == sequence * 1920
+                    assert rtp[12:16] == bytes([255,241,76,128])  # AAC-LC, 48k stereo
                 rpc(ipc, dict(op='microphone-stop'))
                 assert not json.loads(until_frame(live,7)[3])['active']
                 live.sendall(struct.pack('<IBBHQ', 12+len(payload),130,0,0,0)+payload)

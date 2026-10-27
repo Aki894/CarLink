@@ -1,7 +1,7 @@
 //! Stateful DMSDP control and Simple speaker negotiation. No media/identity logging.
 use super::{Result,crypto::{Crypto,wipe},wire::{self,Decoder,Format,Frame,Message,Messages}};
 use serde_json::{Value,json};
-use std::io::Read;
+use std::{collections::VecDeque,io::Read};
 
 fn digits(s:&str,n:usize)->bool{!s.is_empty()&&s.len()<=n&&s.bytes().all(|b|b.is_ascii_digit())}
 fn seq(s:&str)->Result<()>{if digits(s,9){Ok(())}else{Err("invalid control sequence".into())}}
@@ -31,10 +31,12 @@ fn clock_port(s:&str)->Result<u16>{let(negative,text)=decimal(s)?;if negative{re
 fn trigger(body:&[u8])->Option<&str>{let text=std::str::from_utf8(body).ok()?.strip_prefix("msdp_trigger_method:")?.trim_matches(|c:char|c.is_ascii_whitespace());
     (!text.is_empty()&&text.bytes().all(|b|b.is_ascii_uppercase())).then_some(text)}
 
-struct Speaker{name:&'static str,kind:u8,remote:Option<u16>,ports:Option<(u16,i32)>,session:Option<u32>,sequence:u32,setup:Option<u32>,format:Option<Value>,ready:bool}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum MicPhase{Idle,Crypto,Setup,Play,Ready}
+struct Speaker{name:&'static str,kind:u8,remote:Option<u16>,ports:Option<(u16,i32)>,session:Option<u32>,sequence:u32,setup:Option<u32>,format:Option<Value>,ready:bool,mic_phase:MicPhase,retired:VecDeque<u32>}
 impl Speaker{
     fn new()->Self{Self::named("speaker1",3)}
-    fn named(name:&'static str,kind:u8)->Self{Self{name,kind,remote:None,ports:None,session:None,sequence:0,setup:None,format:None,ready:false}}
+    fn named(name:&'static str,kind:u8)->Self{Self{name,kind,remote:None,ports:None,session:None,sequence:0,setup:None,format:None,ready:false,mic_phase:MicPhase::Idle,retired:VecDeque::new()}}
     fn microphone(&self)->bool{matches!(self.kind,2|9)}
     fn notify(&self,name:&str)->Value{let mut v=json!({});v[format!("{}_{}",if self.microphone(){"microphone"}else{"audio"},name)]=true.into();if self.name!="speaker1"{v["service"]=self.name.into();v["modem"]=(self.kind>=9).into();if let Some(p)=self.remote{v["port"]=p.into();}if let Some(id)=self.session{v["session"]=id.into();}}v}
     fn request(&mut self,method:&str,extra:&[(&str,String)])->Result<Vec<u8>>{
@@ -42,7 +44,8 @@ impl Speaker{
         let mut fields=vec![("ServiceID",self.name.into()),("ServiceType",self.kind.to_string()),("DataSessionID",self.session.ok_or("no speaker session")?.to_string()),("CSeq",self.sequence.to_string())];fields.extend_from_slice(extra);
         encode(&format!("{method} * DMSDP/1.0"),&fields)
     }
-    fn teardown(&mut self)->Result<Option<Vec<u8>>>{if self.session.is_none(){return Ok(None);}let record=self.request("TEARDOWN",&[])?;self.session=None;self.ready=false;Ok(Some(record))}
+    fn retire(&mut self){if let Some(id)=self.session.take(){if self.microphone(){if self.retired.len()>=16{self.retired.pop_front();}self.retired.push_back(id);}}self.ready=false;self.remote=None;self.mic_phase=MicPhase::Idle;}
+    fn teardown(&mut self)->Result<Option<Vec<u8>>>{if self.session.is_none(){return Ok(None);}let record=self.request("TEARDOWN",&[])?;self.retire();Ok(Some(record))}
     fn state(&self)->Value{json!({"ports":self.ports,"session_id":self.session,"sequence":self.sequence,"setup_sequence":self.setup,"format":self.format,"ready":self.ready})}
     fn receive(&mut self,m:&Message)->Result<Option<(Vec<Value>,Vec<Vec<u8>>)>>{
         let h=&m.headers;if h.get("serviceid").map(String::as_str)!=Some(self.name){return Ok(None);}
@@ -58,35 +61,67 @@ impl Speaker{
             match t{
                 "OPTIONS"=>{
                     let(port,rtcp)=self.ports.ok_or("speaker ports are not configured")?;
-                    if port==0||rtcp!= -1||h.get("simple").map(String::as_str)!=Some("1")||id==0{return Err("unsupported speaker setup mode".into());}
+                    if port==0||rtcp!= -1||!matches!(h.get("simple").map(String::as_str),Some("1"|"0"))||id==0{return Err("unsupported speaker setup mode".into());}
                     if self.session==Some(id){return Ok(Some((events,replies)));}
+                    if self.microphone()&&self.retired.contains(&id){return Ok(Some((events,replies)));}
+                    if self.session.is_some(){if self.microphone()&&self.ready{events.push(self.notify("stopped"));}self.retire();}
                     self.session=Some(id);self.ready=false;self.format=None;
-                    replies.push(self.request("SETUP",&[("Transport",format!("RTP/AVP/UDP;unicast;client_port={port}--1")),("Simple","1".into()),("CryptoVer","1".into()),("CryptoAbility","222".into()),("CryptoAlg","aes128-ctr".into()),("Fillp","0".into()),("TCP","0".into()),("Codec","0".into())])?);
+                    if self.microphone(){
+                        // A mic is a sender: the phone owns the RTP receiver.
+                        // Simple=0 initiates its per-stream crypto and SETUP.
+                        replies.push(self.request("OPTIONS",&[("Simple","0".into()),("CryptoVer","1".into()),("CryptoAbility","222".into()),("CryptoAlg","aes128-ctr".into()),("Fillp","0".into()),("TCP","0".into()),("Codec","0".into())])?);
+                        self.mic_phase=MicPhase::Crypto;
+                    }else{
+                        if h.get("simple").map(String::as_str)!=Some("1"){return Err("unsupported speaker setup mode".into());}
+                        replies.push(self.request("SETUP",&[("Transport",format!("RTP/AVP/UDP;unicast;client_port={port}--1")),("Simple","1".into()),("CryptoVer","1".into()),("CryptoAbility","222".into()),("CryptoAlg","aes128-ctr".into()),("Fillp","0".into()),("TCP","0".into()),("Codec","0".into())])?);
+                    }
                     self.setup=Some(self.sequence);events.push(self.notify("setup_sent"));
                 },
                 "TEARDOWN"=>{if self.session==Some(id){if let Some(record)=self.teardown()?{replies.push(record);}events.push(self.notify("stopped"));}},
-                "CLOSE"=>{if self.session==Some(id){self.session=None;self.ready=false;events.push(self.notify("stopped"));}},
+                "CLOSE"=>{if self.session==Some(id){events.push(self.notify("stopped"));self.retire();}},
                 _=>return Err("unsupported speaker trigger".into()),
             }
         }else if m.start.starts_with("DMSDP/1.0 "){
             if self.session!=Some(id)||sequence.parse::<u32>().ok()!=self.setup{return Ok(Some((events,replies)));}
             if !m.start.starts_with("DMSDP/1.0 200 "){return Err("speaker setup refused".into());}
+            if self.microphone(){return Ok(Some((events,replies)));}
             let transport=h.get("transport").map(String::as_str).unwrap_or("");
             let ports=transport.strip_prefix("RTP/AVP/UDP;unicast;client_port=").and_then(|s|s.strip_suffix("--1")).and_then(|s|s.split_once("--1;server_port="));
             let (client,server)=ports.ok_or("invalid speaker server endpoint")?;
             if !client.bytes().all(|b|b.is_ascii_digit())||client.is_empty()||!server.bytes().all(|b|b.is_ascii_digit())||server.is_empty(){return Err("invalid speaker server endpoint".into());}
             if client.parse::<u16>().ok()!=self.ports.map(|p|p.0)||server.parse::<u16>().ok().filter(|p|*p!=0).is_none(){return Err("invalid speaker server endpoint".into());}
             self.remote=server.parse().ok();self.ready=true;events.push(self.notify("ready"));
-        }else if self.session!=Some(id){return Err("speaker session mismatch".into());}
+        }else if self.session!=Some(id){if self.microphone(){return Ok(Some((events,replies)));}return Err("speaker session mismatch".into());}
         else if m.start.starts_with("SET_PARAMETER "){
+            if self.microphone()&&h.contains_key("cryptoswitch"){
+                if self.mic_phase==MicPhase::Idle||h.get("cryptover").map(String::as_str)!=Some("1")||h.get("cryptoswitch").map(String::as_str)!=Some("222")||h.get("cryptoalg").map(String::as_str)!=Some("aes128-ctr")||!m.body.is_empty(){return Err("unsupported microphone crypto negotiation".into());}
+                replies.push(encode("DMSDP/1.0 200 OK",&[("ServiceID",name.into()),("ServiceType",kind.to_string()),("DataSessionID",id.to_string()),("CSeq",sequence.into()),("CryptoVer","1".into())])?);
+                if self.mic_phase==MicPhase::Crypto{self.mic_phase=MicPhase::Setup;}
+                return Ok(Some((events,replies)));
+            }
             let text=h.get("audioparameter").map(String::as_str).unwrap_or("");
             let parts=text.strip_prefix("SampleRate=").and_then(|s|s.strip_suffix(";Codec=0")).and_then(|s|s.split_once(";Format=16;ChannelNum="));
             let(rate,channels)=parts.ok_or("unsupported speaker audio parameters")?;
             if !matches!(rate,"48000"|"44100"|"32000"|"24000"|"16000"|"8000")||!matches!(channels,"1"|"2")||!m.body.is_empty(){return Err("unsupported speaker audio parameters".into());}
-            if self.microphone()&&(rate!="16000"||channels!="1"){return Err("microphone requires negotiated 16000 Hz mono AAC".into());}
+            if self.microphone()&&(rate!="48000"||channels!="2"){return Err("microphone requires negotiated 48000 Hz stereo AAC".into());}
             let format=json!({"codec":"aac-adts","rate":rate.parse::<u32>().unwrap(),"channels":channels.parse::<u8>().unwrap(),"pcm_bits":16});
             self.format=Some(format.clone());replies.push(acknowledge()?);let mut e=format;e["audio_negotiated"]=true.into();events.push(e);
-        }else if m.start.starts_with("TEARDOWN "){replies.push(acknowledge()?);self.session=None;self.ready=false;events.push(self.notify("stopped"));}
+        }else if self.microphone()&&m.start.starts_with("SETUP "){
+            if !matches!(self.mic_phase,MicPhase::Setup|MicPhase::Play|MicPhase::Ready)||!m.body.is_empty(){return Err("unexpected microphone setup".into());}
+            let local=self.ports.ok_or("microphone port unavailable")?.0;
+            let client=h.get("transport").and_then(|s|s.strip_prefix("RTP/AVP/UDP;unicast;client_port=")).ok_or("invalid microphone transport")?;
+            let (rtp,rtcp)=client.split_once('-').ok_or("invalid microphone client ports")?;
+            let remote=rtp.parse::<u16>().ok().filter(|p|*p!=0).ok_or("invalid microphone client RTP port")?;
+            if rtcp!="-1"&&rtcp.parse::<u16>().ok().filter(|p|*p!=0).is_none(){return Err("invalid microphone client RTCP port".into());}
+            if self.mic_phase!=MicPhase::Setup&&self.remote!=Some(remote){return Err("microphone endpoint changed during setup".into());}
+            self.remote=Some(remote);
+            replies.push(encode("DMSDP/1.0 200 OK",&[("ServiceID",name.into()),("ServiceType",kind.to_string()),("DataSessionID",id.to_string()),("CSeq",sequence.into()),("Transport",format!("RTP/AVP/UDP;unicast;client_port={client};server_port={local}--1"))])?);
+            if self.mic_phase==MicPhase::Setup{self.mic_phase=MicPhase::Play;}
+        }else if self.microphone()&&m.start.starts_with("PLAY "){
+            if !matches!(self.mic_phase,MicPhase::Play|MicPhase::Ready)||!m.body.is_empty(){return Err("unexpected microphone play".into());}
+            replies.push(acknowledge()?);
+            if self.mic_phase!=MicPhase::Ready{self.ready=true;self.mic_phase=MicPhase::Ready;events.push(self.notify("ready"));}
+        }else if m.start.starts_with("TEARDOWN "){replies.push(acknowledge()?);events.push(self.notify("stopped"));self.retire();}
         else if m.start.starts_with("GET_PARAMETER ")&&m.body.is_empty(){replies.push(acknowledge()?);}
         else{return Err("unsupported speaker request".into());}
         Ok(Some((events,replies)))
@@ -164,7 +199,7 @@ impl Session{
                 104=>{if !self.device_exchanged||body.len()-pos!=4{return Err("invalid service discovery request".into());}let mask=u32::from_be_bytes(body[pos..].try_into().unwrap());events.push(json!({"service_request_mask":mask}));
                     for service_type in [8,4,2,256,512]{if mask&service_type==0||service_type==4&&self.speaker.is_none()||matches!(service_type,2|256|512)&&self.services.is_empty(){continue;}
                         let id=self.device_info.get("deviceId").and_then(Value::as_str).ok_or("missing local device identifier")?;let name=self.device_info.get("deviceName").and_then(Value::as_str).ok_or("missing local device name")?;
-                        let service=if service_type==8{json!({"deviceId":id,"deviceName":name,"serviceId":"display1","serviceType":8,"properties":{"4001":1.0,"1009":800,"1010":480},"status":{}})}else{let microphone=matches!(service_type,2|256);let service_id=match service_type{2=>"mic1",256=>"modemMic",512=>"modemSpeaker",_=>"speaker1"};let rates=if microphone{"16000"}else if service_type==4{"48000,44100"}else{"48000,44100,16000,8000"};json!({"deviceId":id,"deviceName":name,"serviceId":service_id,"serviceType":service_type,"properties":{"2003":rates,"2004":"1","2005":if microphone{"16"}else{"12"}},"status":{}})};
+                        let service=if service_type==8{json!({"deviceId":id,"deviceName":name,"serviceId":"display1","serviceType":8,"properties":{"4001":1.0,"1009":800,"1010":480},"status":{}})}else{let microphone=matches!(service_type,2|256);let service_id=match service_type{2=>"mic1",256=>"modemMic",512=>"modemSpeaker",_=>"speaker1"};let rates=if microphone{"48000"}else if service_type==4{"48000,44100"}else{"48000,44100,16000,8000"};json!({"deviceId":id,"deviceName":name,"serviceId":service_id,"serviceType":service_type,"properties":{"2003":rates,"2004":"1","2005":"12"},"status":{}})};
                         let mut payload=wire::uint(102)?;payload.extend(ascii_json(&service)?);self.business(3,u32::MAX,&payload)?;events.push(json!({"service_announced":service_type}));
                     }
                 },_=>{},
@@ -237,9 +272,23 @@ pub fn differential(v:&Value)->Result<Value>{
         let trigger=frame(b"SET_PARAMETER * DMSDP/1.0\r\nCSeq: 1\r\nServiceID: mic1\r\nServiceType: 2\r\nDataSessionID: 7\r\nSimple: 1\r\nContent-Length: 28\r\n\r\nmsdp_trigger_method: OPTIONS".to_vec(),false).unwrap();
         assert!(s.receive(&trigger,0,false).is_err());
         let mut s=Session::new(&[],json!({"properties":{"5002":true}}),true).unwrap();s.set_audio_ports((41000,-1)).unwrap();s.negotiated=true;
-        let (events,_)=s.receive(&trigger,0,false).unwrap();assert_eq!(events.last().unwrap()["microphone_setup_sent"],true);s.pending();
-        let response=frame(b"DMSDP/1.0 200 OK\r\nCSeq: 1\r\nServiceID: mic1\r\nServiceType: 2\r\nDataSessionID: 7\r\nTransport: RTP/AVP/UDP;unicast;client_port=41000--1;server_port=42000--1\r\n\r\n".to_vec(),false).unwrap();
-        let (events,_)=s.receive(&response,0,false).unwrap();assert_eq!(events.last().unwrap()["microphone_ready"],true);assert_eq!(events.last().unwrap()["port"],42000);
+        let decoded=|packets:Vec<Vec<u8>>|->Vec<String>{packets.into_iter().map(|p|{let frames=Decoder::new(Format::Control).feed(&p).unwrap();String::from_utf8(frames[0].payload.clone()).unwrap()}).collect()};
+        let (events,_)=s.receive(&trigger,0,false).unwrap();assert_eq!(events.last().unwrap()["microphone_setup_sent"],true);
+        let options=decoded(s.pending()).pop().unwrap();assert!(options.starts_with("OPTIONS * DMSDP/1.0\r\n"));assert!(options.contains("Simple: 0\r\n"));assert!(!options.contains("Transport:"));
+        let crypto=frame(b"SET_PARAMETER * DMSDP/1.0\r\nCSeq: 11\r\nServiceID: mic1\r\nServiceType: 2\r\nDataSessionID: 7\r\nCryptoVer: 1\r\nCryptoSwitch: 222\r\nCryptoAlg: aes128-ctr\r\nFillp: 0\r\nTCP: 0\r\n\r\n".to_vec(),false).unwrap();
+        s.receive(&crypto,0,false).unwrap();let response=decoded(s.pending()).pop().unwrap();assert!(response.contains("CryptoVer: 1\r\n"));assert!(response.contains("CSeq: 11\r\n"));
+        let setup=frame(b"SETUP * DMSDP/1.0\r\nCSeq: 12\r\nServiceID: mic1\r\nServiceType: 2\r\nDataSessionID: 7\r\nTransport: RTP/AVP/UDP;unicast;client_port=42000--1\r\n\r\n".to_vec(),false).unwrap();
+        let(events,_)=s.receive(&setup,0,false).unwrap();assert!(events.iter().all(|e|e["microphone_ready"]!=true));
+        let response=decoded(s.pending()).pop().unwrap();assert!(response.contains("client_port=42000--1;server_port=41000--1\r\n"));assert!(response.contains("CSeq: 12\r\n"));
+        // A repeated SETUP must acknowledge the same endpoint without rewinding the state.
+        s.receive(&setup,0,false).unwrap();assert_eq!(decoded(s.pending()).len(),1);
+        let play=frame(b"PLAY * DMSDP/1.0\r\nCSeq: 13\r\nServiceID: mic1\r\nServiceType: 2\r\nDataSessionID: 7\r\n\r\n".to_vec(),false).unwrap();
+        let (events,_)=s.receive(&play,0,false).unwrap();assert_eq!(events.last().unwrap()["microphone_ready"],true);assert_eq!(events.last().unwrap()["port"],42000);assert_eq!(events.last().unwrap()["session"],7);assert_eq!(decoded(s.pending()).len(),1);
+        let(events,_)=s.receive(&play,0,false).unwrap();assert!(events.iter().all(|e|e["microphone_ready"]!=true));assert_eq!(decoded(s.pending()).len(),1);
+        // A replacement retires the old session; old CLOSE/PLAY/triggers must not revoke it.
+        let next=frame(b"SET_PARAMETER * DMSDP/1.0\r\nCSeq: 14\r\nServiceID: mic1\r\nServiceType: 2\r\nDataSessionID: 8\r\nSimple: 1\r\nContent-Length: 28\r\n\r\nmsdp_trigger_method: OPTIONS".to_vec(),false).unwrap();
+        let(events,_)=s.receive(&next,0,false).unwrap();assert!(events.iter().any(|e|e["microphone_stopped"]==true));s.pending();
+        s.receive(&trigger,0,false).unwrap();assert!(s.pending().is_empty());s.receive(&play,0,false).unwrap();assert!(s.pending().is_empty());assert_eq!(s.services[0].session,Some(8));
         s.stop_audio().unwrap();assert!(s.services.iter().all(|s|s.session.is_none()));
     }
     #[test]fn null_session_preserves_fragmentation_and_negotiation(){

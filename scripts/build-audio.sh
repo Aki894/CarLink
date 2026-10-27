@@ -92,15 +92,28 @@ mic = array.array('h', (int(8000*math.sin(2*math.pi*440*i/16000)) for i in range
 if sys.byteorder != 'little': mic.byteswap()
 encoded = subprocess.run(['qemu-arm','-L','/usr/arm-linux-gnueabihf',str(out/'bin/carlink-audio'),
     '-hide_banner','-loglevel','error','-f','s16le','-ar','16000','-ac','1','-i','pipe:0',
-    '-c:a','aac','-b:a','32000','-f','adts','pipe:1'],input=mic.tobytes(),stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True,timeout=30)
+    '-ar','48000','-ac','2','-c:a','aac','-b:a','64000','-f','adts','pipe:1'],input=mic.tobytes(),stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True,timeout=30)
 assert encoded.stdout.startswith(b'\xff\xf1') and len(encoded.stdout)>500
+offset = frames = 0
+while offset < len(encoded.stdout):
+    h = encoded.stdout[offset:offset+7]
+    assert len(h) == 7 and h[:2] == b'\xff\xf1'
+    assert (h[2] >> 2) & 15 == 3  # 48 kHz sampling-frequency index
+    assert ((h[2] & 1) << 2 | h[3] >> 6) == 2
+    size = ((h[3] & 3) << 11) | (h[4] << 3) | (h[5] >> 5)
+    assert 7 < size <= 1400 and offset+size <= len(encoded.stdout)
+    offset += size; frames += 1
+assert frames >= 20 and offset == len(encoded.stdout)
 decoded = subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-f','aac','-i','pipe:0',
-    '-f','s16le','-ac','1','-ar','16000','pipe:1'],input=encoded.stdout,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True,timeout=30)
-assert len(decoded.stdout)>=16000 and any(decoded.stdout)
+    '-f','s16le','-ac','2','-ar','48000','pipe:1'],input=encoded.stdout,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True,timeout=30)
+audio = array.array('h'); audio.frombytes(decoded.stdout)
+if sys.byteorder != 'little': audio.byteswap()
+assert len(decoded.stdout)>=96000 and max(map(abs,audio))>5000
+assert sum(abs(audio[i]-audio[i+1]) for i in range(0,len(audio),2)) < len(audio)*100
 (out / 'audio-validation.txt').write_text(
     'ARMv7 QEMU: pipe s16le 48000 Hz stereo -> 44100 Hz stereo passed\n'
     'Output: 4410 frames, 17640 bytes, non-silent equal stereo channels\n'
-    'ARMv7 microphone PCM16 16000 mono -> AAC ADTS -> host decode passed\n')
+    'ARMv7 microphone PCM16 16000 mono -> AAC ADTS 48000 stereo -> host decode passed\n')
 PY
 for name in LICENSE.md COPYING.LGPLv2.1; do
     cp "$source_dir/$name" "$out/share/licenses/audio/"
