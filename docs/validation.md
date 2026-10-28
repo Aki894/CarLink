@@ -1,5 +1,20 @@
 # 验证与部署记录
 
+## 2026-10-28：HiCar 双向音频、无感连接与协议切换
+
+当前部署源码 `d4205f2ef4744acccd67261c9fb1b2566d6399e2`，运行目录 `/opt/carlink/releases/calls-d4205f2ef474`；应用 SHA256 `efb1cf20065de90e676c291f2ec5c81b9ead41909a7ff596763ff83ea8031d31`。部署后核对实际运行路径和七个关键文件哈希，保留回滚目录 `/var/backups/carlink/calls-20261028T100739Z`。
+
+- **HiCar 自动连接**：主动查询已配对手机的 SDP，选择 FE35 的 RFCOMM 记录，排除同 UUID 的 ATT 记录；用户确认已能无感连接。
+- **协议与菜单**：实机 HiCar → CarPlay → HiCar 自动连接分别约 8.5 / 9.7 / 8.5 秒，期间 CarLife PID `11095` 和 USB 会话保持不变。手动断开暂停自动连接，再点击连接可恢复；重复点击连接不重建接收端。该组切换运行于 `6b65118`，后续 `d4205f2` 仅修改麦克风上行。
+- **麦克风根因与修复**：DMSDP `DataSessionID` 是控制会话编号，不能作为虚拟麦克风的 RTP SSRC。上行改为 stream `1100` 后，手机执行 AAC/ADTS 解码、PCM 入队和读取，原先的 `no packet` 与录音反复重启消失。语音探针采集 283 包 / 289792 字节，发送 418 个 RTP 包。
+- **实际通话**：独立 Android CarLife 测试端与华为 HiCar 源机分离；用户确认双向通话、挂断后音乐恢复和画面连接均正常。本轮通话后 CarLife PID `16281` 保持不变。
+- **异常退出恢复**：对 HiCar 接收进程注入 SIGTERM 后，约 3.29 秒返回菜单、19.69 秒自动恢复 HiCar；CarLife 进程与 USB 会话保持不变。
+- **USB 与控制链路**：视频心跳等待 VIDEO_START 且传输就绪后发送，PAUSE 保留已完成握手，SUSPEND 停发、RESUME 恢复。CarPlay 控制 TCP 增加六秒连接失效检测，媒体/事件 socket 保留独立参数。CI 覆盖握手门槛、暂停恢复、健康静默连接、媒体背压、音频角色/服务代次隔离及三次返回菜单。
+
+[应用构建 40667649054](https://github.com/Aki894/CarLink/actions/runs/40667649054) 和 [完整固件构建 40669393281](https://github.com/Aki894/CarLink/actions/runs/40669393281) 成功，native、rust-interop、firmware、镜像结构检查和产物上传完成。已下载并复核 GitHub artifact digest 与镜像 SHA256SUMS：`CarLink-refresh-39459953269-d4205f2e.img.xz` SHA256 `051c814c43853d24f56ed797ee58cd04ecfc2725a8c5a2e967a05c937079fd48`。
+
+HelloCar 对应模块、测试及接口文档已本地同步，未提交或上传。Lexus 实车握手、实体触控板及长时间导航/通话路测仍安排在后续实车验收。
+
 ## 2026-10-27：双向通话与 USB 恢复
 
 运行提交 `cac132a0644ecd017adc9f090015d7d6a930b082`，台架目录 `/opt/carlink/releases/calls-cac132a0644e`。应用由 [Actions 40379459149](https://github.com/Aki894/CarLink/actions/runs/40379459149) 编译，GitHub artifact digest、内部 SHA256SUMS、ARM ABI 与部署文件哈希均已核对；管理器、CarLife、CarPlay 和 HiCar 音频工具路径使用同一发布目录。
