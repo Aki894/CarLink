@@ -1,5 +1,20 @@
 # 验证与部署记录
 
+## 2026-10-29：导航与音乐并行时的 HiCar VoIP 通话
+
+修复源码 `68dfc2ea9d1b26b5a60c4f8291c0a33ffe6e3288` 已部署至 `/opt/carlink/releases/calls-68dfc2ea9d1b`，应用 SHA256 `5333f159badaeca8b484feb312160f9e6fbad6e2aa3cacf62c6cc22a77457a03`，七个运行文件及子进程路径核对通过。
+
+根因是微信通话复用 `speaker1/mic1`，此前只根据 modem 服务识别通话，漏掉 DMSDP module 4 的 VoIP 焦点请求。车机麦克风独占焦点后暂停 MEDIA 播放器，而下行通话仍被当作普通音乐发送，形成积压。现按明确的焦点 usage 进入/退出通话角色，并结合 RTP stream/usage 区分同端口通话、音乐及导航；角色切换清理旧解码与待发 PCM，保留播放器 STOP，挂断后的迟到通话包被丢弃。另保留 CarLife 错误原因与 PID，便于复查 USB 失败。
+
+- 用户在导航、音乐同时运行时复测通话，确认对方声音实时播放、挂断后音乐自动恢复、CarLife 未断开。
+- 本轮日志记录 HiCar 和 CarLife 两侧 `call_active=true`；CarLife PID `2412` 在通话前后保持不变，USB 连接正常；新版 manager 启动后未出现 CarLife 重启。
+- [应用构建 40722403781](https://github.com/Aki894/CarLink/actions/runs/40722403781) 成功，168 项 Rust 单测及真实 DMSDP 焦点入口、backend 到媒体控制、同端口混流和挂断恢复回归通过。
+- [完整固件构建 40723628181](https://github.com/Aki894/CarLink/actions/runs/40723628181) 的 native、rust-interop、firmware、镜像结构校验及产物上传均成功。
+
+已下载固件并核对 GitHub artifact digest、SHA256SUMS 与镜像检查报告；`CarLink-refresh-39459953269-68dfc2ea.img.xz` SHA256 为 `f4ecbe4b01b7fcd98594063e50762611e8eee120d4a324ed3c017719a1924da8`。
+
+此前独立通话场景的结果保留在下节；本节补充的是导航与音乐并行的组合场景。对应 HiCar 代码已同步至本地 HelloCar，尚未推送此次修复。
+
 ## 2026-10-28：HiCar 双向音频、无感连接与协议切换
 
 当前部署源码 `d4205f2ef4744acccd67261c9fb1b2566d6399e2`，运行目录 `/opt/carlink/releases/calls-d4205f2ef474`；应用 SHA256 `efb1cf20065de90e676c291f2ec5c81b9ead41909a7ff596763ff83ea8031d31`。部署后核对实际运行路径和七个关键文件哈希，保留回滚目录 `/var/backups/carlink/calls-20261028T100739Z`。
