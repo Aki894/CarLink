@@ -345,6 +345,7 @@ impl Owner{
                 if self.store.devices.len()>=8{return Err("device store is full".into());}self.store.devices.push(d);save(&self.config.state,&self.store)?;},
             "switch_protocol"=>{
                 let protocol=if v.get("protocol").is_some(){serde_json::from_value(v["protocol"].clone()).map_err(|_|"invalid protocol")?}else{match self.selected_protocol(){Protocol::Carplay=>Protocol::Hicar,Protocol::Hicar=>Protocol::Carplay}};
+                if self.backend.is_some()&&!self.status.paused&&self.status.protocol==Some(protocol){return Ok(json!({"ok":true,"status":self.status}));}
                 if self.status.call_active{return Err("finish the active call before switching protocols".into());}
                 self.stop_backend()?;self.choice=None;self.store.selected_protocol=Some(protocol);self.status.protocol=Some(protocol);self.status.target=None;self.status.pairing=false;self.pair_deadline=None;self.tried.clear();self.store.paused=false;self.status.paused=false;self.store.policy=Policy::Last;save(&self.config.state,&self.store)?;
                 self.retry_at=Instant::now();self.show_recovery_menu();
@@ -356,6 +357,7 @@ impl Owner{
             "connect"=>{let address=v["address"].as_str().ok_or("missing target address")?;
                 let protocol:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing protocol")?;
                 let d=self.store.devices.iter().find(|d|d.protocol==protocol&&d.address.eq_ignore_ascii_case(address)).cloned().ok_or("unknown target device")?;
+                if self.backend.is_some()&&!self.status.paused&&self.choice.as_ref().is_some_and(|c|c.protocol==protocol&&c.device.as_ref().is_some_and(|current|current.address.eq_ignore_ascii_case(address))){return Ok(json!({"ok":true,"status":self.status}));}
                 self.tried.clear();self.select(Choice{protocol,device:Some(d),pairing:false})?;self.store.paused=false;self.status.paused=false;save(&self.config.state,&self.store)?;},
             "pair"=>{let protocol:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing protocol")?;
                 if self.store.devices.len()>=8{return Err("device store is full; forget a device first".into());}
@@ -596,6 +598,20 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
             assert_eq!(owner.automatic().is_some(),!paused&&policy==Policy::Last);assert_eq!(fs::read_to_string(&path).unwrap(),record);
             fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
         }
+    }
+    #[test]fn repeated_current_selection_preserves_receiver_even_during_call(){
+        let root=test_root("idempotent-selection");let mut owner=test_owner(&root);
+        let device=Device{protocol:Protocol::Carplay,address:"02:00:00:00:00:01".into(),name:"phone".into(),auto:true,last_used:1};
+        owner.store.devices.push(device.clone());owner.store.selected_protocol=Some(device.protocol);
+        owner.choice=Some(Choice{protocol:device.protocol,device:Some(device.clone()),pairing:false});
+        owner.backend=Some(spawn(&["/bin/sleep".into(),"60".into()],0,None).unwrap());
+        owner.status.protocol=Some(device.protocol);owner.status.active=true;owner.status.call_active=true;
+        let pid=owner.backend.as_ref().unwrap().child.id();let generation=owner.status.generation;
+        owner.command(json!({"op":"switch_protocol","protocol":"carplay"})).unwrap();
+        owner.command(json!({"op":"connect","protocol":"carplay","address":device.address})).unwrap();
+        assert_eq!(owner.backend.as_ref().unwrap().child.id(),pid);assert_eq!(owner.status.generation,generation);assert!(owner.status.active);
+        assert!(owner.command(json!({"op":"switch_protocol","protocol":"hicar"})).is_err());
+        owner.status.call_active=false;owner.stop_backend().unwrap();fs::remove_dir_all(root).unwrap();
     }
     #[test]fn missing_pair_identity_does_not_interrupt_active_projection(){
         let root=test_root("pair-identity-missing");let mut owner=test_owner(&root);

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -31,6 +32,7 @@
 #define LIMIT (512 * 1024)
 typedef struct {
     unsigned char *font_bytes, *image;
+    size_t font_size;
     stbtt_fontinfo font;
     H264E_persist_t *encoder;
     H264E_scratch_t *scratch;
@@ -38,7 +40,8 @@ typedef struct {
 static void *aligned(size_t n) { void *p = NULL; return posix_memalign(&p, 64, n) ? NULL : p; }
 __attribute__((visibility("default"))) void carlink_menu_destroy(void *opaque) {
     Menu *m = opaque; if (!m) return;
-    free(m->font_bytes); free(m->image); free(m->encoder); free(m->scratch); free(m);
+    if (m->font_bytes) munmap(m->font_bytes, m->font_size);
+    free(m->image); free(m->encoder); free(m->scratch); free(m);
 }
 __attribute__((visibility("default"))) void *carlink_menu_create(const char *path) {
     if (!path) return NULL;
@@ -46,11 +49,13 @@ __attribute__((visibility("default"))) void *carlink_menu_create(const char *pat
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC); struct stat st;
     if (fd < 0) goto failed;
     if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 1024 || st.st_size > 24*1024*1024) { close(fd); goto failed; }
-    size_t size = (size_t)st.st_size; m->font_bytes = malloc(size);
-    if (!m->font_bytes) { close(fd); goto failed; }
-    size_t offset = 0;
-    while (offset < size) { ssize_t n = read(fd, m->font_bytes+offset, size-offset); if (n <= 0) { close(fd); goto failed; } offset += (size_t)n; }
+    // stbtt retains pointers into the font. Keep a read-only mapping for the
+    // renderer lifetime so unused CJK glyph pages remain reclaimable/file-backed.
+    size_t size = (size_t)st.st_size;
+    void *font = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
+    if (font == MAP_FAILED) goto failed;
+    m->font_bytes = font; m->font_size = size;
     if (!stbtt_InitFont(&m->font, m->font_bytes, stbtt_GetFontOffsetForIndex(m->font_bytes, 0))) goto failed;
     m->image = aligned(WIDTH*HEIGHT*3/2); if (!m->image) goto failed;
     H264E_create_param_t parameters; memset(&parameters, 0, sizeof(parameters));

@@ -55,8 +55,10 @@ class BootProfileTests(unittest.TestCase):
         self.assertIn('identity.pk8 certificate.p7b', runner)
         logging = (self.root / 'etc/systemd/system/carlink.service.d/80-journal.conf').read_text()
         self.assertIn('ExecStartPre=/usr/bin/journalctl --flush', logging)
-        self.assertIn('ExecStartPre=/usr/bin/journalctl --sync', logging)
+        starts = [line for line in logging.splitlines() if line.startswith('ExecStartPre=')]
+        self.assertEqual(starts, ['ExecStartPre=/usr/bin/journalctl --flush'])
         journal = (self.root / 'etc/systemd/journald.conf.d/80-carlink.conf').read_text()
+        self.assertIn('Storage=persistent', journal)
         self.assertIn('SyncIntervalSec=5s', journal)
 
     def test_updates_are_delayed_not_masked(self):

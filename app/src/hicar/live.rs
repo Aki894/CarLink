@@ -331,9 +331,9 @@ impl Engine{
         for (id,decoder) in &mut self.decoders{if decoder.step().is_err(){failed.push(*id);}}
         for id in failed{self.reset_decoder(id);}
         if self.playout.due(Instant::now(),self.decoders.values().any(|d|d.pcm.len()>=PCM)){
-            let blocks:Vec<_>=self.decoders.values_mut().filter_map(Decoder::take_pcm).collect();
-            let pts=blocks.iter().map(|(_,t)|*t).max().unwrap_or(0);
-            let pcm=mix_pcm(blocks.iter().map(|(pcm,_)|pcm.as_slice()));if self.link.media(3,&pcm,pts,false){self.pcm_blocks+=1;}
+            if let Some((pcm,pts))=playout_pcm(self.decoders.values_mut().filter_map(Decoder::take_pcm)){
+                if self.link.media(3,&pcm,pts,false){self.pcm_blocks+=1;}
+            }
         }
         let controls=self.link.step();for v in controls{self.feedback(v);}self.flush_input();
         let mut failed=false;
@@ -344,10 +344,10 @@ impl Engine{
         }}
         if failed{self.invalid+=1;self.stop_microphone();println!("{}",json!({"event":"microphone_error","capture_stopped":true}));}
     }
-    fn pollfds(&self)->Vec<libc::pollfd>{
-        let mut fds=vec![libc::pollfd{fd:self.udp.as_raw_fd(),events:libc::POLLIN,revents:0}];
+    fn pollfds(&self,fds:&mut Vec<libc::pollfd>){
+        fds.clear();fds.push(libc::pollfd{fd:self.udp.as_raw_fd(),events:libc::POLLIN,revents:0});
         for fd in [self.video.as_ref().map(AsRawFd::as_raw_fd),self.link.socket.as_ref().map(AsRawFd::as_raw_fd),self.clock.as_ref().map(|c|c.socket.as_raw_fd())].into_iter().flatten(){fds.push(libc::pollfd{fd,events:libc::POLLIN,revents:0});}
-        for d in self.decoders.values().filter(|d|d.pcm.len()<6*PCM){fds.push(libc::pollfd{fd:d.output.as_raw_fd(),events:libc::POLLIN,revents:0});}fds
+        for d in self.decoders.values().filter(|d|d.pcm.len()<6*PCM){fds.push(libc::pollfd{fd:d.output.as_raw_fd(),events:libc::POLLIN,revents:0});}
     }
 }
 fn audio_port_allowed(ports:&BTreeMap<String,u16>,role:u8,port:u16,call_stream:bool)->bool{
@@ -376,7 +376,28 @@ fn audio_port_allowed(ports:&BTreeMap<String,u16>,role:u8,port:u16,call_stream:b
     assert!(link.socket.is_some());assert!(link.established);assert_eq!(link.mic_pcm.len(),6);assert_eq!(link.mic_pcm.front().unwrap().0,4);assert_eq!(link.dropped,4);
 }
 
+fn playout_pcm(blocks:impl Iterator<Item=(Vec<u8>,u64)>)->Option<(Vec<u8>,u64)>{
+    let mut blocks=blocks.peekable();let first=blocks.next()?;
+    // A single decoded stream is already PCM16 stereo. Move its owned block
+    // directly instead of allocating a collection, accumulator and mixed copy.
+    if blocks.peek().is_none(){return Some(first);}
+    let blocks:Vec<_>=std::iter::once(first).chain(blocks).collect();
+    let pts=blocks.iter().map(|(_,pts)|*pts).max().unwrap_or(0);
+    Some((mix_pcm(blocks.iter().map(|(pcm,_)|pcm.as_slice())),pts))
+}
 fn mix_pcm<'a>(blocks:impl Iterator<Item=&'a [u8]>)->Vec<u8>{let mut mixed=vec![0i32;PCM/2];for block in blocks{for (sample,data) in mixed.iter_mut().zip(block.chunks_exact(2)){*sample+=i16::from_le_bytes([data[0],data[1]])as i32;}}mixed.into_iter().flat_map(|sample|(sample.clamp(i16::MIN as i32,i16::MAX as i32)as i16).to_le_bytes()).collect()}
+#[test]fn single_stream_playout_moves_pcm_without_copying_and_multi_stream_keeps_clock(){
+    let pcm:Vec<_>=(0..PCM).map(|i|i as u8).collect();let pointer=pcm.as_ptr();
+    let (output,pts)=playout_pcm(std::iter::once((pcm,71))).unwrap();
+    assert_eq!(output.as_ptr(),pointer);assert_eq!(pts,71);
+    assert!(output.iter().enumerate().all(|(i,b)|*b==i as u8));
+    assert!(playout_pcm(std::iter::empty()).is_none());
+    let a=[30000i16.to_le_bytes(),(-30000i16).to_le_bytes()].concat();
+    let b=[30000i16.to_le_bytes(),30000i16.to_le_bytes()].concat();
+    let (output,pts)=playout_pcm([(a,10),(b,20)].into_iter()).unwrap();
+    assert_eq!(pts,20);assert_eq!(output.len(),PCM);
+    assert_eq!(&output[..4],&[i16::MAX.to_le_bytes(),0i16.to_le_bytes()].concat());
+}
 #[test]fn pcm_mixer_saturates_without_changing_sample_layout(){let a=[30000i16.to_le_bytes(),(-30000i16).to_le_bytes()].concat();let output=mix_pcm([a.as_slice(),a.as_slice()].into_iter());assert_eq!(output.len(),PCM);assert_eq!(&output[..4],&[i16::MAX.to_le_bytes(),i16::MIN.to_le_bytes()].concat());}
 #[test]fn playout_clock_has_no_scheduler_drift_or_pcm_overwrite(){
     for poll_us in [5200,6000,11000]{
@@ -434,6 +455,8 @@ pub fn run(fd:i32)->Result<()>{
     socket.write_all(&reply(json!({"ok":true,"ready":true,"audio_ports":[port,-1],"state":engine.state()}))?).map_err(|_|"private media ready failed")?;
     socket.set_nonblocking(true).map_err(|_|"private media mode failed")?;
     let mut input=vec![];let mut output:VecDeque<(Vec<u8>,usize)>=VecDeque::new();let mut closing=false;
+    // UDP, video, source, clock, up to four decoder pipes and private IPC.
+    let mut fds=Vec::with_capacity(9);
     loop{
         engine.step();let mut data=[0;8192];
         for _ in 0..4{match socket.read(&mut data){Ok(0)=>return Ok(()),Ok(n)=>{input.extend(&data[..n]);if input.len()>IPC_LIMIT+4{return Err("private media request exceeds limit".into());}},Err(e)if e.kind()==ErrorKind::WouldBlock=>break,Err(_)=>return Err("private media IPC failed".into())}}
@@ -445,7 +468,7 @@ pub fn run(fd:i32)->Result<()>{
         }
         while let Some((data,offset))=output.front_mut(){match socket.write(&data[*offset..]){Ok(0)=>return Ok(()),Ok(n)=>{*offset+=n;if *offset==data.len(){output.pop_front();}else{break;}},Err(e)if e.kind()==ErrorKind::WouldBlock=>break,Err(_)=>return Ok(())}}
         if closing&&output.is_empty(){return Ok(());}
-        let mut fds=engine.pollfds();fds.push(libc::pollfd{fd:socket.as_raw_fd(),events:libc::POLLIN,revents:0});unsafe{libc::poll(fds.as_mut_ptr(),fds.len() as libc::nfds_t,5);}
+        engine.pollfds(&mut fds);fds.push(libc::pollfd{fd:socket.as_raw_fd(),events:libc::POLLIN,revents:0});unsafe{libc::poll(fds.as_mut_ptr(),fds.len() as libc::nfds_t,5);}
     }
 }
 }
