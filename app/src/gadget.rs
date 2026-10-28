@@ -776,9 +776,11 @@ mod linux {
                         }
                     }
                     5 => {
+                        eprintln!("usb_gadget: FunctionFS suspend");
                         if let Some(worker) = workers.as_ref() { worker.enabled.store(false, Ordering::Release); }
                     }
                     6 => {
+                        eprintln!("usb_gadget: FunctionFS resume");
                         if let Some(worker) = workers.as_ref() { worker.enabled.store(enabled, Ordering::Release); }
                     }
                     _ => return Err("unknown FunctionFS event type".into()),

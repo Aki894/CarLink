@@ -205,7 +205,8 @@ impl Endpoint {
         // Video liveness has its own deadline. Continuous PCM must not keep
         // returning before the heartbeat when the picture is static or waiting
         // for a recovery IDR.
-        if (self.live.is_some() || self.media.is_some()) && self.session.video_config().is_some()
+        if self.transport_ready && self.handshake_complete
+            && (self.live.is_some() || self.media.is_some()) && self.session.video_config().is_some()
             && now.saturating_sub(self.last_video)>=Duration::from_secs(1) {
             self.last_video=now;
             let timestamp=self.live.as_mut().map_or(now.as_millis() as u32,
@@ -323,6 +324,28 @@ mod tests {
         assert!(!Endpoint::new().handshake_complete());
     }
 
+    #[test]
+    fn heartbeat_waits_for_start_and_transport_but_survives_pause() {
+        let path=std::env::temp_dir().join(format!("carlink-heartbeat-gate-{}",std::process::id()));
+        let mut endpoint=Endpoint::with_source(None,Some(path)).unwrap();
+        for (id,payload) in [(ids::HU_PROTOCOL_VERSION,vec![8,4,16,1]),
+            (ids::VIDEO_INIT,vec![8,0xa0,6,16,0xe0,3,24,30])] {
+            endpoint.receive(&Message::command(id,payload).unwrap().encode().unwrap()).unwrap();
+        }
+        endpoint.clock=Instant::now()-Duration::from_secs(2);
+        assert!(endpoint.poll_media().unwrap().is_none());
+        endpoint.receive(&Message::command(ids::VIDEO_START,vec![]).unwrap().encode().unwrap()).unwrap();
+        assert!(endpoint.poll_media().unwrap().is_some());
+        endpoint.receive(&Message::command(ids::VIDEO_PAUSE,vec![]).unwrap().encode().unwrap()).unwrap();
+        endpoint.clock=Instant::now()-Duration::from_secs(4);
+        endpoint.transport_ready(false);
+        assert!(endpoint.poll_media().unwrap().is_none());
+        endpoint.transport_ready(true);
+        let packet=endpoint.poll_media().unwrap().expect("paused established session keeps heartbeat");
+        let messages=Decoder::new(Limits::default()).feed(&packet).unwrap();
+        assert_eq!(messages[0].id,0x20002);
+        assert!(messages[0].payload.is_empty());
+    }
     #[test]
     fn continuous_audio_cannot_starve_video_heartbeat() {
         let path=std::env::temp_dir().join(format!("carlink-heartbeat-{}",std::process::id()));
