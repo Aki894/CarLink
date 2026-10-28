@@ -164,7 +164,10 @@ def check(binary):
                     s=until(lambda s:s['protocol']==protocol and s['active'])
                     assert s['carlife_pid']==first_life, 'source switch restarted the USB output'
                     cleanup=[e for e in events()[marker:] if e['event']=='disconnect']
-                    assert len(cleanup)==1 and cleanup[0]['args']==['--timeout','3','disconnect',old['target']['address']], 'switch cleaned the wrong Bluetooth target'
+                    if old['protocol']==protocol and old['target']['address']==device['address']:
+                        assert not cleanup and s['backend_pid']==old['backend_pid'] and s['generation']==old['generation'], 'duplicate selection restarted its receiver'
+                    else:
+                        assert len(cleanup)==1 and cleanup[0]['args']==['--timeout','3','disconnect',old['target']['address']], 'switch cleaned the wrong Bluetooth target'
                     assert not any(e['event']=='remove' for e in events()[marker:]), 'ordinary source switching removed a bond'
             # Bluetooth may already be disconnected or the controller may reject
             # cleanup. Both directions must still transfer ownership successfully.
