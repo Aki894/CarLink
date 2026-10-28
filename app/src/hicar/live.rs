@@ -213,8 +213,8 @@ impl Engine{
         "microphone-start"=>{
             let service=v["service"].as_str().unwrap_or("mic1");if !matches!(service,"mic1"|"modemMic"){return Err("invalid microphone service".into());}
             self.stop_microphone();self.mic_generation=self.mic_generation.checked_add(1).ok_or("microphone generation exhausted")?.max(now_us());
-            let remote=port(v,"port")?;let stream=v["session"].as_u64().filter(|id|*id<=u32::MAX as u64).ok_or("invalid microphone session")? as u32;
-            self.uplink=Some(super::super::uplink::Uplink::new(&self.audio_binary,self.mic_generation,remote,stream)?);self.mic_service=Some(service.into());self.link.microphone(self.mic_generation,true);
+            let remote=port(v,"port")?;v["session"].as_u64().filter(|id|*id>0&&*id<=u32::MAX as u64).ok_or("invalid microphone control session")?;
+            self.uplink=Some(super::super::uplink::Uplink::new(&self.audio_binary,self.mic_generation,remote)?);self.mic_service=Some(service.into());self.link.microphone(self.mic_generation,true);
         },
         "microphone-stop"=>{if v["service"].is_null()||v["service"].as_str()==self.mic_service.as_deref(){self.stop_microphone();}},
         "audio-service"=>{

@@ -370,7 +370,9 @@ while True:
                     encrypted, _ = microphone_peer.recvfrom(1500)
                     assert encrypted[0] == 0xab and int.from_bytes(encrypted[1:3],'big') == len(encrypted)-3
                     rtp = cipher.decrypt(encrypted[3:])
-                    assert rtp[:2] == b'\x80\x60' and int.from_bytes(rtp[8:12],'big') == 7
+                    # DataSessionID=7 belongs to control; virtual mic RTP must
+                    # select the separately registered AudioStream type 1100.
+                    assert rtp[:2] == b'\x80\x60' and int.from_bytes(rtp[8:12],'big') == 1100
                     assert int.from_bytes(rtp[2:4],'big') == sequence
                     stamp = int.from_bytes(rtp[4:8], 'big')
                     if origin is None:
