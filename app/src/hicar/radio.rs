@@ -19,6 +19,7 @@ struct Config{
     #[serde(default)]pair_seconds:u64,#[serde(default="channel")]channel:u16,
     #[serde(default="power")]tx_power:i16,#[serde(default)]interface:Option<String>,
     #[serde(default="yes")]network:bool,#[serde(default="yes")]manage_controller:bool,
+    #[serde(default)]managed_handoff:bool,
 }
 fn mac(value:&str)->Result<String>{
     let fields:Vec<_>=value.split(':').collect();
@@ -432,13 +433,19 @@ impl Radio{
     }
     fn index(&self)->Result<u16>{self.c.adapter.rsplit("hci").next().ok_or("invalid adapter")?.parse().map_err(|_|"invalid adapter index".into())}
     fn setting(&self,opcode:u16,mask:u32,enabled:bool,timeout:Duration)->Result<()>{let result=mgmt(self.index()?,opcode,&[u8::from(enabled)],timeout)?;if result.len()<4||(u32::from_le_bytes(result[..4].try_into().unwrap())&mask!=0)!=enabled{return Err("controller setting not applied".into());}Ok(())}
-    fn cleanup(&mut self){self.state.closing=true;self.business_connect=None;self.sdp_query=None;self.control_connect=None;
+    fn cleanup(&mut self,handoff:bool){self.state.closing=true;self.business_connect=None;self.sdp_query=None;self.control_connect=None;
         let registrations=[(self.advertisement,self.c.adapter.clone(),"org.bluez.LEAdvertisingManager1","UnregisterAdvertisement",format!("{ROOT}/advertisement")),(self.profile,"/org/bluez".into(),"org.bluez.ProfileManager1","UnregisterProfile",format!("{ROOT}/profile")),(self.business,"/org/bluez".into(),"org.bluez.ProfileManager1","UnregisterProfile",format!("{ROOT}/business")),(self.agent,"/org/bluez".into(),"org.bluez.AgentManager1","UnregisterAgent",format!("{ROOT}/agent"))];
         self.advertisement=false;self.profile=false;self.business=false;self.agent=false;self.activated=false;
         for (active,p,i,m,arg) in registrations{if active{let _=self.call("org.bluez",&p,i,m,vec![path(&arg)],Duration::from_millis(500));}}
         if self.restore_bondable{self.restore_bondable=false;let _=self.setting(9,16,false,Duration::from_millis(500));}if self.restore_connectable{self.restore_connectable=false;let _=self.setting(7,2,false,Duration::from_millis(500));}
+        let previous=self.previous.take();let device=self.device.take();
+        if handoff{if let Some(device)=&device{
+            // A user-requested disconnect also prevents NM from automatically
+            // racing the next receiver by reviving a previous uplink profile.
+            let _=self.call("org.freedesktop.NetworkManager",device,"org.freedesktop.NetworkManager.Device","Disconnect",vec![],Duration::from_secs(1));
+        }}
         if let Some(c)=self.connection.take(){let _=self.call("org.freedesktop.NetworkManager",&c,"org.freedesktop.NetworkManager.Settings.Connection","Delete",vec![],Duration::from_secs(1));}
-        if let (Some(previous),Some(device))=(self.previous.take(),self.device.take()){let _=self.call("org.freedesktop.NetworkManager","/org/freedesktop/NetworkManager","org.freedesktop.NetworkManager","ActivateConnection",vec![path(&previous),path(&device),path("/")],Duration::from_secs(2));}
+        if !handoff{if let (Some(previous),Some(device))=(previous,device){let _=self.call("org.freedesktop.NetworkManager","/org/freedesktop/NetworkManager","org.freedesktop.NetworkManager","ActivateConnection",vec![path(&previous),path(&device),path("/")],Duration::from_secs(2));}}
         self.offer=None;
     }
 }
@@ -489,7 +496,7 @@ pub fn run(fd:i32)->Result<()>{
                     "open-business"=>{let port=v["port"].as_u64().and_then(|v|u16::try_from(v).ok()).ok_or("invalid business port")?;radio.open_business(port).map(|_|json!({"pending":true}))},
                     "projection"=>{radio.projection_active=v["active"].as_bool().ok_or("projection active flag required")?;if !radio.projection_active{radio.reconnect_at=Instant::now();radio.reconnect_attempts=0;}Ok(json!({}))},
                     "status"=>Ok(json!({"active":radio.activated,"streams":radio.state.slots.len()})),
-                    "close"=>{radio.cleanup();let _=radio.ipc.send(&json!({"id":v.get("id"),"ok":true,"closed":true}),None);break;},
+                    "close"=>{radio.cleanup(radio.c.managed_handoff&&v["handoff"]==true);let _=radio.ipc.send(&json!({"id":v.get("id"),"ok":true,"closed":true}),None);break;},
                     _=>Err("unknown radio operation".into()),
                 };
                 match reply{Ok(mut value)=>{value["ok"]=true.into();value["id"]=v.get("id").cloned().unwrap_or(Value::Null);radio.ipc.send(&value,None)?;},Err(error)=>{radio.ipc.send(&json!({"id":v.get("id"),"ok":false,"error":error}),None)?;if op=="activate"{return Err("radio activation failed".into());}}}
@@ -498,7 +505,7 @@ pub fn run(fd:i32)->Result<()>{
             let mut busfd=0;unsafe{(radio.bus.api.get_fd)(radio.bus.connection,&mut busfd);}
             let mut fds=[libc::pollfd{fd:radio.ipc.fd.as_raw_fd(),events:libc::POLLIN,revents:0},libc::pollfd{fd:busfd,events:libc::POLLIN,revents:0}];unsafe{libc::poll(fds.as_mut_ptr(),2,50);}
         }Ok(())
-    })();radio.cleanup();
+    })();radio.cleanup(false);
     if radio.startup_cancelled{
         // Acknowledge only after temporary networking has been removed and
         // the previous connection restored. EOF has no request to acknowledge.

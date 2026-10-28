@@ -52,12 +52,14 @@ class Harness:
     address = '02:00:00:00:00:01'
     peer = '02:00:00:00:00:02'
 
-    def __init__(self, binary, base=None, pair_seconds=None, fail_ports=False, stall_prepare=False):
+    def __init__(self, binary, base=None, pair_seconds=None, fail_ports=False, stall_prepare=False, managed_handoff=False):
         self.binary = str(Path(binary).resolve())
         self.base = free_ports() if base is None else base
         self.pair_seconds = pair_seconds
         self.fail_ports = fail_ports
         self.stall_prepare = stall_prepare
+        self.managed_handoff=managed_handoff
+        self.radio_handoff=False
         self.control_open = False
         self.sight = socket.socket()
         self.sight.bind(('127.0.0.1', 0))
@@ -83,6 +85,7 @@ class Harness:
         args = [str(Path(binary).resolve()), 'hicar', 'run', '--test-mode',
                 '--test-listen-ip', '127.0.0.1',
                 '--test-base-port', str(self.base)]
+        if managed_handoff:args.append('--managed-handoff')
         args.extend(('--peer', self.peer) if pair_seconds is None else
                     ('--pair', str(pair_seconds)))
         for name, fd in zip(('radio', 'session', 'media'), fds):
@@ -147,6 +150,7 @@ class Harness:
             self.trace.append(('radio', operation))
             result = {'id': value['id'], 'ok': True}
             if operation == 'prepare':
+                assert value['managed_handoff']==self.managed_handoff
                 if self.stall_prepare:
                     continue
                 assert value['peer'] == (self.peer if self.pair_seconds is None else None)
@@ -161,6 +165,7 @@ class Harness:
                 for offset in range(3):
                     with socket.create_connection(('127.0.0.1', self.base + offset), 1):
                         pass
+            if operation=='close':self.radio_handoff=value.get('handoff',False)
             self.send_radio(result)
             if operation == 'close':
                 return
@@ -305,6 +310,20 @@ class Harness:
 
 
 def run(binary):
+    # The manager's private signal reaches only an already-ready owner; its
+    # radio worker receives explicit handoff intent after graceful teardown.
+    for managed,handoff in ((False,False),(True,False),(True,True)):
+        selected=Harness(binary,managed_handoff=managed)
+        try:
+            selected.authenticate();selected.project()
+            selected.stopping.set()
+            selected.process.send_signal(signal.SIGUSR1 if handoff else signal.SIGTERM)
+            assert selected.process.wait(timeout=6)==0
+        finally:selected.close()
+        selected.check()
+        assert selected.radio_handoff==(managed and handoff)
+        assert ('session','close') in selected.trace and ('radio','close') in selected.trace
+
     preparing = Harness(binary, stall_prepare=True)
     try:
         preparing.wait(lambda: ('radio', 'prepare') in preparing.trace)

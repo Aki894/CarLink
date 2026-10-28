@@ -169,11 +169,11 @@ async def mock_bus(binary):
 
     class Device(ServiceInterface):
         def __init__(self):
-            super().__init__('org.freedesktop.NetworkManager.Device');self.disconnected=False
+            super().__init__('org.freedesktop.NetworkManager.Device');self.disconnected=False;self.disconnects=0
         @dbus_property(access=PropertyAccess.READ)
         def ActiveConnection(self)->'o': return NM_ACTIVE
         @method()
-        def Disconnect(self): self.disconnected=True
+        def Disconnect(self): self.disconnected=True;self.disconnects+=1
 
     class ActiveConnection(ServiceInterface):
         def __init__(self):super().__init__('org.freedesktop.NetworkManager.Connection.Active')
@@ -375,6 +375,30 @@ else:
             assert device.disconnected and connection.deleted and network.activated==[NM_NEW,NM_OLD]
             assert process.stdout.read()==b'' and process.stderr.read()==b''
             process.stdout.close();process.stderr.close();channel.close();channel=None
+            # Only an explicitly enabled and requested handoff skips the old
+            # uplink. It still removes the AP, unregisters Bluetooth ownership,
+            # and issues NM Disconnect to inhibit autoconnect during handoff.
+            for managed,handoff in ((False,True),(True,False),(True,True)):
+                ip_state.unlink(missing_ok=True)
+                network.activated.clear();connection.deleted=False;device.disconnects=0
+                agents.unregistered=False;advertisements.unregistered=False;profiles.unregistered.clear()
+                parent,child=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET)
+                process=subprocess.Popen([*json.loads(os.environ.get('CARLINK_RUST_RUNNER','[]')),
+                    binary,'hicar','radio-worker',str(child.fileno())],pass_fds=(child.fileno(),),
+                    stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
+                child.close();channel=Channel(parent)
+                channel.send(dict(id=0,model='00040A00',sequence=7,network=True,interface='lo',
+                    manage_controller=False,managed_handoff=managed,peer='02:00:00:00:00:02'))
+                ready,fds=await asyncio.to_thread(channel.receive);assert ready['ok'] and not fds
+                await asyncio.to_thread(channel.call,'activate')
+                await asyncio.to_thread(channel.call,'close',handoff=handoff)
+                assert await asyncio.to_thread(process.wait,8)==0
+                assert connection.deleted and agents.unregistered and advertisements.unregistered
+                assert set(profiles.unregistered)=={CONTROL,BUSINESS}
+                assert network.activated==([NM_NEW] if managed and handoff else [NM_NEW,NM_OLD])
+                assert device.disconnects==(2 if managed and handoff else 1)
+                assert process.stdout.read()==b'' and process.stderr.read()==b''
+                process.stdout.close();process.stderr.close();channel.close();channel=None
             # Parent death closes the private descriptor and must perform the
             # same restoration even without an explicit close command.
             parent,child=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET)
@@ -404,7 +428,7 @@ else:
                     stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=cancelled_env)
                 child.close();channel=Channel(parent)
                 channel.send(dict(id=0,model='00040A00',sequence=7,network=True,interface='lo',
-                    manage_controller=False,peer='02:00:00:00:00:02'))
+                    manage_controller=False,managed_handoff=True,peer='02:00:00:00:00:02'))
                 deadline=asyncio.get_running_loop().time()+6
                 while True:
                     try:
@@ -418,7 +442,7 @@ else:
                     await asyncio.sleep(.02)
                 cancelled_at=asyncio.get_running_loop().time()
                 if explicit_close:
-                    reply=await asyncio.to_thread(channel.call,'close')
+                    reply=await asyncio.to_thread(channel.call,'close',handoff=True)
                     assert reply['closed'] and connection.deleted and network.activated==[NM_NEW,NM_OLD]
                 else:
                     channel.close();channel=None

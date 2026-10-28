@@ -13,7 +13,9 @@ use std::{collections::{BTreeMap,VecDeque},io::{Read,Write,ErrorKind},net::{Ipv4
 const IPC:usize=256*1024;
 const QUEUE:usize=256*1024;
 static STOP:AtomicBool=AtomicBool::new(false);
+static HANDOFF:AtomicBool=AtomicBool::new(false);
 extern "C" fn stop(_:i32){STOP.store(true,Ordering::Relaxed);}
+extern "C" fn handoff(_:i32){HANDOFF.store(true,Ordering::Relaxed);STOP.store(true,Ordering::Relaxed);}
 fn event(name:&str,epoch:u64){println!("{}",json!({"event":name,"session_epoch":epoch}));}
 fn now_us()->u64{let mut t=libc::timespec{tv_sec:0,tv_nsec:0};unsafe{libc::clock_gettime(libc::CLOCK_MONOTONIC,&mut t);}t.tv_sec as u64*1_000_000+t.tv_nsec as u64/1000}
 fn num(v:&Value,k:&str)->Result<u64>{v[k].as_u64().ok_or_else(||format!("missing private field {k}"))}
@@ -105,15 +107,16 @@ impl AudioServices{
 fn mac(s:&str)->Result<String>{let p:Vec<_>=s.split(':').collect();if p.len()!=6||p.iter().any(|s|s.len()!=2||!s.bytes().all(|b|b.is_ascii_hexdigit())){return Err("invalid peer address".into());}Ok(s.to_ascii_uppercase())}
 struct Config{model:String,identity:PathBuf,library:PathBuf,store:PathBuf,interface:String,live:PathBuf,audio_binary:PathBuf,
     adapter:String,peer:Option<String>,reconnect_peer:Option<String>,excluded:Vec<String>,pair:bool,pair_seconds:u64,sequence:u8,duration:u64,power:i16,channel:u16,
-    test:bool,fds:[Option<i32>;3],test_ip:Option<Ipv4Addr>,test_port:Option<u16>}
+    managed_handoff:bool,test:bool,fds:[Option<i32>;3],test_ip:Option<Ipv4Addr>,test_port:Option<u16>}
 impl Config{
     fn parse(args:&[String])->Result<Self>{
         let mut c=Self{model:"00040A00".into(),identity:"/var/lib/carlink/hicar/production/identity.json".into(),
             library:"/usr/local/lib/carlink/hicar-native/libcarlink_hichain.so".into(),store:"/var/lib/carlink/hicar/production/keys".into(),
             interface:String::new(),live:"/run/carlink/live.sock".into(),audio_binary:"/usr/local/lib/carlink/carplay/bin/carlink-audio".into(),adapter:"/org/bluez/hci0".into(),
-            peer:None,reconnect_peer:None,excluded:vec![],pair:false,pair_seconds:120,sequence:0,duration:0,power:11,channel:23,test:false,fds:[None;3],test_ip:None,test_port:None};
+            peer:None,reconnect_peer:None,excluded:vec![],pair:false,pair_seconds:120,sequence:0,duration:0,power:11,channel:23,managed_handoff:false,test:false,fds:[None;3],test_ip:None,test_port:None};
         let mut i=0;while i<args.len(){let name=args[i].as_str();i+=1;
-            if matches!(name,"--pair"|"--test-mode"|"--managed"|"--allow-incoming"|"--reply-control"|"--reply-identity"|"--dmsdp-options"|"--audio"){
+            if matches!(name,"--pair"|"--test-mode"|"--managed-handoff"|"--managed"|"--allow-incoming"|"--reply-control"|"--reply-identity"|"--dmsdp-options"|"--audio"){
+                if name=="--managed-handoff"{c.managed_handoff=true;}
                 if name=="--pair"{c.pair=true;if args.get(i).is_some_and(|v|!v.starts_with("--")){c.pair_seconds=args[i].parse().map_err(|_|"invalid pairing duration")?;i+=1;}}
                 if name=="--test-mode"{c.test=true;}continue;}
             let value=args.get(i).ok_or("missing HiCar option value")?;i+=1;
@@ -193,7 +196,8 @@ impl Radio{
         loop{if STOP.load(Ordering::Relaxed)&&!self.closed{return Err("radio preparation interrupted".into());}
             if let Some(packet)=self.receive()?{if packet.value["id"].as_u64()==Some(self.next){if packet.fd.is_some()||packet.value["ok"]!=true{return Err("radio operation rejected".into());}return Ok(packet.value);}if self.pending.len()>=8{return Err("radio event backlog exceeds limit".into());}self.pending.push_back(packet);}if Instant::now()>=until{return Err("radio operation timeout".into());}std::thread::sleep(Duration::from_millis(5));}}
     fn poll(&mut self)->Result<Option<Packet>>{if let Some(v)=self.pending.pop_front(){Ok(Some(v))}else{self.receive()}}
-    fn close(&mut self){if !self.closed{self.closed=true;let _=self.call(json!({"op":"close"}),Duration::from_secs(7));finish(&mut self.child,Duration::from_millis(250));}}
+    fn close(&mut self){self.close_for_handoff(false);}
+    fn close_for_handoff(&mut self,handoff:bool){if !self.closed{self.closed=true;let _=self.call(json!({"op":"close","handoff":handoff}),Duration::from_secs(7));finish(&mut self.child,Duration::from_millis(250));}}
 }
 impl Drop for Radio{fn drop(&mut self){self.close();}}
 #[derive(Clone,Copy,PartialEq)]enum Kind{Nearby,Business,Data,Control,Sight}
@@ -237,7 +241,7 @@ impl Owner{
         let mut radio=Radio::new(config.fds[0])?;
         let prepared=radio.call(json!({"model":config.model,"sequence":config.sequence,"peer":config.peer,"reconnect_peer":config.reconnect_peer,"exclude_peers":config.excluded,
             "pair_seconds":if config.pair{config.pair_seconds}else{0},"channel":config.channel,"tx_power":config.power,"interface":config.interface,
-            "adapter":config.adapter,"network":true,"manage_controller":true}),Duration::from_secs(25))?;
+            "adapter":config.adapter,"network":true,"manage_controller":true,"managed_handoff":config.managed_handoff}),Duration::from_secs(25))?;
         let address=mac(text(&prepared,"address")?)?;let offer=prepared["offer"].clone();
         let local=text(&offer,"owner_ip")?.parse::<Ipv4Addr>().map_err(|_|"invalid offered local address")?;let peer_ip=text(&offer,"client_ip")?.parse::<Ipv4Addr>().map_err(|_|"invalid offered peer address")?;
         let base=num(&offer,"port")?.try_into().map_err(|_|"invalid offered TCP port")?;
@@ -383,9 +387,9 @@ impl Owner{
         let mut fds=vec![libc::pollfd{fd:self.radio.fd.as_raw_fd(),events:libc::POLLIN,revents:0}];
         for l in &self.listeners{fds.push(libc::pollfd{fd:l.as_raw_fd(),events:libc::POLLIN,revents:0});}for c in &self.channels{fds.push(libc::pollfd{fd:c.fd.as_raw_fd(),events:libc::POLLIN|if c.output.is_empty(){0}else{libc::POLLOUT},revents:0});}unsafe{libc::poll(fds.as_mut_ptr(),fds.len() as libc::nfds_t,10);}
     }}
-    fn shutdown(&mut self){self.stop_projection();self.channels.clear();self.auth_close();self.worker.close();self.radio.close();event("stopped",self.epoch);}
+    fn shutdown(&mut self){self.stop_projection();self.channels.clear();self.auth_close();self.worker.close();self.radio.close_for_handoff(self.config.managed_handoff&&HANDOFF.load(Ordering::Relaxed));event("stopped",self.epoch);}
 }
 impl Drop for Owner{fn drop(&mut self){self.shutdown();}}
-pub fn run(args:&[String])->Result<()>{let config=Config::parse(args)?;STOP.store(false,Ordering::Relaxed);unsafe{libc::signal(libc::SIGTERM,stop as *const () as libc::sighandler_t);libc::signal(libc::SIGINT,stop as *const () as libc::sighandler_t);}match Owner::start(config){Ok(mut owner)=>owner.run(),Err(_) if STOP.load(Ordering::Relaxed)=>Ok(()),Err(e)=>Err(e)}}
+pub fn run(args:&[String])->Result<()>{let config=Config::parse(args)?;STOP.store(false,Ordering::Relaxed);HANDOFF.store(false,Ordering::Relaxed);unsafe{libc::signal(libc::SIGTERM,stop as *const () as libc::sighandler_t);libc::signal(libc::SIGINT,stop as *const () as libc::sighandler_t);if config.managed_handoff{libc::signal(libc::SIGUSR1,handoff as *const () as libc::sighandler_t);}}match Owner::start(config){Ok(mut owner)=>owner.run(),Err(_) if STOP.load(Ordering::Relaxed)=>Ok(()),Err(e)=>Err(e)}}
 }
 pub fn run(args:&[String])->Result<()>{#[cfg(unix)]{unix::run(args)}#[cfg(not(unix))]{let _=args;Err("HiCar backend requires Linux/Unix".into())}}

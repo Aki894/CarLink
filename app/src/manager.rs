@@ -92,7 +92,7 @@ fn stage_report(generation:u64,current:u64,v:&Value)->Option<Value>{
     let stage=v["stage"].as_str().filter(|s|diagnostic_stage(s))?;
     Some(json!({"event":"manager_backend_stage","generation":generation,"stage":stage}))
 }
-struct Process{child:Child,pgid:i32,events:Receiver<Value>,generation:u64}
+struct Process{child:Child,pgid:i32,events:Receiver<Value>,generation:u64,managed_handoff:bool}
 fn spawn(args:&[String],generation:u64,source:Option<&Path>)->Result<Process>{
     if args.is_empty(){return Err("backend command is empty".into());}
     let mut cmd=Command::new(&args[0]);cmd.args(&args[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit());
@@ -112,12 +112,17 @@ fn spawn(args:&[String],generation:u64,source:Option<&Path>)->Result<Process>{
                 }
             }
         }
-    });Ok(Process{child,pgid,events:rx,generation})
+    });Ok(Process{child,pgid,events:rx,generation,managed_handoff:args.iter().any(|a|a=="--managed-handoff")})
 }
 impl Process{
     fn end(&mut self)->Result<()>{
+        self.end_for_handoff(false)
+    }
+    fn end_for_handoff(&mut self,handoff:bool)->Result<()>{
         if self.pgid<=0{return Ok(());}
-        unsafe{libc::kill(-self.pgid,libc::SIGTERM);}
+        // Only an active managed HiCar owner understands this private signal.
+        // Workers keep running until its existing graceful shutdown completes.
+        unsafe{if handoff&&self.managed_handoff{libc::kill(self.child.id() as i32,libc::SIGUSR1);}else{libc::kill(-self.pgid,libc::SIGTERM);}}
         let deadline=Instant::now()+Duration::from_secs(8);
         loop{
             let exited=self.child.try_wait().map_err(|_|"cannot reap projection process")?.is_some();
@@ -169,13 +174,17 @@ impl Owner{
         if self.store.devices.iter().any(|d|d.protocol==protocol){return None;}
         Some(Choice{protocol,device:None,pairing:true})
     }
+    fn handoff_to(&self,next:Protocol)->bool{self.status.active&&self.status.protocol==Some(Protocol::Hicar)&&next==Protocol::Carplay}
     fn stop_backend(&mut self)->Result<()>{
+        self.stop_backend_for_handoff(false)
+    }
+    fn stop_backend_for_handoff(&mut self,handoff:bool)->Result<()>{
         self.status.call_active=false;
         self.pair_pin=None;
         self.menu_pending=None;self.menu_focus=0;
         let had_carplay=self.backend.is_some()&&self.status.protocol==Some(Protocol::Carplay);
         if let Some(mut p)=self.backend.take(){
-            p.end()?;
+            p.end_for_handoff(handoff)?;
             // Unregistering a profile can leave its selected phone's ACL up.
             // Drop that transport after the backend exits, retaining its bond
             // and application keys. An absent/already-down link is harmless.
@@ -198,9 +207,11 @@ impl Owner{
         // Validate the persisted PIN before interrupting the current projection.
         // Identity creation and rotation belong to provisioning, never this UI.
         let pair_pin=if choice.protocol==Protocol::Hicar&&choice.pairing{Some(self.read_pair_pin()?)}else{None};
+        let handoff=self.handoff_to(choice.protocol);
         self.status.active=false;self.show_recovery_menu();
-        self.stop_backend()?;self.session_epoch=0;self.closed_hicar_epoch=None;self.status.generation=self.status.generation.checked_add(1).ok_or("generation exhausted")?;
+        self.stop_backend_for_handoff(handoff)?;self.session_epoch=0;self.closed_hicar_epoch=None;self.status.generation=self.status.generation.checked_add(1).ok_or("generation exhausted")?;
         let mut args=if choice.protocol==Protocol::Carplay{self.config.carplay.clone()}else{self.config.hicar.clone()};
+        if choice.protocol==Protocol::Hicar&&args.get(1).is_some_and(|v|v=="hicar")&&args.get(2).is_some_and(|v|v=="run")&&!args.iter().any(|v|v=="--managed-handoff"){args.push("--managed-handoff".into());}
         if choice.pairing {args.extend(["--pair".into(),self.config.pair_seconds.to_string()]);}
         if choice.protocol==Protocol::Hicar&&choice.pairing&&choice.device.is_none(){
             let hint=self.store.preferred.as_ref().or(self.store.last.as_ref()).and_then(|preferred|self.store.devices.iter().find(|d|d.protocol==Protocol::Hicar&&d.auto&&d.address.eq_ignore_ascii_case(&preferred.address)))
@@ -347,7 +358,8 @@ impl Owner{
                 let protocol=if v.get("protocol").is_some(){serde_json::from_value(v["protocol"].clone()).map_err(|_|"invalid protocol")?}else{match self.selected_protocol(){Protocol::Carplay=>Protocol::Hicar,Protocol::Hicar=>Protocol::Carplay}};
                 if self.backend.is_some()&&!self.status.paused&&self.status.protocol==Some(protocol){return Ok(json!({"ok":true,"status":self.status}));}
                 if self.status.call_active{return Err("finish the active call before switching protocols".into());}
-                self.stop_backend()?;self.choice=None;self.store.selected_protocol=Some(protocol);self.status.protocol=Some(protocol);self.status.target=None;self.status.pairing=false;self.pair_deadline=None;self.tried.clear();self.store.paused=false;self.status.paused=false;self.store.policy=Policy::Last;save(&self.config.state,&self.store)?;
+                let handoff=self.handoff_to(protocol);
+                self.stop_backend_for_handoff(handoff)?;self.choice=None;self.store.selected_protocol=Some(protocol);self.status.protocol=Some(protocol);self.status.target=None;self.status.pairing=false;self.pair_deadline=None;self.tried.clear();self.store.paused=false;self.status.paused=false;self.store.policy=Policy::Last;save(&self.config.state,&self.store)?;
                 self.retry_at=Instant::now();self.show_recovery_menu();
             },
             "default_protocol"=>{let mode:BootProtocol=serde_json::from_value(v["mode"].clone()).map_err(|_|"invalid default protocol")?;self.store.boot_protocol=mode;self.status.default_protocol=mode;save(&self.config.state,&self.store)?;},
@@ -568,6 +580,15 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
     _=>Err("Usage: carlink manager run --config PRIVATE_JSON | ctl SOCKET JSON".into()),
 }}
 #[cfg(test)]mod tests{use super::*;
+    #[test]fn only_active_hicar_to_carplay_uses_handoff(){
+        let root=test_root("handoff-guard");let mut owner=test_owner(&root);
+        owner.status.protocol=Some(Protocol::Hicar);
+        assert!(!owner.handoff_to(Protocol::Carplay)); // Startup cancellation stays SIGTERM.
+        owner.status.active=true;assert!(owner.handoff_to(Protocol::Carplay));
+        assert!(!owner.handoff_to(Protocol::Hicar));
+        owner.status.protocol=Some(Protocol::Carplay);assert!(!owner.handoff_to(Protocol::Hicar));
+        fs::remove_dir(root).unwrap();
+    }
     #[test]fn active_call_blocks_selection_and_source_loss_releases_protection(){
         let root=test_root("call-guard");let mut owner=test_owner(&root);
         owner.menu_input(json!({"type":"call-state","active":true})).unwrap();
