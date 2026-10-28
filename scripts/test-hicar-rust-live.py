@@ -281,6 +281,21 @@ while True:
                 rpc(ipc, dict(op='audio-service', service='speaker1', active=False))
             finally:
                 call_udp.close()
+            # VoIP and navigation/music share the same advertised speaker1
+            # port. Focus transitions must flush old PCM and never queue call
+            # tails as media after hangup.
+            rpc(ipc,dict(op='audio-service',service='speaker1',active=True,port=udp.getsockname()[1]))
+            rpc(ipc,dict(op='audio-role',role=3));rpc(ipc,dict(op='audio-ready'))
+            before_voip=rpc(ipc,dict(op='status'))['state']['audio_frames']
+            for stream in (1003,1009,1000):
+                udp.sendto(audio_packet(cipher,0,stream=stream),('127.0.0.1',audio_port))
+            until_frame(live,3,lambda f:f[1]==3)
+            assert rpc(ipc,dict(op='status'))['state']['audio_frames']==before_voip+1
+            rpc(ipc,dict(op='audio-role',role=0));rpc(ipc,dict(op='audio-ready'))
+            udp.sendto(audio_packet(cipher,1,stream=1000),('127.0.0.1',audio_port))
+            udp.sendto(audio_packet(cipher,0,stream=1003),('127.0.0.1',audio_port))
+            until_frame(live,3,lambda f:f[1]==0)
+            assert rpc(ipc,dict(op='status'))['state']['audio_frames']==before_voip+2
             # Datagram framing and selected source checks reject unexpected
             # senders independently of the connected TCP control session.
             udp.sendto(b'\xab\0\0wrong', ('127.0.0.1', audio_port))

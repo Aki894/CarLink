@@ -160,6 +160,17 @@ def check(binary):
         assert result[6]['events'][-1]['microphone_ready'] is True and result[6]['events'][-1]['port']==43000
         assert not any(e.get('microphone_ready') for e in result[7]['events']) and len(result[7]['pending'])==1
         count+=1
+        # Real encrypted module-4 control: WeChat uses normal audio services.
+        focus_records=[(2,b'2'),(3,b'12'),(2,b'13'),(2,b'1'),(5,b''),(2,b'not-a-usage')]
+        focus_steps=[dict(receive=negotiation.hex())]
+        for kind,body in focus_records:
+            payload=b'$'+(4).to_bytes(4,'big')+kind.to_bytes(4,'big')+len(body).to_bytes(2,'big')+body
+            focus_steps.append(dict(receive=wire(payload).hex()))
+        focus=worker.call(dict(op='dmsdp-session',key=key.hex(),device_info=info,audio=True,steps=focus_steps))
+        assert focus.get('ok'), 'focus control must not tear down DMSDP'
+        focus_events=[[e for e in step['events'] if e.get('audio_focus')] for step in focus['result']['steps'][1:]]
+        assert focus_events==[[dict(audio_focus=True,active=True,usage=usage,focus_type=kind)] for kind,usage in [(2,2),(3,12),(2,13),(2,1)]]+[[dict(audio_focus=True,active=False)],[]]
+        count+=1
         invalid=[
             [dict(receive=b'\x01\0\x01x'.hex())], [dict(receive=b'\0\0\0'.hex())],
             [dict(receive=(b'\0'+(1498).to_bytes(2,'big')).hex())],

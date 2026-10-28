@@ -19,6 +19,18 @@ pub fn adts(data:&[u8])->Result<Vec<Aac>>{
     if out.is_empty(){return Err("empty AAC payload".into());}Ok(out)
 }
 pub struct Rtp {pub sequence:u16,pub timestamp:u32,pub stream:u32,pub frames:Vec<Aac>}
+impl Rtp{
+    pub fn call(&self)->bool{
+        let id=self.stream&0xfff;
+        let usage=(self.stream>>16)|((self.stream&0xc000)<<2);
+        matches!(id,1000|1006)||usage==2
+    }
+}
+#[test]fn native_stream_and_usage_distinguish_voip_from_navigation_and_assistant(){
+    let packet=|stream|Rtp{sequence:0,timestamp:0,stream,frames:vec![]};
+    assert!(packet(1000).call());assert!(packet(1006).call());assert!(packet((2<<16)|1003).call());
+    for stream in [1003,1009,(12<<16)|1003,(13<<16)|1003]{assert!(!packet(stream).call());}
+}
 pub fn rtp(data:&[u8])->Result<Rtp>{
     if data.len()<12||data[0]>>6!=2||data[1]&127!=96{return Err("invalid audio RTP header".into());}
     let mut offset=12+4*(data[0]&15) as usize;let mut end=data.len();
@@ -38,7 +50,10 @@ pub struct Audio {streams:BTreeMap<u32,Stream>,pub frames:u64,pub packets:u64,pu
 impl Audio {
     pub fn new()->Self{Self{streams:BTreeMap::new(),frames:0,packets:0,samples:0,lost:0,duplicates:0}}
     pub fn receive(&mut self,data:&[u8])->Result<Vec<AudioFrame>>{
-        let packet=rtp(data)?;let id=packet.stream&0xfff;
+        self.receive_packet(rtp(data)?)
+    }
+    pub fn receive_packet(&mut self,packet:Rtp)->Result<Vec<AudioFrame>>{
+        let id=packet.stream&0xfff;
         if !self.streams.contains_key(&id){
             if self.streams.len()>=8{return Err("too many RTP sources".into());}
             self.streams.insert(id,Stream{expected:packet.sequence,pending:BTreeMap::new(),timestamp:None,sample_offset:0,rate:None});

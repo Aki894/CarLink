@@ -268,13 +268,13 @@ impl Engine{
         let mut bytes=[0u8;65536];for _ in 0..16{
             let (n,peer)=match self.udp.recv_from(&mut bytes){Ok(v)=>v,Err(e)if e.kind()==ErrorKind::WouldBlock=>break,Err(_)=>break};
             if peer.ip()!=std::net::IpAddr::V4(self.peer)||!self.audio_ready{continue;}
-            // DMSDP advertises each sender UDP port. During a call, discard
-            // normal music/navigation datagrams before decoding, and vice versa.
-            // Keep fallback compatibility for senders that choose another port.
-            if !audio_port_allowed(&self.audio_ports,self.link.audio_role,peer.port()){continue;}
             if n<20||bytes[0]!=0xab||u16::from_be_bytes([bytes[1],bytes[2]]) as usize!=n-3{self.invalid+=1;continue;}
             let decoded=match decrypt(&self.crypto,&self.key,&bytes[3..n]){Ok(v)=>v,Err(_)=>{self.invalid+=1;continue;}};
-            let frames=match self.audio.receive(&decoded){Ok(v)=>v,Err(_)=>{self.invalid+=1;continue;}};
+            let packet=match media::rtp(&decoded){Ok(v)=>v,Err(_)=>{self.invalid+=1;continue;}};
+            // VoIP shares speaker1 with music/navigation. Inspect native RTP
+            // stream/usage as well as the independently advertised modem port.
+            if !audio_port_allowed(&self.audio_ports,self.link.audio_role,peer.port(),packet.call()){continue;}
+            let frames=match self.audio.receive_packet(packet){Ok(v)=>v,Err(_)=>{self.invalid+=1;continue;}};
             for frame in frames{
                 // Match the proven bridge sink: both video and PCM begin on
                 // local arrival time. RTP clock mapping remains diagnostic
@@ -350,15 +350,15 @@ impl Engine{
         for d in self.decoders.values().filter(|d|d.pcm.len()<6*PCM){fds.push(libc::pollfd{fd:d.output.as_raw_fd(),events:libc::POLLIN,revents:0});}fds
     }
 }
-fn audio_port_allowed(ports:&BTreeMap<String,u16>,role:u8,port:u16)->bool{
+fn audio_port_allowed(ports:&BTreeMap<String,u16>,role:u8,port:u16,call_stream:bool)->bool{
     let normal=ports.get("speaker1").copied();let call=ports.get("modemSpeaker").copied();
-    if normal==call{return true;} // Some receivers multiplex both services.
-    if role==3{normal!=Some(port)}else{call!=Some(port)}
+    if role==3{call_stream||(call==Some(port)&&call!=normal)}else{!call_stream&&(call!=Some(port)||call==normal)}
 }
-#[test]fn service_ports_isolate_call_and_media_without_unknown_port_lockout(){
+#[test]fn service_ports_and_rtp_usage_isolate_call_from_media(){
     let ports=BTreeMap::from([("speaker1".into(),1000),("modemSpeaker".into(),2000)]);
-    assert!(!audio_port_allowed(&ports,3,1000));assert!(audio_port_allowed(&ports,3,2000));
-    assert!(audio_port_allowed(&ports,0,1000));assert!(!audio_port_allowed(&ports,0,2000));assert!(audio_port_allowed(&ports,0,3000));
+    assert!(!audio_port_allowed(&ports,3,1000,false));assert!(audio_port_allowed(&ports,3,2000,false));
+    assert!(audio_port_allowed(&ports,3,1000,true));assert!(!audio_port_allowed(&ports,0,1000,true));
+    assert!(audio_port_allowed(&ports,0,1000,false));assert!(!audio_port_allowed(&ports,0,2000,false));assert!(audio_port_allowed(&ports,0,3000,false));
 }
 #[test]fn pruning_audio_keeps_partial_record_without_disconnecting_the_source(){
     let mut link=Link::new(PathBuf::from("/unused"));let (a,_b)=UnixStream::pair().unwrap();link.socket=Some(a);link.active=true;link.established=true;

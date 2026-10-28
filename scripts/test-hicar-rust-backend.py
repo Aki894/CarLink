@@ -53,6 +53,7 @@ class Harness:
     peer = '02:00:00:00:00:02'
 
     def __init__(self, binary, base=None, pair_seconds=None, fail_ports=False, stall_prepare=False):
+        self.binary = str(Path(binary).resolve())
         self.base = free_ports() if base is None else base
         self.pair_seconds = pair_seconds
         self.fail_ports = fail_ports
@@ -200,7 +201,19 @@ class Harness:
             self.control_open = False
         if operation == 'dmsdp-receive':
             data = bytes.fromhex(value['data'])
+            if data.startswith(b'$'):
+                # Decode the actual module-4 record with the production Rust
+                # codec before passing its events through the real owner.
+                def framed(payload,kind=0):
+                    return bytes([kind])+len(payload).to_bytes(2,'big')+payload
+                negotiation=framed(b'SET_PARAMETER * DMSDP/1.0\r\nCSeq: 1\r\nCryptoVer: 1\r\nCryptoSwitch: 222\r\nCryptoAlg: null\r\n\r\n')
+                request=dict(op='dmsdp-session',key='',device_info=None,audio=False,steps=[dict(receive=negotiation.hex()),dict(receive=framed(data).hex())])
+                native=subprocess.run([self.binary,'hicar','codec'],input=json.dumps(request)+'\n',text=True,capture_output=True,check=True,timeout=5)
+                decoded=json.loads(native.stdout)
+                assert decoded['ok'], decoded
+                return dict(events=decoded['result']['steps'][1]['events'],pending=[],state=dict(negotiated=True,media_port=self.sight_port))
             audio = {
+                b'MIC_READY': dict(microphone_ready=True,service='mic1',port=55300,session=44),
                 b'MEDIA_READY': dict(audio_ready=True, service='speaker1', modem=False, port=55100, session=42),
                 b'CALL_READY': dict(audio_ready=True, service='modemSpeaker', modem=True, port=55200, session=43),
                 b'MEDIA_STOP': dict(audio_stopped=True, service='speaker1', modem=False),
@@ -314,11 +327,23 @@ def run(binary):
             (b'MEDIA_STOP', [dict(op='audio-service', service='speaker1', active=False)]),
             (b'CALL_STOP', [dict(op='audio-service', service='modemSpeaker', active=False), dict(op='audio-role', role=0), dict(op='audio-stop')]),
         )
+        def focus(kind,usage=b''):
+            return b'$'+(4).to_bytes(4,'big')+kind.to_bytes(4,'big')+len(usage).to_bytes(2,'big')+usage
+        stages=stages[:1]+(
+            (b'MIC_READY',[]),
+            (focus(2,b'2'),[dict(op='audio-role',role=3),dict(op='audio-ready')]),
+            (focus(3,b'12'),[]),
+            (focus(2,b'13'),[]),
+            (focus(2,b'1'),[dict(op='audio-role',role=0),dict(op='audio-ready')]),
+            (focus(2,b'2'),[dict(op='audio-role',role=3),dict(op='audio-ready')]),
+            (focus(5),[dict(op='audio-role',role=0),dict(op='audio-ready')]),
+        )+stages[1:]
         expected_audio = []
         for record, expected in stages:
             expected_audio.extend(expected)
             control.sendall(record)
             owner.wait(lambda: len(owner.audio_commands) >= len(expected_audio))
+            if not expected:time.sleep(.05)
             assert owner.audio_commands == expected_audio, 'speaker route/lifetime command mismatch'
         # A second control connection must be rejected without touching the owner.
         with socket.create_connection(('127.0.0.1', owner.base + 2), 2) as duplicate:

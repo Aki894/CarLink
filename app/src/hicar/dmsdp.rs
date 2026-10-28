@@ -188,6 +188,13 @@ impl Session{
         if data.len()<11||u16::from_be_bytes([data[9],data[10]])as usize!=data.len()-11{return Err("invalid binary control message".into());}
         let module=u32::from_be_bytes(data[1..5].try_into().unwrap());let kind=u32::from_be_bytes(data[5..9].try_into().unwrap());let body=&data[11..];
         events.push(json!({"binary":true,"module":module,"data_type":kind,"body_bytes":body.len()}));
+        // VoIP uses speaker1/mic1; AudioFocusManager sends decimal UTF-8 usage.
+        if module==4 {
+            if kind==5{events.push(json!({"audio_focus":true,"active":false}));}
+            else if (1..=4).contains(&kind)&&!body.is_empty()&&body.len()<=3&&body.iter().all(u8::is_ascii_digit){
+                if let Ok(usage)=std::str::from_utf8(body).unwrap().parse::<u32>(){events.push(json!({"audio_focus":true,"active":true,"usage":usage,"focus_type":kind}));}
+            }
+        }
         if module==5&&kind==u32::MAX{let mut pos=0;let cmd=unsigned(body,&mut pos)?;let port=unsigned(body,&mut pos)?;
             if cmd!=101||pos!=body.len()||!(1..=65535).contains(&port){return Err("invalid HiSight endpoint".into());}self.media_port=Some(port as u16);events.push(json!({"hisight_endpoint":true,"port":port}));}
         if module==3&&kind==u32::MAX&&self.device_info.as_object().is_some_and(|v|!v.is_empty()){

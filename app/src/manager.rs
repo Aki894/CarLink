@@ -460,7 +460,8 @@ impl Owner{
 
         if let Some(life)=self.life.as_mut(){for v in life.events.try_iter().take(16){if v["event"]=="voice_stats"{println!("{}",json!({"event":"manager_voice_stats","microphone_active":v["microphone_active"]==true,"microphone_packets":v["microphone_packets"].as_u64().unwrap_or(0),"microphone_bytes":v["microphone_bytes"].as_u64().unwrap_or(0),"call_active":v["call_active"]==true}));}if v["event"]=="carlife_state"{self.status.usb_connected=true;self.life_ready=true;self.status.last_error=None;}if v["event"]=="session_error"{
             self.status.usb_connected=false;
-            self.status.last_error=Some(v["detail"].as_str().unwrap_or("CarLife output failed").chars().take(256).collect());event("manager_carlife_error");
+            self.status.last_error=Some(v["detail"].as_str().unwrap_or("CarLife output failed").chars().take(256).collect());
+            println!("{}",json!({"event":"manager_carlife_error","pid":self.status.carlife_pid,"reason":self.status.last_error}));
         }}}
         if self.life.as_mut().is_some_and(|p|p.child.try_wait().ok().flatten().is_some()){
             self.life=None;self.status.carlife_pid=None;self.status.usb_connected=false;self.defer_carlife();event("manager_carlife_restart");

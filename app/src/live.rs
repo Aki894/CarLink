@@ -166,6 +166,10 @@ impl LiveSource {
                 if self.voice.call&&f.flags==2{return Ok(());}
                 if f.flags==3&&f.payload[0]==1&&!self.voice.call{
                     self.audio_generation=self.audio_generation.wrapping_add(1);
+                    // INIT may already have left a DATA packet pending outside
+                    // the ingress queue. Do not relabel that old playback as
+                    // part of the new call epoch; retain only track teardown.
+                    self.audio_pending.retain(|m|matches!(m.id,0x30002|0x40002|0x50004));
                     self.queue.retain(|q|q.kind!=3||q.flags==3);self.queued=self.queue.iter().map(|q|q.payload.len()).sum();self.stop_role(0);self.stop_role(1);self.stop_role(2);
                 }
                 if f.flags==2{self.voice.speech(f.payload[0]==1);}if f.flags==3{self.voice.call(f.payload[0]==1);}
@@ -372,6 +376,27 @@ fn varint(bytes:&[u8],pos:&mut usize)->Result<u64,String>{let mut out=0u64;for s
  }
  #[test]#[cfg(unix)]fn pause_overload_and_reconnect_wait_for_keyframe(){let mut s=source();let frame=|key|Frame{arrived:Instant::now(),kind:2,flags:key,pts:1000,payload:vec![0,0,0,1,0x65]};s.accept_frame(frame(0)).unwrap();assert!(s.next(true).is_none());s.accept_frame(frame(1)).unwrap();assert!(s.next(true).is_some());s.set_playing(false);s.accept_frame(frame(1)).unwrap();assert!(s.queue.is_empty());s.set_playing(true);s.accept_frame(frame(0)).unwrap();assert!(s.queue.is_empty());s.queued=MAX_QUEUED;s.accept_frame(frame(0)).unwrap();assert!(s.waiting_key);s.disconnect();assert!(!s.configured);assert!(!s.active);}
  #[test]#[cfg(unix)]fn monotonic_timestamp_and_audio_init(){let mut s=source();s.waiting_key=false;for pts in [100000,90000]{s.accept_frame(Frame{arrived:Instant::now(),kind:3,flags:0,pts,payload:vec![0;4]}).unwrap();}assert_eq!(s.next(true).unwrap().id,0x30001);assert_eq!(s.next(true).unwrap().id,0x30006);assert_eq!(s.next(true).unwrap().timestamp_ms,Some(0));}
+ #[test]#[cfg(unix)]fn call_takeover_discards_pending_pcm_but_keeps_track_teardown(){
+  for media in [false,true]{for role in 0..3{
+   let mut s=source();s.call_media=media;
+   s.accept_frame(Frame{kind:3,flags:role,pts:1000,payload:vec![11;4],arrived:Instant::now()}).unwrap();
+   let (_,init,_,stop)=s.audio_lane(role);
+   assert_eq!(s.next(true).unwrap().id,init);
+   assert!(s.audio_pending.iter().any(|m|m.payload==vec![11;4]));
+   // A previously queued teardown must survive even if another lane takes over.
+   s.audio_pending.push_back(packet(Channel::Tts,0x40002,0,Vec::new()));
+   s.accept_frame(Frame{kind:5,flags:3,pts:0,payload:vec![1],arrived:Instant::now()}).unwrap();
+   s.accept_frame(Frame{kind:3,flags:3,pts:2000,payload:vec![22;4],arrived:Instant::now()}).unwrap();
+   let mut messages=Vec::new();while let Some(m)=s.next(true){messages.push(m);}
+   assert!(!messages.iter().any(|m|m.payload==vec![11;4]));
+   assert!(messages.iter().any(|m|m.id==0x40002));
+   let stopped=messages.iter().position(|m|m.id==stop).unwrap();
+   let call=messages.iter().position(|m|m.payload==vec![22;4]).unwrap();
+   assert!(stopped<call);
+   assert_eq!(messages[call].id,s.audio_lane(3).2);
+   assert!(s.voice.call);
+  }}
+ }
  #[test]#[cfg(unix)]fn call_switch_fences_queued_audio_and_preserves_physical_clock(){
   for media in [false,true]{
   let mut s=source();s.call_media=media;let role=if media{0}else{2};let data=if media{0x30006}else{0x50003};

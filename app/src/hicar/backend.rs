@@ -22,7 +22,7 @@ fn wipe_field(v:&mut Value,k:&str){if let Some(Value::String(s))=v.get_mut(k){un
 /// Each DMSDP service owns its lifetime. A normal speaker/microphone teardown
 /// must not release the still-active modem speaker or microphone.
 #[derive(Default)]
-struct AudioServices{speakers:BTreeMap<String,bool>,microphones:BTreeMap<String,Value>,role:u8}
+struct AudioServices{speakers:BTreeMap<String,bool>,microphones:BTreeMap<String,Value>,focus_call:bool,role:u8}
 impl AudioServices{
     fn microphone(&self)->Option<(&str,&Value)>{self.microphones.get_key_value("modemMic").or_else(||self.microphones.get_key_value("mic1")).map(|(n,v)|(n.as_str(),v))}
     fn apply(&mut self,e:&Value)->Vec<Value>{
@@ -36,7 +36,11 @@ impl AudioServices{
         if e["audio_ready"]==true{self.speakers.insert(service.into(),e["modem"]==true);}
         let new_mic=self.microphone().map(|(n,v)|(n.to_owned(),v.clone()));
         let ready=!self.speakers.is_empty();
-        self.role=if self.microphones.contains_key("modemMic")||self.speakers.values().any(|m|*m){3}else{0};
+        if e["audio_focus"]==true{
+            if e["active"]==false{self.focus_call=false;}
+            else {match e["usage"].as_u64(){Some(2)=>self.focus_call=true,Some(1)=>self.focus_call=false,_=>{}}}
+        }
+        self.role=if self.focus_call||self.microphones.contains_key("modemMic")||self.speakers.values().any(|m|*m){3}else{0};
         let mut commands=vec![];
         if e["audio_ready"]==true&&e["port"].as_u64().is_some(){commands.push(json!({"op":"audio-service","service":service,"active":true,"port":e["port"]}));}
         if e["audio_stopped"]==true&&was_ready{commands.push(json!({"op":"audio-service","service":service,"active":false}));}
@@ -56,6 +60,18 @@ impl AudioServices{
     use super::*;
     fn ready(name:&str,modem:bool)->Value{json!({"audio_ready":true,"service":name,"modem":modem})}
     fn mic(name:&str,port:u16)->Value{json!({"microphone_ready":true,"service":name,"modem":name=="modemMic","port":port,"session":7})}
+    #[test]fn voip_focus_routes_normal_services_and_restores_music_without_teardown(){
+        let mut s=AudioServices::default();s.apply(&ready("speaker1",false));s.apply(&mic("mic1",41000));
+        let focus=|usage|json!({"audio_focus":true,"active":true,"usage":usage,"focus_type":2});
+        assert_eq!(s.apply(&focus(2)),vec![json!({"op":"audio-role","role":3}),json!({"op":"audio-ready"})]);
+        assert!(s.apply(&focus(12)).is_empty());assert!(s.apply(&focus(13)).is_empty());assert_eq!(s.role,3);
+        assert_eq!(s.apply(&focus(1)),vec![json!({"op":"audio-role","role":0}),json!({"op":"audio-ready"})]);
+        s.apply(&focus(2));s.apply(&json!({"audio_focus":true,"active":false}));assert_eq!(s.role,0);
+        s.apply(&ready("modemSpeaker",true));s.apply(&focus(2));
+        assert!(s.apply(&focus(1)).is_empty());assert_eq!(s.role,3);
+        assert!(s.apply(&json!({"audio_focus":true,"active":false})).is_empty());assert_eq!(s.role,3);
+        s.apply(&json!({"audio_stopped":true,"service":"modemSpeaker"}));assert_eq!(s.role,0);
+    }
     #[test]fn a_remaining_modem_owner_keeps_call_role_and_playback(){
         let mut s=AudioServices::default();s.apply(&ready("speaker1",false));s.apply(&ready("modemSpeaker",true));
         s.apply(&mic("modemMic",42000));
