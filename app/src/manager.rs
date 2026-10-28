@@ -357,7 +357,7 @@ impl Owner{
             "connect"=>{let address=v["address"].as_str().ok_or("missing target address")?;
                 let protocol:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing protocol")?;
                 let d=self.store.devices.iter().find(|d|d.protocol==protocol&&d.address.eq_ignore_ascii_case(address)).cloned().ok_or("unknown target device")?;
-                if self.backend.is_some()&&!self.status.paused&&self.choice.as_ref().is_some_and(|c|c.protocol==protocol&&c.device.as_ref().is_some_and(|current|current.address.eq_ignore_ascii_case(address))){return Ok(json!({"ok":true,"status":self.status}));}
+                if self.status.active&&self.backend.is_some()&&!self.status.paused&&self.choice.as_ref().is_some_and(|c|c.protocol==protocol&&c.device.as_ref().is_some_and(|current|current.address.eq_ignore_ascii_case(address))){return Ok(json!({"ok":true,"status":self.status}));}
                 self.tried.clear();self.select(Choice{protocol,device:Some(d),pairing:false})?;self.store.paused=false;self.status.paused=false;save(&self.config.state,&self.store)?;},
             "pair"=>{let protocol:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing protocol")?;
                 if self.store.devices.len()>=8{return Err("device store is full; forget a device first".into());}
