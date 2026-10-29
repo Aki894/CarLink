@@ -176,9 +176,9 @@ def check(binary):
         service=json.dumps(dict(deviceId='synthetic-owner',deviceName='',serviceId='display1',serviceType=8,properties={},status={}),separators=(',',':')).encode()
         updates=[(103,None,202),(103,None,202),(103,None,203),(107,7,202),(107,7,202)]
         steps=[dict(receive=negotiation.hex())]
-        for command,sequence,action in updates:
+        for command_id,sequence,action in updates:
             tail=(sequence.to_bytes(4,'big') if sequence is not None else b'')+action.to_bytes(4,'big')+service
-            steps.append(dict(receive=wire(business(3,command,tail)).hex()))
+            steps.append(dict(receive=wire(business(3,command_id,tail)).hex()))
         result=worker.call(dict(op='dmsdp-session',key=key.hex(),device_info=info,audio=True,steps=steps))
         assert result.get('ok'),'SDK2 display update rejected'
         results=result['result']['steps'][1:]
