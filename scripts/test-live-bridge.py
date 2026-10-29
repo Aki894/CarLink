@@ -69,7 +69,8 @@ with tempfile.TemporaryDirectory(prefix='carlink-live-ci-') as directory:
             assert media.packet(hu)[3] == config
             hu.sendall(lab.command(0x18009))
             wait_path(live)
-            children.append(subprocess.Popen([sys.executable, str(root / 'receiver/forward.py'), '--unix', str(oxp),
+            forward = [str(app), 'carplay-output'] if os.environ.get('CARLINK_FORWARD_IMPLEMENTATION') == 'rust' else [sys.executable, str(root / 'receiver/forward.py')]
+            children.append(subprocess.Popen([*forward, '--unix', str(oxp),
                 '--live-socket', str(live), '--audio-binary', str(wrapper)], stdout=subprocess.DEVNULL,
                 env=dict(os.environ, CARLINK_LOW_LATENCY='1')))
             wait_path(oxp)

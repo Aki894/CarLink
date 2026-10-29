@@ -37,6 +37,7 @@ jobs:
           bash -n scripts/verify-image.sh
           bash -n scripts/build-carplay.sh
           bash -n scripts/run-carplay.sh
+          bash -n receiver/carplay-output.sh
           bash -n scripts/run-carlink.sh
           bash -n scripts/build-audio.sh
           bash scripts/test-uboot-config.sh
@@ -90,6 +91,7 @@ jobs:
           timeout 120s python3 scripts/test-hicar-rust-live.py app/target/debug/carlink
           timeout 120s python3 scripts/test-hicar-rust-backend.py app/target/debug/carlink
           python3 scripts/test-manager.py app/target/debug/carlink
+          python3 scripts/test-carplay-output.py app/target/debug/carlink
           python3 scripts/test-manager-web.py app/target/debug/carlink
           python3 -c 'import json; d=json.load(open("/tmp/carlink-doctor.json")); assert d["schema_version"] == 1; assert d["aoa"]["status"] == "not_tested"'
           cargo +"$RUST_VERSION" build --release --locked --manifest-path app/Cargo.toml --target "$TARGET"
@@ -108,6 +110,10 @@ jobs:
           bash scripts/build-carplay.sh
           PYTHONPATH=dist/carplay/hicar/python timeout 120s python3 scripts/test-hicar-rust-radio.py app/target/debug/carlink
           python3 scripts/test-live-bridge.py app/target/debug/carlink dist/carplay/bin/carlink-audio
+          CARLINK_FORWARD_IMPLEMENTATION=rust python3 scripts/test-live-bridge.py app/target/debug/carlink dist/carplay/bin/carlink-audio
+          printf '#!/bin/sh\nexec qemu-arm -L /usr/arm-linux-gnueabihf "%s/dist/carplay/bin/carlink-audio" "$@"\n' "$PWD" > .build/carplay-output-test-audio
+          chmod +x .build/carplay-output-test-audio
+          CARLINK_AUDIO_TEST_BINARY="$PWD/.build/carplay-output-test-audio" cargo +"$RUST_VERSION" test --locked --manifest-path app/Cargo.toml carplay_output:: -- --nocapture
           python3 scripts/test-runtime-install.py dist/app dist/carplay
       - uses: actions/upload-artifact@v4
         with:

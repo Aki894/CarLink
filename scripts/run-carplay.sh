@@ -13,7 +13,7 @@ case "$mode" in
     *) echo 'Usage: run-carplay.sh [probe|web|forward] [receiver options...]' >&2; exit 2 ;;
 esac
 [ "$(id -u)" = 0 ] || { echo 'Run as root for Bluetooth and hotspot management.' >&2; exit 1; }
-for command in nmcli iw bluetoothctl python3; do
+for command in nmcli iw bluetoothctl; do
     command -v "$command" >/dev/null || { echo "Missing prerequisite: $command" >&2; exit 1; }
 done
 test -d "/sys/class/net/$iface" || { echo "Wi-Fi interface missing: $iface" >&2; exit 1; }
@@ -23,7 +23,13 @@ done
 install -d -m 700 "$state/state" /run/carlink-carplay
 if [ "$mode" = probe ] || [ "$mode" = forward ]; then
     if [ "$mode" = forward ]; then export CARLINK_LOW_LATENCY=1; fi
-    if [ "$mode" = forward ]; then output="$root/forward.py"; else output="$root/probe.py"; fi
+    if [ "$mode" = forward ]; then
+        case "${CARLINK_CARPLAY_FORWARDER:-rust}" in
+            rust) output="$root/carplay-output.sh" ;;
+            python) output="$root/forward.py" ;;
+            *) echo 'Invalid CarPlay forwarder selection' >&2; exit 2 ;;
+        esac
+    else output="$root/probe.py"; fi
     # iOS wireless audio initialization requires a compatible voice offer even
     # when only AAC media is playing. The probe accepts compressed OXP packets.
     export CARLINK_CARPLAY_VOICE_OPUS=${CARLINK_CARPLAY_VOICE_OPUS:-1}
@@ -32,6 +38,7 @@ else
     output="$root/bin/oxp-relay"
 fi
 test -x "$output" || { echo "Missing executable: $output" >&2; exit 1; }
+case "$output" in *.py) command -v python3 >/dev/null || { echo 'Python diagnostic/reference mode requires python3' >&2; exit 1; } ;; esac
 iw reg set "$country"
 exec "$root/bin/openxplay-relay" \
     --state-dir "$state/state" --identity-dir "$state/mfi" \

@@ -5,6 +5,8 @@ mod runtime;
 mod media;
 mod live;
 mod voice;
+#[cfg(unix)]
+mod carplay_output;
 mod input;
 mod auth;
 mod hicar;
@@ -240,11 +242,18 @@ fn main() {
     if args == ["--help"] || args == ["-h"] {
         println!("HiCar development tools: carlink hicar codec | auth-worker (no radio access)");
         println!("Connection manager: carlink manager run --config PRIVATE_JSON | ctl SOCKET JSON");
+        println!("CarPlay media output: carlink carplay-output --help");
         println!("Usage:\n  carlink doctor --json\n  carlink carlife tcp [--listen 127.0.0.1:7240] [--duration 60] [--test-media DIR | --live-socket PATH]\n  carlink carlife usb [--duration 120] [--test-media DIR | --live-socket PATH]\nTCP is a loopback lab transport. USB creates a temporary AOA FunctionFS gadget. Duration 0 runs continuously. Live mode accepts H.264 and PCM from the local forwarder; test media is opt-in generated media.");
         return;
     }
     if args.first().map(String::as_str) == Some("hicar") {
         if let Err(error)=hicar::run(&args[1..]) {runtime::log("hicar_error",&error);std::process::exit(1);}
+        return;
+    }
+    if args.first().map(String::as_str) == Some("carplay-output") {
+        #[cfg(unix)] let result=carplay_output::run(&args[1..]);
+        #[cfg(not(unix))] let result:Result<(),String>=Err("CarPlay output requires Linux/Unix".into());
+        if let Err(error)=result {runtime::log("live_bridge_error",&error);std::process::exit(1);}
         return;
     }
     if args.first().map(String::as_str) == Some("manager") {
