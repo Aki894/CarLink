@@ -143,7 +143,8 @@ impl Adapter{
             if !self.decoders.contains_key(&message.stream){
                 if self.retry.get(&message.stream).is_some_and(|t|Instant::now()<*t){return Ok(());}
                 let decoder=audio::Decoder::new(&self.config.audio,&format)?;
-                diagnostic("audio_decoder_started",message.stream,&json!({"role":["MEDIA","ALERT","VOICE","TELEPHONY"][format.role as usize],"codec":format.codec,"sampleRate":format.sample_rate,"channels":format.channels}));
+                let role_name=["MEDIA","ALERT","VOICE","TELEPHONY"][format.role as usize];
+                diagnostic("audio_decoder_started",message.stream,&json!({"role":role_name,"codec":format.codec,"sampleRate":format.sample_rate,"channels":format.channels}));
                 self.decoders.insert(message.stream,decoder);self.link.audio_state(format.role,true);
             }
             let pts=if self.config.source_clock{self.capture_offset.and_then(|offset|message.pts.checked_add(offset)).unwrap_or(message.sender)}else{message.pts};
