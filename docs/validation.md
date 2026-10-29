@@ -1,5 +1,18 @@
 # 验证与部署记录
 
+## 2026-10-29：Rust CarPlay 媒体桥接与资源优化
+
+运行源码 `90ee05a450b6ef80cb3f309bcb8ba7c41a5cc49c` 已部署至 `/opt/carlink/releases/calls-90ee05a450b6`。主程序 SHA256 为 `b7184d5676d951813bf3f1bbb761cef92ffa1e3d5280d74f753359e9dcd514b0`；部署后核对 11 个运行文件、菜单动态库映射及各子进程路径。旧运行版本保留于 `/var/backups/carlink/calls-20261028T175858Z`（目录名使用板上时钟）。
+
+- **运行主链路**：CarPlay 输出进程已从 Python 切换为 `carlink carplay-output`；实机 CarPlay 与 HiCar 两种模式下，服务内没有 Python 进程。原生音频工具、libopus 与菜单动态库继续使用；Python 参考、诊断、测试和首次配置入口保留。
+- **用户台架验收**：用户确认新版 CarPlay 的画面、音乐、操作、双向通话及挂断恢复音乐均正常。日志记录麦克风累计 377 包、386,048 B，通话结束后停止采集。
+- **连接回归**：CarPlay → HiCar → CarPlay → HiCar 三次切换自动连通，分别约 8.88 / 13.64 / 8.97 s；始终保留 CarLife PID `9460`，USB 均连接。重复选择同一协议的五次请求中位数 31.02 ms，接收端 PID 与代次保持。测试结束切回 CarPlay，连接正常。
+- **资源测量**：静态画面、无解码子进程，三次五秒采样的服务总 PSS 中位数由 21,887 KiB 降至 14,474 KiB；CPU 为 19.93% / 21.10%（单核口径），未显示改善。ARMv7 主程序增加 120 KiB。方法和前两阶段优化见[性能记录](performance.md)。
+- **源码与应用构建**：[40819266235](https://github.com/Aki894/CarLink/actions/runs/40819266235) 成功，193 项主程序单测、OXP 字节级对照、真实 Rust 输出进程与合成 CarLife 闭环、麦克风代次/错误隔离、原生 PCM 持续播放和 Opus 往返均通过；旧 Python 路径仍作为对照运行。
+- **完整固件**：[40820009281](https://github.com/Aki894/CarLink/actions/runs/40820009281) 的 native、rust-interop、firmware、镜像结构检查及上传全部成功。本地下载后核对 artifact digest、压缩镜像 SHA256SUMS 和检查报告；镜像内新 `carplay-output.sh`、运行脚本、应用和依赖校验通过。
+
+镜像 `CarLink-refresh-39459953269-90ee05a4.img.xz` SHA256：`185caea67dfd8d1ff99802c95b6df17d0669824dcf853b3c548f20500acd31fb`。本轮验证范围为台架；Lexus 实车连接与实体触控板延续原有独立验收项。
+
 ## 2026-10-29：导航与音乐并行时的 HiCar VoIP 通话
 
 修复源码 `68dfc2ea9d1b26b5a60c4f8291c0a33ffe6e3288` 已部署至 `/opt/carlink/releases/calls-68dfc2ea9d1b`，应用 SHA256 `5333f159badaeca8b484feb312160f9e6fbad6e2aa3cacf62c6cc22a77457a03`，七个运行文件及子进程路径核对通过。
