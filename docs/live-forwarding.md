@@ -2,7 +2,9 @@
 
 ## 数据路径
 
-`carlink-run` 并行启动 CarLife USB 发送端和 OpenXPlay 无线 CarPlay 接收端。接收端通过 OXP Unix socket 将媒体交给 `receiver/forward.py`，再通过独立的本地媒体协议送给 Rust CarLife 会话。服务由 systemd 负责自动重启。
+`carlink-run` 并行启动 CarLife USB 发送端和 OpenXPlay 无线 CarPlay 接收端。接收端通过 OXP Unix socket 将媒体交给 Rust `carlink carplay-output`，再通过独立的本地媒体协议送给 Rust CarLife 会话。服务由 systemd 负责自动重启。
+
+常规运行中，连接管理、CarLife、HiCar 及 CarPlay 媒体桥接由 Rust 负责；FFmpeg、libopus 和菜单绘制仍使用原生库。Python 保留作诊断、参考实现、测试及首次配置引导。`CARLINK_CARPLAY_FORWARDER=python` 可显式选择旧桥接路径进行对照，默认使用 Rust。
 
 - 视频：固定 800×480、最高 30 fps 的源头声明和接收能力；H.264 AVC 转为 Annex B，关键帧补齐 SPS/PPS，High Profile 数据透传，不执行软件视频重编码。
 - 媒体和提示音：AAC-LC、PCM S16LE、Opus 分别封装为所需输入格式，由精简 FFmpeg 解码并转换为 44.1 kHz、双声道 PCM16LE。MEDIA 使用 CarLife Media 通道，ALERT 使用 TTS 通道，二者维持独立初始化状态。
@@ -13,7 +15,7 @@
 
 ## 边界和依赖
 
-Rust 监听 `/run/carlink/live.sock`，权限 0600，父目录由启动服务以 0700 创建。帧包含 4 字节小端长度和 12 字节 `<BBHQ` 头：kind、flags、reserved=0、pts_us。视频单帧最大 512 KiB，PCM 最大 64 KiB；两端媒体队列有 1 MiB 上限。Python 音频输入另有 16 包上限，Python 视频队列最多 4 帧、每音频角色最多 6 块；视频/音频下游排队期限 120 ms，压缩音频入口期限 500 ms，过期媒体不无限追赶。
+Rust 监听 `/run/carlink/live.sock`，权限 0600，父目录由启动服务以 0700 创建。帧包含 4 字节小端长度和 12 字节 `<BBHQ` 头：kind、flags、reserved=0、pts_us。视频单帧最大 512 KiB，PCM 最大 64 KiB；两端媒体队列有 1 MiB 上限。CarPlay 桥接音频输入另有 16 包上限，视频队列最多 4 帧、每音频角色最多 6 块；视频/音频下游排队期限 120 ms。输入队列、管道及解码器内尚未播放的音频共用 500 ms 预算，过期后重建对应解码器，防止积压追赶。已经开始写出的协议帧保持完整，通话接管优先清除尚未发送的普通 PCM。
 
 | kind | 方向 | 内容 |
 | --- | --- | --- |

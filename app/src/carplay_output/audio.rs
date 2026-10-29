@@ -145,9 +145,16 @@ impl Drop for Decoder{fn drop(&mut self){let _=self.child.kill();let _=self.chil
         let format=Format{role:0,codec:"PCM_S16LE".into(),sample_rate:44100,channels:2};
         let mut decoder=Decoder::new(Path::new(&binary),&format).unwrap();let source:Vec<u8>=(0..882*2).flat_map(|_|1234i16.to_le_bytes()).collect();
         for _ in 0..8{assert!(decoder.feed(&source,100000).unwrap());}
-        let deadline=Instant::now()+Duration::from_secs(2);let mut blocks=vec![];
-        while Instant::now()<deadline&&blocks.len()<5{blocks.extend(decoder.poll().unwrap());assert!(!decoder.failed());std::thread::sleep(Duration::from_millis(2));}
-        assert!(blocks.len()>=5);for (i,(pcm,pts)) in blocks.iter().enumerate(){assert_eq!(pcm.len(),PCM);assert_eq!(*pts,100000+i as u64*20000);assert!(pcm.chunks_exact(2).all(|b|b==1234i16.to_le_bytes()));}
+        // FFmpeg's live raw-PCM reader retains part of a short burst until
+        // more input arrives. Keep stdin open and supply a real 20 ms stream;
+        // requiring a finite 160 ms burst to drain would test EOF semantics.
+        let deadline=Instant::now()+Duration::from_secs(2);let mut blocks=vec![];let mut input_due=Instant::now()+Duration::from_millis(20);
+        while Instant::now()<deadline&&blocks.len()<5{
+            let now=Instant::now();if now>=input_due{assert!(decoder.feed(&source,100000).unwrap());input_due=now+Duration::from_millis(20);}
+            blocks.extend(decoder.poll().unwrap());assert!(!decoder.failed());std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(blocks.len()>=5,"live PCM output stalled: blocks={}, queued={}, pcm_bytes={}",blocks.len(),decoder.queue.len(),decoder.pcm.len());
+        for (i,(pcm,pts)) in blocks.iter().enumerate(){assert_eq!(pcm.len(),PCM);assert_eq!(*pts,100000+i as u64*20000);assert!(pcm.chunks_exact(2).all(|b|b==1234i16.to_le_bytes()));}
         // Six 100 ms packets hit the latency cap before the 16-packet cap.
         let mut bounded=Decoder::new(Path::new(&binary),&format).unwrap();
         for _ in 0..5{assert!(bounded.feed(&vec![0;17640],0).unwrap());}
