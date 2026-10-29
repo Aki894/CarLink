@@ -1,0 +1,111 @@
+diff --git a/rust/carplay-airplay/src/buffered_audio_stream.rs b/rust/carplay-airplay/src/buffered_audio_stream.rs
+index a1532cf..58203e6 100644
+--- a/rust/carplay-airplay/src/buffered_audio_stream.rs
++++ b/rust/carplay-airplay/src/buffered_audio_stream.rs
+@@ -236,7 +236,9 @@ impl BufferedAudioStream {
+                 }
+                 Self::retire(&mut s, i.format.sample_rate);
+                 i.changed.notify_all();
+-                if s.rate == 0 || s.queue.is_empty() || Self::lead(&s, i.format.sample_rate) >= 1000
++                if s.rate == 0
++                    || s.queue.is_empty()
++                    || Self::lead(&s, i.format.sample_rate) >= LEAD_MILLIS as i64
+                 {
+                     drop(
+                         i.changed
+@@ -477,8 +479,9 @@ pub const MAX_BUFFER_MILLIS: u64 = 120_000;
+ pub const PACED_FILL_FLOOR_MILLIS: u64 = 15_000;
+ /// Protocol message, field, or framing constant.
+ pub const FILL_RATE_MULTIPLE: u64 = 4;
+-/// Protocol message, field, or framing constant.
+-pub const LEAD_MILLIS: u64 = 1_000;
++/// Bound decoder prefetch independently of the 400 ms playback clock anchor.
++/// A one-second startup burst overruns CarLink's bounded live decoder queue.
++pub const LEAD_MILLIS: u64 = 200;
+ /// Protocol message, field, or framing constant.
+ pub const START_LATENCY_MILLIS: u64 = 400;
+ /// Protocol message, field, or framing constant.
+diff --git a/rust/carplay-airplay/tests/media_workers.rs b/rust/carplay-airplay/tests/media_workers.rs
+index 9902eb0..9394b79 100644
+--- a/rust/carplay-airplay/tests/media_workers.rs
++++ b/rust/carplay-airplay/tests/media_workers.rs
+@@ -448,6 +448,79 @@ fn buffered_split_and_coalesced_frames_wait_for_rate_then_pause_and_flush() {
+     assert!(b.set_rate(Some(0), 1, now).unwrap().is_none());
+ }
+ #[test]
++fn buffered_prefetch_is_bounded_without_changing_playback_anchor() {
++    #[derive(Default)]
++    struct TimedAudio {
++        packets: Mutex<Vec<(Instant, u32)>>,
++        stops: AtomicUsize,
++    }
++    impl AudioListener for TimedAudio {
++        fn on_rtp(&self, _: &AudioFormat, _: &[u8], sample: u32) -> Result<()> {
++            self.packets.lock().unwrap().push((Instant::now(), sample));
++            Ok(())
++        }
++        fn on_stopped(&self) -> Result<()> {
++            self.stops.fetch_add(1, Ordering::SeqCst);
++            Ok(())
++        }
++    }
++    let t = Arc::new(Transport::default());
++    let o = Arc::new(TimedAudio::default());
++    let f = format();
++    assert_eq!(f.sample_rate, 48000);
++    let b = BufferedAudioStream::new(t.clone(), f, vec![4; 32], o.clone()).unwrap();
++    b.start().unwrap();
++    let socket = Arc::new(ByteStream::default());
++    t.server().connect(socket.clone());
++    let first = 1000;
++    let mut bytes = Vec::new();
++    for seq in 0..48u16 {
++        bytes.extend(buffered_packet(
++            &[4; 32], seq, first + u32::from(seq) * 1024, b"aac",
++        ));
++    }
++    let length = bytes.len();
++    socket.push(bytes);
++    wait(|| socket.consumed.load(Ordering::SeqCst) == length);
++    assert!(o.packets.lock().unwrap().is_empty());
++    let now = (2_208_988_800u64 + 100) << 32;
++    let epoch = Instant::now();
++    let anchor = b.set_rate(Some(first), 1, now).unwrap();
++    assert_eq!(anchor, Some(BufferedAudioStream::anchor_plist(
++        first, now.wrapping_add(BufferedAudioStream::millis_to_ntp(400)), 1,
++    )));
++    wait(|| o.packets.lock().unwrap().len() == 48);
++    b.set_rate(None, 0, now).unwrap();
++    let captured = o.packets.lock().unwrap().clone();
++    for (index, (at, sample)) in captured.iter().enumerate() {
++        assert_eq!(*sample, first + index as u32 * 1024);
++        let sent_us = (index as i128 + 1) * 1024 * 1_000_000 / 48000;
++        let lead_us = sent_us - at.duration_since(epoch).as_micros() as i128;
++        // Include one AAC frame of threshold overshoot and scheduler margin.
++        assert!(lead_us <= 235_000, "packet {index}: prefetch lead {lead_us} us");
++    }
++    assert_eq!(o.stops.load(Ordering::SeqCst), 1);
++    // Pause, discard retained history, and start another epoch: no stale
++    // prefetched audio may leak through the bounded-feed change.
++    let resumed = 1_000_000;
++    b.flush(Some(resumed)).unwrap();
++    let resume_anchor = b.set_rate(Some(resumed), 1, now).unwrap();
++    assert_eq!(resume_anchor, Some(BufferedAudioStream::anchor_plist(
++        resumed, now.wrapping_add(BufferedAudioStream::millis_to_ntp(400)), 1,
++    )));
++    let mut next = Vec::new();
++    for seq in 48..52u16 {
++        next.extend(buffered_packet(
++            &[4; 32], seq, resumed + u32::from(seq - 48) * 1024, b"aac",
++        ));
++    }
++    socket.push(next);
++    wait(|| o.packets.lock().unwrap().len() == 52);
++    assert_eq!(o.packets.lock().unwrap()[48..].iter().map(|(_, ts)| *ts).collect::<Vec<_>>(),
++        [resumed, resumed + 1024, resumed + 2048, resumed + 3072]);
++    b.close().unwrap();
++}
++#[test]
+ fn buffered_malformed_length_closes_without_reading_another_prefix() {
+     let t = Arc::new(Transport::default());
+     let o = Arc::new(AudioOutput::default());

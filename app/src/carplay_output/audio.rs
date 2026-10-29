@@ -142,6 +142,28 @@ impl Decoder{
 }
 impl Drop for Decoder{fn drop(&mut self){let _=self.child.kill();let _=self.child.wait();}}
 
+#[cfg(test)]
+pub(super) fn test_aac_packets(binary:&Path)->Vec<Vec<u8>>{
+    // Generate valid, compact AAC with the same pinned native tool used on
+    // the board; no external fixture or encoder dependency is required.
+    let pcm:Vec<u8>=(0..12000).flat_map(|i|{
+        let sample=((i as f64*std::f64::consts::TAU*440./48000.).sin()*8000.) as i16;
+        [sample.to_le_bytes(),sample.to_le_bytes()].concat()
+    }).collect();
+    let mut encoder=Command::new(binary).args(["-hide_banner","-loglevel","error","-f","s16le","-ar","48000","-ac","2","-i","pipe:0","-c:a","aac","-b:a","64000","-f","adts","pipe:1"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    encoder.stdin.take().unwrap().write_all(&pcm).unwrap();let encoded=encoder.wait_with_output().unwrap();assert!(encoded.status.success());
+    let mut packets=vec![];let mut offset=0;
+    while offset<encoded.stdout.len(){
+        let header=&encoded.stdout[offset..offset+7];
+        let size=((header[3] as usize&3)<<11)|((header[4] as usize)<<3)|((header[5] as usize)>>5);
+        assert!(size>7&&offset+size<=encoded.stdout.len());
+        packets.push(encoded.stdout[offset+7..offset+size].to_vec());offset+=size;
+    }
+    assert!(packets.len()>=10);
+    packets
+}
+
 #[cfg(test)]mod tests{
     use super::*;
     #[test]fn formats_aac_and_opus_framing_are_strict(){
@@ -177,25 +199,9 @@ impl Drop for Decoder{fn drop(&mut self){let _=self.child.kill();let _=self.chil
     }
     #[test]fn native_aac_decoder_sustains_eight_seconds_of_realtime_music(){
         let Some(binary)=std::env::var_os("CARLINK_AUDIO_TEST_BINARY") else{return};
-        // Generate valid, compact AAC with the same pinned native tool used on
-        // the board; no external fixture or encoder dependency is required.
-        let pcm:Vec<u8>=(0..12000).flat_map(|i|{
-            let sample=((i as f64*std::f64::consts::TAU*440./48000.).sin()*8000.) as i16;
-            [sample.to_le_bytes(),sample.to_le_bytes()].concat()
-        }).collect();
-        let mut encoder=Command::new(&binary).args(["-hide_banner","-loglevel","error","-f","s16le","-ar","48000","-ac","2","-i","pipe:0","-c:a","aac","-b:a","64000","-f","adts","pipe:1"])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
-        encoder.stdin.take().unwrap().write_all(&pcm).unwrap();let encoded=encoder.wait_with_output().unwrap();assert!(encoded.status.success());
-        let mut packets=vec![];let mut offset=0;
-        while offset<encoded.stdout.len(){
-            let header=&encoded.stdout[offset..offset+7];
-            let size=((header[3] as usize&3)<<11)|((header[4] as usize)<<3)|((header[5] as usize)>>5);
-            assert!(size>7&&offset+size<=encoded.stdout.len());
-            packets.push(encoded.stdout[offset+7..offset+size].to_vec());offset+=size;
-        }
-        assert!(packets.len()>=10);
+        let packets=test_aac_packets(Path::new(&binary));
         let format=Format{role:0,codec:"AAC_LC".into(),sample_rate:48000,channels:2};
-        let mut decoder=Decoder::new(Path::new(&binary),&format).unwrap();let started=Instant::now();let mut fed=0u64;let mut blocks=0u64;let mut first=None;let mut audible=false;
+        let mut decoder=Decoder::new(Path::new(&binary),&format).unwrap();let started=Instant::now();let mut fed=0u64;let mut blocks=0u64;let mut first=None;let mut audible=false;let mut previous=None;let mut maximum_gap=Duration::ZERO;
         while started.elapsed()<Duration::from_secs(8){
             // Three-packet bursts exercise real radio/IPC delivery without
             // relaxing the total 500 ms native+Rust+playout sample budget.
@@ -204,12 +210,14 @@ impl Drop for Decoder{fn drop(&mut self){let _=self.child.kill();let _=self.chil
                 assert!(decoder.feed(&packets[fed as usize%packets.len()],100000+fed*1024*1_000_000/48000).unwrap(),"{}",decoder.failure());fed+=1;
             }
             for (pcm,pts)in decoder.poll().unwrap(){
+                let now=Instant::now();if let Some(last)=previous{maximum_gap=maximum_gap.max(now.duration_since(last));}previous=Some(now);
                 first.get_or_insert(started.elapsed());assert_eq!(pts,100000+blocks*20000);assert_eq!(pcm.len(),PCM);
                 audible|=pcm.chunks_exact(2).any(|b|i16::from_le_bytes([b[0],b[1]]).unsigned_abs()>1000);blocks+=1;
             }
             assert!(!decoder.failed(),"{}",decoder.failure());std::thread::sleep(Duration::from_millis(2));
         }
         assert!(first.unwrap()<BUDGET);assert!(blocks>=350&&audible,"sustained AAC failed: blocks={blocks}, diagnostics={}",decoder.failure());
+        assert!(maximum_gap<Duration::from_millis(150),"live AAC output gap: {maximum_gap:?}");
     }
 
 }

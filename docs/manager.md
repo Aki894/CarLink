@@ -16,7 +16,7 @@ HiCar 已配对手机的主动回连使用 FE35 Nearby 控制、CCMP business 19
 
 - 开机等待连接时显示 CarLink 设备菜单；通过触摸或 Lexus 焦点方向、确认、返回操作。真实 Remote Touch 的原车快捷键仍待实车确定。
 - 投屏期间，在当前热点内打开 `http://10.77.0.1:8088`（CarPlay）或 `http://192.168.49.1:8088`（HiCar），选择手机、添加设备或打开车机菜单。有线维护地址是 `http://192.168.77.2:8088`。
-- CarPlay 桌面使用上游已有车形图标，名称为“CarLink菜单”，点击打开本地菜单。HiCar 默认返回车机图标也接入同一菜单；当前保留系统图标与名称，不修改蓝牙/热点名称。菜单显示期间保持无线连接和音频；返回投屏时请求源关键帧，HiCar 同时恢复原生 PLAY。
+- CarPlay 桌面使用上游已有车形图标，名称为“CarLink菜单”，点击打开本地菜单。HiCar 默认返回车机图标也接入同一菜单；当前保留系统图标与名称，不修改蓝牙/热点名称。菜单显示期间保持无线连接和音频；返回投屏时请求源关键帧，HiCar 同时发送 DMSDP 显示服务恢复指令（203）。
 - 菜单添加设备会在当前已有投屏时要求确认。网页添加与忘记操作也有明确确认。
 
 菜单只编码本地静态 UI；源手机的压缩 H.264 与 PCM 直接转发。单个 live mux 持有 CarLife 输出连接，菜单和无线后端不会竞争同一个 Unix socket。队列按帧数、字节和等待时间限界，切换后等待新关键帧，清理旧源的未发送媒体与触点。
@@ -52,7 +52,7 @@ carlink manager ctl /run/carlink-manager/control.sock '{"op":"resume"}'
 
 明确认证失配或连续三次连接拒绝时，只清理目标 iPhone 的旧 BlueZ 配对并开放有界重配窗口；普通离线保留记录。CarLife 故障单独恢复，已建立的无线源保留。每次切换增加代际，忽略旧后端回调。
 
-验证入口：`scripts/test-manager.py`（生命周期、策略、配对和遗忘）、`scripts/test-manager-web.py`（真实 HTTP 边界）、`scripts/test-manager-menu.py` 与 Rust `manager_menu::`（H.264 实际解码、菜单焦点、PCM 透传、关键帧恢复、USB 重连）。台架、完整固件与 Lexus 实车结果记入 [validation.md](validation.md)。HiCar 的 R2 运行链路已迁入 Rust，Python HiCar 实验代码仅保留为参考与测试；CarPlay 仍使用其独立 Python 媒体桥接。当前缺口见[完成情况核对](status-audit.md)。
+验证入口：`scripts/test-manager.py`（生命周期、策略、配对和遗忘）、`scripts/test-manager-web.py`（真实 HTTP 边界）、`scripts/test-manager-menu.py` 与 Rust `manager_menu::`（H.264 实际解码、菜单焦点、PCM 透传、关键帧恢复、USB 重连）。台架、完整固件与 Lexus 实车结果记入 [validation.md](validation.md)。HiCar 的 R2 运行链路与 CarPlay 媒体桥接均已迁入 Rust，Python 实验代码仅保留为参考与测试。当前缺口见[完成情况核对](status-audit.md)。
 
 ## 断连、启动与返回键入口（2026-10-25）
 

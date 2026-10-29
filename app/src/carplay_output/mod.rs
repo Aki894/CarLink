@@ -149,6 +149,10 @@ impl Adapter{
             let pts=if self.config.source_clock{message.sender}else{message.pts};
             self.link.media(2,data,pts.max(0) as u64,(message.flags&1)|if self.config.source_clock{2}else{0});
         }else if message.kind==2{
+            // A single OXP read can contain many compressed packets. Advance
+            // nonblocking codec pipes between packets instead of filling the
+            // Rust queue before the owner gets its next regular step.
+            self.poll_audio()?;
             let Some(format)=self.formats.get(&message.stream).cloned()else{return Ok(());};
             if self.decoders.get(&message.stream).is_some_and(|d|d.failed()){
                 self.decoder_failed(message.stream);
@@ -165,7 +169,7 @@ impl Adapter{
             self.decoders.get_mut(&message.stream).unwrap().feed(&message.payload,pts.max(0) as u64)?;
         }Ok(())
     }
-    fn step(&mut self)->Result<()>{
+    fn poll_audio(&mut self)->Result<()>{
         let mut failed=vec![];
         for (stream,decoder)in &mut self.decoders{
             let role=self.formats.get(stream).ok_or("audio format disappeared")?.role;
@@ -182,6 +186,10 @@ impl Adapter{
                 if role==3&&self.formats.values().any(|f|f.role==3){self.link.audio_state(3,true);}
             }
         }
+        Ok(())
+    }
+    fn step(&mut self)->Result<()>{
+        self.poll_audio()?;
         for feedback in self.link.step(){match feedback{
             link::Feedback::Control(value)=>{
                 // The source remains active behind the local menu. Returning is
@@ -205,6 +213,26 @@ impl Adapter{
     }
 }
 impl Drop for Adapter{fn drop(&mut self){let stopped=self.microphone.stop(None);let _=self.request_microphone(stopped);self.decoders.clear();self.link.session(false);self.link.close();}}
+
+#[cfg(test)]mod tests{
+    use super::*;
+    #[test]fn native_audio_ipc_burst_advances_decoder_between_packets(){
+        let Some(binary)=std::env::var_os("CARLINK_AUDIO_TEST_BINARY") else{return};
+        let packets=audio::test_aac_packets(Path::new(&binary));
+        let config=Config{socket:"/nonexistent/oxp".into(),live:"/nonexistent/live".into(),audio:binary.into(),opus:None,width:800,height:480,source_clock:false};
+        let mut adapter=Adapter::new(config);adapter.hello=true;adapter.active=true;
+        adapter.formats.insert(0,audio::Format{role:0,codec:"AAC_LC".into(),sample_rate:48000,channels:2});
+        // 384 ms fits the total latency budget, but exceeds the 16-packet
+        // input queue if an IPC batch is fed without polling its codec pipes.
+        for sequence in 0..18{
+            adapter.binary(wire::Binary{kind:2,stream:0,flags:0,sequence,pts:sequence as i64*1024*1_000_000/48000,sender:0,payload:packets[sequence as usize%packets.len()].clone()}).unwrap();
+        }
+        assert!(adapter.retry.is_empty(),"a legal IPC burst restarted the codec");
+        let decoder=adapter.decoders.get(&0).unwrap();
+        assert!(!decoder.failed(),"{}",decoder.failure());
+        assert_eq!(decoder.failure()["packets"],18);
+    }
+}
 
 pub fn run(args:&[String])->Result<()>{
     if args.iter().any(|v|v=="--help"||v=="-h"){println!("Usage: carlink carplay-output [--unix PATH] [--live-socket PATH] [--audio-binary PATH] [--opus-library PATH] [--width 800] [--height 480]");return Ok(());}
