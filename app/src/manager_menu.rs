@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Single-owner live mux. Only the local menu is encoded; projection bytes pass through.
+//! Single-owner live mux. Only the local menu is encoded; projection video passes through.
 #[cfg(unix)]
 mod unix {
 use libloading::Library;
@@ -16,7 +16,7 @@ struct View {rows:Vec<String>,focus:usize,visible:bool,revision:u64}
 impl Default for View {fn default()->Self{Self{rows:vec!["CarLink".into()],focus:0,visible:false,revision:0}}}
 /// One producer socket and one output socket. Native rendering is confined
 /// to its own thread; latest-view/result slots keep native work off media IO.
-pub struct Mux {view:Arc<Mutex<View>>,wake:Arc<Condvar>,events:Receiver<Value>,stop:Arc<AtomicBool>,source_ids:Arc<AtomicU64>,retire:Arc<AtomicU64>,retired:Arc<AtomicU64>,thread:Option<JoinHandle<()>>,renderer:Option<JoinHandle<()>>}
+pub struct Mux {view:Arc<Mutex<View>>,wake:Arc<Condvar>,events:Receiver<Value>,stop:Arc<AtomicBool>,source_ids:Arc<AtomicU64>,retire:Arc<AtomicU64>,retired:Arc<AtomicU64>,volume:Arc<AtomicU64>,resume:Arc<AtomicU64>,thread:Option<JoinHandle<()>>,renderer:Option<JoinHandle<()>>}
 type RenderSlot=Arc<Mutex<Option<(u64,Result<Vec<u8>>)>>>;
 fn request_stop(view:&Mutex<View>,wake:&Condvar,stop:&AtomicBool){
     // Share the waiter's mutex so stopping cannot race between its predicate
@@ -43,7 +43,7 @@ impl Mux {
         let listener=UnixListener::bind(source_socket).map_err(|_|"cannot bind menu source socket")?;
         if fs::set_permissions(source_socket,fs::Permissions::from_mode(0o600)).is_err() || listener.set_nonblocking(true).is_err(){let _=fs::remove_file(source_socket);return Err("cannot secure menu source socket".into());}
         let view=Arc::new(Mutex::new(View::default()));let stop=Arc::new(AtomicBool::new(false));let wake=Arc::new(Condvar::new());let rendered=Arc::new(Mutex::new(None));
-        let source_ids=Arc::new(AtomicU64::new(0));let retire=Arc::new(AtomicU64::new(0));let retired=Arc::new(AtomicU64::new(0));
+        let source_ids=Arc::new(AtomicU64::new(0));let retire=Arc::new(AtomicU64::new(0));let retired=Arc::new(AtomicU64::new(0));let volume=Arc::new(AtomicU64::new(100));let resume=Arc::new(AtomicU64::new(0));
         let (send,events)=mpsc::sync_channel(32);let (ready_tx,ready_rx)=mpsc::sync_channel(1);
         let rv=view.clone();let rs=stop.clone();let rw=wake.clone();let result=rendered.clone();let library=library.to_path_buf();let font=font.to_path_buf();
         let renderer=thread::spawn(move||render_loop(library,font,rv,rw,rs,result,ready_tx,delay));
@@ -53,13 +53,13 @@ impl Mux {
                 return Err(match result{Ok(Err(e))=>e,_=>"menu renderer initialization timed out".into()});}
         }
         let tv=view.clone();let ts=stop.clone();let tw=wake.clone();let input=source_socket.to_path_buf();let output=live_socket.to_path_buf();
-        let ids=source_ids.clone();let retirement=retire.clone();let completed=retired.clone();
+        let ids=source_ids.clone();let retirement=retire.clone();let completed=retired.clone();let gain=volume.clone();let return_source=resume.clone();
         let handle=thread::spawn(move||{
             let exit_view=tv.clone();let mut worker=Worker::new(listener,output,tv,ts.clone(),send,rendered);
-            worker.source_ids=ids;worker.retire=retirement;worker.retired=completed;worker.run();
+            worker.source_ids=ids;worker.retire=retirement;worker.retired=completed;worker.volume=gain;worker.resume=return_source;worker.run();
             request_stop(&exit_view,&tw,&ts);let _=fs::remove_file(input);
         });
-        Ok(Self{view,wake,events,stop,source_ids,retire,retired,thread:Some(handle),renderer:Some(renderer)})
+        Ok(Self{view,wake,events,stop,source_ids,retire,retired,volume,resume,thread:Some(handle),renderer:Some(renderer)})
     }
     pub fn set_menu(&self,rows:Vec<String>,focus:usize,visible:bool)->Result<()>{
         if rows.is_empty() || rows.len()>24 || focus>=rows.len() || rows.iter().any(|s|s.chars().count()>128 || s.chars().any(char::is_control)){return Err("invalid menu model".into());}
@@ -67,6 +67,10 @@ impl Mux {
         if view.rows!=rows || view.focus!=focus || view.visible!=visible {view.revision=view.revision.wrapping_add(1);view.rows=rows;view.focus=focus;view.visible=visible;self.wake.notify_one();}Ok(())
     }
     pub fn try_input(&self)->Option<Value>{self.events.try_recv().ok()}
+    /// Master output attenuation; capture/microphone data is never scaled.
+    pub fn set_volume(&self,level:u8)->Result<()>{if level>100{return Err("volume must be within 0..100".into());}self.volume.store(level as u64,Ordering::Release);Ok(())}
+    /// Fence the return request to the source that was current at this call.
+    pub fn resume_projection(&self){self.resume.store(self.source_ids.load(Ordering::Acquire),Ordering::Release);}
     pub fn retire_sources(&self)->Result<u64>{
         // Call after terminating the old producer. The acknowledgement also
         // fences connections already queued in the listener but not accepted.
@@ -200,7 +204,28 @@ fn valid(f:&Frame,reverse:bool)->bool{
         ||f.kind==130&&(10..=16392).contains(&f.payload.len())&&f.payload.len()%2==0);}
     match f.kind {1=>f.flags==0&&f.payload==configure().payload,2=>f.flags<=3&&!f.payload.is_empty()&&f.payload.len()<=MENU_BYTES&&(f.payload.starts_with(&[0,0,1])||f.payload.starts_with(&[0,0,0,1])),
         3=>f.flags<=3&&!f.payload.is_empty()&&f.payload.len()<=65536&&f.payload.len()%4==0,4=>f.flags<=1&&f.payload.is_empty(),5=>f.flags<=3&&f.payload.len()==1&&f.payload[0]<=1,6=>f.flags==0&&f.payload.is_empty(),
-        7=>f.flags==0&&f.payload.len()<=1024&&serde_json::from_slice::<Value>(&f.payload).is_ok(),_=>false}
+        7=>f.flags==0&&f.payload.len()<=1024&&serde_json::from_slice::<Value>(&f.payload).is_ok(),8=>f.flags==0&&f.payload.is_empty(),_=>false}
+}
+const UNITY:i64=65536;
+const GAIN_FRAMES:u32=882; // 20 ms at the local 44.1 kHz stereo PCM interface.
+#[derive(Clone,Copy)]
+struct Gain {current:i64,start:i64,target:i64,position:u32}
+impl Default for Gain{fn default()->Self{Self{current:UNITY,start:UNITY,target:UNITY,position:GAIN_FRAMES}}}
+impl Gain {
+    fn apply(&mut self,level:u8,pcm:&mut [u8]){
+        let target=level.min(100)as i64*UNITY/100;
+        if target!=self.target{self.start=self.current;self.target=target;self.position=0;}
+        // Unity output keeps the already-owned payload untouched, with no copy.
+        if self.current==UNITY&&self.target==UNITY{return;}
+        for frame in pcm.chunks_exact_mut(4){
+            if self.position<GAIN_FRAMES{self.position+=1;self.current=self.start+(self.target-self.start)*self.position as i64/GAIN_FRAMES as i64;}
+            for sample in frame.chunks_exact_mut(2){
+                let input=i16::from_le_bytes([sample[0],sample[1]])as i64;
+                let output=(input*self.current/UNITY).clamp(i16::MIN as i64,i16::MAX as i64)as i16;
+                sample.copy_from_slice(&output.to_le_bytes());
+            }
+        }
+    }
 }
 fn connect_output(path:&Path)->std::io::Result<UnixStream>{
     // AF_UNIX connect can otherwise block indefinitely when a stale listener's
@@ -218,10 +243,11 @@ fn connect_output(path:&Path)->std::io::Result<UnixStream>{
 }
 struct Worker {listener:UnixListener,output:PathBuf,view:Arc<Mutex<View>>,stop:Arc<AtomicBool>,events:SyncSender<Value>,rendered:RenderSlot,cached:Option<(u64,Vec<u8>)>,
     microphone:Option<Frame>,audio_roles:[bool;4],source_ids:Arc<AtomicU64>,source_id:u64,retire:Arc<AtomicU64>,retired:Arc<AtomicU64>,
+    volume:Arc<AtomicU64>,gains:[Gain;4],resume:Arc<AtomicU64>,
     source:Option<Pipe>,hu:Option<Pipe>,snapshot:View,source_active:bool,source_key:Option<Frame>,waiting_key:bool,retry:Instant,painted:Option<Instant>,presented:Option<View>,touch:Option<Value>,menu_touch:Option<(usize,f64,f64,bool)>,last_key:Option<Instant>,back_frames:Vec<Frame>,back_last:Option<Instant>,back_first:Option<Instant>}
 impl Worker {
     fn new(listener:UnixListener,output:PathBuf,view:Arc<Mutex<View>>,stop:Arc<AtomicBool>,events:SyncSender<Value>,rendered:RenderSlot)->Self{
-        Self{listener,output,view,stop,events,rendered,cached:None,microphone:None,audio_roles:[false;4],source_ids:Arc::new(AtomicU64::new(0)),source_id:0,retire:Arc::new(AtomicU64::new(0)),retired:Arc::new(AtomicU64::new(0)),source:None,hu:None,snapshot:View::default(),source_active:false,source_key:None,waiting_key:true,retry:Instant::now(),painted:None,presented:None,touch:None,menu_touch:None,last_key:None,back_frames:vec![],back_last:None,back_first:None}
+        Self{listener,output,view,stop,events,rendered,cached:None,microphone:None,audio_roles:[false;4],source_ids:Arc::new(AtomicU64::new(0)),source_id:0,retire:Arc::new(AtomicU64::new(0)),retired:Arc::new(AtomicU64::new(0)),volume:Arc::new(AtomicU64::new(100)),gains:[Gain::default();4],resume:Arc::new(AtomicU64::new(0)),source:None,hu:None,snapshot:View::default(),source_active:false,source_key:None,waiting_key:true,retry:Instant::now(),painted:None,presented:None,touch:None,menu_touch:None,last_key:None,back_frames:vec![],back_last:None,back_first:None}
     }
     fn output(&mut self,f:Frame){if self.hu.as_mut().is_some_and(|p|p.push(f).is_err()){self.hu=None;self.painted=None;self.presented=None;self.waiting_key=true;}}
     fn source(&mut self,f:Frame){if self.source.as_mut().is_some_and(|p|p.push(f).is_err()){self.lose_source();}}
@@ -242,7 +268,7 @@ impl Worker {
     fn state(&mut self){self.output(configure());self.output(Frame::new(4,u8::from(self.snapshot.visible||self.source_active),vec![]));
         if self.source_active{for role in 0..4{if self.audio_roles[role]{self.output(Frame::new(5,role as u8,vec![1]));}}if let Some(mic)=self.microphone.clone(){self.output(mic);}}
         self.waiting_key=true;self.request_key();self.replay_source_key();self.painted=None;}
-    fn incoming(&mut self,f:Frame){
+    fn incoming(&mut self,mut f:Frame){
         if f.kind==5{self.audio_roles[f.flags as usize]=f.payload[0]==1;}
         if f.kind==7{if let Ok(v)=serde_json::from_slice::<Value>(&f.payload){
             if v["active"]==true{self.microphone=Some(f.clone());}
@@ -268,7 +294,8 @@ impl Worker {
             }
             self.waiting_key=false;self.output(f);
         }},
-        3=>{if let Some(h)=self.hu.as_mut(){h.trim_audio();}self.output(f);},
+        3=>{self.gains[f.flags as usize].apply(self.volume.load(Ordering::Acquire).min(100)as u8,&mut f.payload);if let Some(h)=self.hu.as_mut(){h.trim_audio();}self.output(f);},
+        8=>{self.emit_source(json!({"type":"open-menu"}));},
         _=>self.output(f),
     }}
     fn accept_source(&mut self,socket:UnixStream){
@@ -345,6 +372,12 @@ impl Worker {
         }
         self.painted=None;
     }
+    fn resume_source(&mut self){
+        let source_id=self.resume.swap(0,Ordering::AcqRel);
+        if source_id!=0&&source_id==self.source_id&&self.source.is_some(){
+            self.source(feedback(json!({"type":"return-projection"})));self.last_key=None;self.request_key();
+        }
+    }
     fn take_rendered(&mut self){
         let result={let mut slot=self.rendered.lock().unwrap_or_else(|e|e.into_inner());
             if slot.as_ref().is_some_and(|(revision,_)|*revision<=self.snapshot.revision){slot.take()}else{None}};
@@ -355,7 +388,7 @@ impl Worker {
     fn run(&mut self){
         while !self.stop.load(Ordering::Acquire){
             if self.retire_pending().is_err(){break;}
-            self.update();if self.back_expired(Instant::now()){self.flush_backs();}
+            self.update();self.resume_source();if self.back_expired(Instant::now()){self.flush_backs();}
             if self.source.is_none(){match self.listener.accept(){Ok((s,_))=>{self.accept_source(s);
                 if !self.snapshot.visible{self.output(configure());self.output(Frame::new(6,0,vec![]));self.output(Frame::new(4,0,vec![]));}},Err(e) if e.kind()==ErrorKind::WouldBlock=>{},Err(_)=>break}}
             if self.hu.is_none() && Instant::now()>=self.retry {self.retry=Instant::now()+Duration::from_millis(200);if let Ok(s)=connect_output(&self.output){self.hu=Pipe::new(s).ok();if self.hu.is_some(){self.state();}}}
@@ -379,6 +412,47 @@ fn touch_row(x:f64,y:f64,focus:usize,count:usize)->Option<usize>{
 }
 #[cfg(test)]mod tests {
     use super::*;
+    fn stereo(left:i16,right:i16,frames:usize)->Vec<u8>{[left.to_le_bytes(),right.to_le_bytes()].concat().repeat(frames)}
+    #[test]fn output_gain_preserves_unity_and_reaches_exact_attenuation_without_clipping(){
+        let mut gain=Gain::default();let original=stereo(i16::MIN,i16::MAX,GAIN_FRAMES as usize);let mut pcm=original.clone();
+        gain.apply(100,&mut pcm);assert_eq!(pcm,original);
+        gain.apply(50,&mut pcm);assert_eq!(gain.current,UNITY/2);assert_eq!(&pcm[pcm.len()-4..],stereo(-16384,16383,1));
+        let mut stable=stereo(-12345,12345,4);gain.apply(50,&mut stable);assert_eq!(stable,stereo(-6172,6172,4));
+        let mut muted=stereo(i16::MIN,i16::MAX,GAIN_FRAMES as usize+3);gain.apply(0,&mut muted);
+        assert_eq!(gain.current,0);assert_eq!(&muted[muted.len()-16..],&[0;16]);
+    }
+    #[test]fn output_gain_ramp_is_stereo_locked_and_invariant_to_packet_boundaries(){
+        let source=stereo(30000,-30000,1764);let mut whole=source.clone();let mut full_gain=Gain::default();full_gain.apply(0,&mut whole);
+        let mut fragmented=source;let mut split_gain=Gain::default();
+        for part in fragmented.chunks_mut(4*37){split_gain.apply(0,part);}
+        assert_eq!(fragmented,whole);
+        let frames:Vec<_>=whole.chunks_exact(4).map(|p|(i16::from_le_bytes([p[0],p[1]]),i16::from_le_bytes([p[2],p[3]]))).collect();
+        assert!(frames.windows(2).all(|p|p[1].0<=p[0].0));assert!(frames.iter().all(|(l,r)|*l==-*r));
+        let mut prefix=stereo(30000,-30000,100);split_gain.apply(100,&mut prefix);
+        let before=split_gain.current;let mut retarget=stereo(30000,-30000,1);split_gain.apply(25,&mut retarget);
+        assert!((split_gain.current-before).abs()<=UNITY/GAIN_FRAMES as i64+1);assert!((0..=UNITY).contains(&split_gain.current));
+    }
+    #[test]fn native_menu_request_and_return_preserve_audio_and_fence_retired_sources(){
+        let root=std::env::temp_dir().join(format!("carlink-native-menu-{}",std::process::id()));fs::create_dir(&root).unwrap();
+        let listener=UnixListener::bind(root.join("source")).unwrap();let(tx,rx)=mpsc::sync_channel(32);
+        let mut w=Worker::new(listener,root.join("live"),Arc::new(Mutex::new(View::default())),Arc::new(AtomicBool::new(false)),tx,Arc::new(Mutex::new(None)));
+        let(socket,_peer)=UnixStream::pair().unwrap();w.source=Some(Pipe::new(socket).unwrap());w.source_active=true;w.source_id=4;
+        let(socket,_peer)=UnixStream::pair().unwrap();w.hu=Some(Pipe::new(socket).unwrap());w.audio_roles=[true,true,false,true];
+        let open=Frame::new(8,0,vec![]);assert!(valid(&open,false));assert!(!valid(&Frame::new(8,1,vec![]),false));assert!(!valid(&Frame::new(8,0,vec![1]),false));
+        w.incoming(open);assert_eq!(rx.try_recv().unwrap(),json!({"type":"open-menu","source_id":4}));
+        assert!(w.hu.as_ref().unwrap().output.is_empty());assert_eq!(w.audio_roles,[true,true,false,true]);assert!(w.source_active);
+        w.resume.store(4,Ordering::Release);w.resume_source();let pending=&w.source.as_ref().unwrap().output;
+        assert_eq!(pending.len(),2);assert_eq!(serde_json::from_slice::<Value>(&pending[0].data[16..]).unwrap()["type"],"return-projection");
+        assert_eq!(serde_json::from_slice::<Value>(&pending[1].data[16..]).unwrap()["type"],"keyframe");
+        w.resume.store(3,Ordering::Release);w.resume_source();assert_eq!(w.source.as_ref().unwrap().output.len(),2);
+        w.volume.store(0,Ordering::Release);let mut audio=Frame::new(3,3,stereo(12345,-12345,GAIN_FRAMES as usize+1));audio.pts=123456;
+        w.incoming(audio);let pending=&w.hu.as_ref().unwrap().output;assert_eq!(pending.len(),1);assert_eq!(pending[0].data[5],3);
+        assert_eq!(u64::from_le_bytes(pending[0].data[8..16].try_into().unwrap()),123456);assert_eq!(&pending[0].data[pending[0].data.len()-4..],&[0;4]);
+        // Capture feedback uses the reverse direction and remains byte-exact.
+        let microphone=Frame::new(130,0,vec![0x55;12]);let exact=microphone.wire();w.input(microphone);
+        assert_eq!(w.source.as_ref().unwrap().output.back().unwrap().data,exact);
+        drop(w);fs::remove_file(root.join("source")).unwrap();fs::remove_dir(root).unwrap();
+    }
     #[test]fn hu_reconnect_replays_call_and_microphone_but_source_loss_stops_capture(){
         let root=std::env::temp_dir().join(format!("carlink-call-replay-{}",std::process::id()));fs::create_dir(&root).unwrap();
         let listener=UnixListener::bind(root.join("source")).unwrap();let(tx,_rx)=mpsc::sync_channel(32);

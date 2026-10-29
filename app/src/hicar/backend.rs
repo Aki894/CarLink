@@ -233,7 +233,7 @@ fn listener(local:Ipv4Addr,port:u16)->Result<TcpListener>{
 }
 struct Owner{config:Config,radio:Radio,worker:Rpc,media:Option<Rpc>,mock_media:Option<i32>,channels:Vec<Channel>,listeners:Vec<TcpListener>,
     offer:Value,address:String,own:String,local:Ipv4Addr,peer_ip:Ipv4Addr,base:u16,auth:Option<u64>,authenticated:bool,key:Vec<u8>,epoch:u64,
-    audio_services:AudioServices,video_set:bool,clock_set:bool,last_stats:Instant,last_poll:Instant,closing:bool}
+    audio_services:AudioServices,return_projection:u64,video_set:bool,clock_set:bool,last_stats:Instant,last_poll:Instant,closing:bool}
 impl Owner{
     fn start(config:Config)->Result<Self>{
         // Validate every inherited mock endpoint before opening any real worker.
@@ -255,14 +255,14 @@ impl Owner{
         radio.call(json!({"op":"activate"}),Duration::from_secs(15))?;
         event("ready",0);
         Ok(Self{mock_media:config.fds[2],config,radio,worker,media:None,channels:vec![],listeners,offer,address,own,local,peer_ip,base,
-            auth:None,authenticated:false,key:vec![],epoch:0,audio_services:AudioServices::default(),video_set:false,clock_set:false,last_stats:Instant::now(),last_poll:Instant::now(),closing:false})
+            auth:None,authenticated:false,key:vec![],epoch:0,audio_services:AudioServices::default(),return_projection:0,video_set:false,clock_set:false,last_stats:Instant::now(),last_poll:Instant::now(),closing:false})
     }
     fn next_epoch(&mut self)->Result<()>{self.epoch=self.epoch.checked_add(1).ok_or("projection epoch exhausted")?;Ok(())}
     fn begin_media(&mut self)->Result<Value>{
         if self.media.is_some(){return Err("projection already active".into());}
         if self.config.test&&self.mock_media.is_none(){return Err("mock media descriptor already consumed".into());}
         let mut media=Rpc::new("media-worker",self.mock_media.take(),65536)?;let mut config=json!({"key":hex(&self.key),"local_ip":self.local,"peer_ip":self.peer_ip,"live_socket":self.config.live,"audio_binary":self.config.audio_binary});
-        let ready=media.call(&config);wipe_field(&mut config,"key");let ready=ready?;if !self.config.test{self.radio.call(json!({"op":"projection","active":true}),Duration::from_secs(1))?;}self.media=Some(media);self.video_set=false;self.clock_set=false;self.audio_services=AudioServices::default();Ok(ready)
+        let ready=media.call(&config);wipe_field(&mut config,"key");let ready=ready?;if !self.config.test{self.radio.call(json!({"op":"projection","active":true}),Duration::from_secs(1))?;}self.media=Some(media);self.video_set=false;self.clock_set=false;self.return_projection=0;self.audio_services=AudioServices::default();Ok(ready)
     }
     fn media_call(&mut self,v:Value)->Result<Value>{self.media.as_mut().ok_or("media worker unavailable")?.call(&v)}
     fn auth_close(&mut self){if let Some(generation)=self.auth.take(){let _=self.worker.call(&json!({"op":"auth-close","generation":generation}));}self.authenticated=false;wipe(&mut self.key);self.key.clear();}
@@ -333,6 +333,7 @@ impl Owner{
             let mut sight=Channel::new(fd,Kind::Sight,self.epoch)?;sight.token=Some(num(&result,"session")?);sight.enqueue(unhex(text(&result,"initial")?)?)?;self.channels.push(sight);event("hisight_connected",self.epoch);
         }}Ok(())}
     fn receive_sight(&mut self,c:&mut Channel,bytes:&[u8])->Result<()>{let result=self.worker.call(&json!({"op":"hisight-receive","session":c.token,"data":hex(bytes),"capture":false}))?;pending(c,&result)?;
+        if result["events"].as_array().is_some_and(|events|events.iter().any(|e|e["return_to_car"]==true)){self.media_call(json!({"op":"open-menu"}))?;}
         let state=&result["state"];if state["peer_teardown"]==true{c.closing=true;}
         if !self.video_set{if let Some(port)=state["media_endpoint"].as_u64(){self.media_call(json!({"op":"set-video","media_port":port,"input_port":state["input_endpoint"]}))?;self.video_set=true;
             let play=self.worker.call(&json!({"op":"hisight-play","session":c.token}))?;pending(c,&play)?;
@@ -370,6 +371,12 @@ impl Owner{
     }
     fn stats(&mut self,force:bool)->Result<()>{if self.media.is_none()||!force&&self.last_poll.elapsed()<Duration::from_millis(250){return Ok(());}self.last_poll=Instant::now();
         let response=self.media_call(json!({"op":"status"}))?;let state=&response["state"];
+        if let Some(request)=state["return_projection"].as_u64(){if request!=self.return_projection{
+            self.return_projection=request;
+            for c in &mut self.channels{if c.kind==Kind::Sight&&!c.closing{
+                let result=self.worker.call(&json!({"op":"hisight-play","session":c.token}))?;pending(c,&result)?;
+            }}
+        }}
         if force||self.last_stats.elapsed()>=Duration::from_secs(1){let mut out=state.clone();out["event"]="bridge_stats".into();out["session_epoch"]=self.epoch.into();println!("{out}");self.last_stats=Instant::now();}
         if self.video_set&&state["video_ended"]==true{self.stop_projection();}Ok(())}
     fn stop_projection(&mut self){

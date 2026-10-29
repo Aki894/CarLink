@@ -36,8 +36,10 @@ mkdir -p "$out/bin" "$out/share/licenses/relay" "$out/share/licenses/stream" "$o
 shopt -s nullglob
 patches=("$root"/receiver/patches/*.patch)
 for patch in "${patches[@]}"; do
-    git -C "$relay" apply --check "$patch"
-    git -C "$relay" apply "$patch"
+    destination="$relay"
+    [[ $(basename "$patch") != *-stream.patch ]] || destination="$stream"
+    git -C "$destination" apply --check "$patch"
+    git -C "$destination" apply "$patch"
     cp "$patch" "$out/share/source/patches/"
 done
 
@@ -50,6 +52,7 @@ rustup toolchain install "$version" --profile minimal --target "$target"
 # are resolved by the upstream Cargo.lock files rather than edited locally.
 cargo +"$version" test --locked --manifest-path "$relay/rust/Cargo.toml" -p carplay-iap2 -p carplay-airplay
 cargo +"$version" test --locked --manifest-path "$relay/rust/Cargo.toml" -p openxplay-relay carlink_
+cargo +"$version" test --locked --manifest-path "$stream/rust/Cargo.toml" -p oxp-wire carlink_
 cargo +"$version" build --locked --release --manifest-path "$relay/rust/Cargo.toml" --target "$target" -p openxplay-relay --bin openxplay-relay
 cargo +"$version" build --locked --release --manifest-path "$stream/rust/Cargo.toml" --target "$target" -p oxp-bin --bin oxp-relay
 for name in openxplay-relay oxp-relay; do
@@ -106,7 +109,7 @@ root,out=map(pathlib.Path,sys.argv[1:]); lock=json.loads((root/'sources.lock.jso
 manifest=dict(lock, project_commit=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD'],text=True).strip(),
     binaries=['bin/openxplay-relay','bin/oxp-relay'],
     patches=[{'file':'share/source/patches/'+p.name,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for p in sorted((out/'share/source/patches').glob('*.patch'))],
-    source_instructions='Extract relay.tar.gz and stream.tar.gz as sibling OpenXPlay-Relay and OpenXPlay-Stream directories. Apply listed patches in order to Relay. Run build-carplay.sh in the CarLink revision listed here; Cargo/npm locked dependencies are fetched from their recorded sources.',
+    source_instructions='Extract relay.tar.gz and stream.tar.gz as sibling OpenXPlay-Relay and OpenXPlay-Stream directories. Apply listed patches in order to Relay, except files ending -stream.patch which apply to Stream. Run build-carplay.sh in the CarLink revision listed here; Cargo/npm locked dependencies are fetched from their recorded sources.',
     runtime_identity='Supplied locally; excluded from build and firmware.',
     license_notice='Powered by OpenXPlay. https://github.com/OpenXPlay/OpenXPlay-Relay')
 (out/'SOURCE.json').write_text(json.dumps(manifest,indent=2)+'\n')

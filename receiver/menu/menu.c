@@ -105,8 +105,8 @@ __attribute__((visibility("default"))) int carlink_menu_render(void *opaque,
     if (!m || !rows || !lengths || !count || count>24 || focus>=count || !output || capacity<LIMIT) return -1;
     for (uint32_t i=0; i<count; ++i) if (!rows[i] || lengths[i]>128) return -1;
     memset(m->image, 25, WIDTH*HEIGHT); memset(m->image+WIDTH*HEIGHT, 128, WIDTH*HEIGHT/2);
-    static const uint32_t title[]={'C','a','r','L','i','n','k',' ',0x8bbe,0x5907};
-    static const uint32_t footer[]={0x4e0a,0x4e0b,0xff1a,0x9009,0x62e9,' ',0x786e,0x8ba4,0xff1a,0x8fde,0x63a5,' ',0x8fd4,0x56de,0xff1a,0x6295,0x5c4f};
+    static const uint32_t title[]={'C','a','r','L','i','n','k',' ',0x83dc,0x5355};
+    static const uint32_t footer[]={0x4e0a,0x4e0b,0xff1a,0x9009,0x62e9,' ',0x786e,0x8ba4,0xff1a,0x9009,0x62e9,' ',0x8fd4,0x56de,0xff1a,0x6295,0x5c4f};
     text(m,title,sizeof(title)/sizeof(*title),32,48,36,235);
     rectangle(m,24,62,752,2,90);
     uint32_t first=focus>=ROWS ? focus-ROWS+1 : 0;

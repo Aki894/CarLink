@@ -70,11 +70,14 @@ impl Adapter{
         if !self.hello{
             if value["type"]!="hello"||value["version"].as_u64()!=Some(0)||value["role"]!="producer"{return Err("expected OXP v0 producer hello".into());}
             self.hello=true;
-            self.output.push(wire::json(&json!({"type":"hello","version":0,"role":"consumer","name":"CarLink live","client":"carlink-live-rust"}))?)?;
+            self.output.push(wire::json(&json!({"type":"hello","version":0,"role":"consumer","name":"CarLink live","client":"carlink-live-rust;carlink-host-ui=1"}))?)?;
             self.output.push(wire::json(&json!({"type":"capabilities","latency":"INTERACTIVE","decoders":[{"codecString":"avc1.64001F","hardware":false}],"displays":{"0":{"widthPx":self.config.width,"heightPx":self.config.height,"densityDpi":160,"refreshHz":30,"frameRate":"FPS_30","safeArea":{"left":0,"top":0,"right":0,"bottom":0}}},"touch":10,"keys":(0..11).collect::<Vec<u8>>(),"audio":[],"microphone":true,"prefersH264":true}))?)?;
             return Ok(());
         }
         match value["type"].as_str(){
+            Some("host-ui-request") if self.active && value.as_object().is_some_and(|o|o.len()==1)=>{
+                self.link.open_menu();
+            },
             Some("stats")if self.config.source_clock&&!value["clockOffsetUs"].is_null()=>{
                 self.capture_offset=Some(value["clockOffsetUs"].as_str().ok_or("invalid source clock mapping")?.parse().map_err(|_|"invalid source clock mapping")?);
             },
@@ -168,7 +171,14 @@ impl Adapter{
             }
         }
         for feedback in self.link.step(){match feedback{
-            link::Feedback::Control(value)=>{if let Ok(bytes)=wire::control(&value){self.output.push(bytes)?;}},
+            link::Feedback::Control(value)=>{
+                // The source remains active behind the local menu. Returning is
+                // a source-mux operation; the existing keyframe request resumes
+                // display without a speculative AirPlay mode/audio reset.
+                if value["type"] != "return-projection" {
+                    if let Ok(bytes)=wire::control(&value){self.output.push(bytes)?;}
+                }
+            },
             link::Feedback::Microphone{generation,pcm}=>{
                 let result=self.microphone.feed(generation,&pcm).and_then(|packets|{for bytes in packets{self.output.push(bytes)?;}Ok(())});
                 if result.is_err(){self.output.clear_microphone();let stopped=self.microphone.stop(None);self.request_microphone(stopped)?;println!("{}",json!({"event":"microphone_error","capture_stopped":true}));}

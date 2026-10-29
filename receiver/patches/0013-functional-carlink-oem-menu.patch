@@ -1,0 +1,175 @@
+diff --git a/rust/direlay-linux/src/branding.rs b/rust/direlay-linux/src/branding.rs
+index 49cbe2e..6e26dbb 100644
+--- a/rust/direlay-linux/src/branding.rs
++++ b/rust/direlay-linux/src/branding.rs
+@@ -10,7 +10,7 @@ pub const MODEL: &str = "CarLink";
+ /// Manufacturer reported over iAP2 and AirPlay.
+ pub const MANUFACTURER: &str = "CarLink";
+ /// Label the iPhone shows with the car-button (OEM) icon on its "back to the car" tile.
+-pub const OEM_ICON_LABEL: &str = "CarLink";
++pub const OEM_ICON_LABEL: &str = "CarLink菜单";
+ /// Side of the car-button icon in pixels, the size of the icon the Android relay sends.
+ pub const OEM_ICON_PIXELS: u32 = 192;
+ /// Opaque square PNG of the car-button icon, rendered from the launcher icon by
+diff --git a/rust/direlay-linux/src/di_play_input.rs b/rust/direlay-linux/src/di_play_input.rs
+index 34fdc39..87c2cea 100644
+--- a/rust/direlay-linux/src/di_play_input.rs
++++ b/rust/direlay-linux/src/di_play_input.rs
+@@ -67,6 +67,7 @@ pub(crate) struct InputState {
+     pub declarations: BTreeMap<String, Message>,
+     pub output: Option<SyncSender<Message>>,
+     pub active: bool,
++    pub carlink_host_ui: bool,
+     pub desired_fps: u32,
+     pub applied_fps: u32,
+     /// A receiver asked to apply `desired_fps`; it stays pending through the rate limit.
+@@ -172,6 +173,7 @@ impl DiPlayInput {
+             ]),
+             output: None,
+             active: false,
++            carlink_host_ui: false,
+             desired_fps: 60,
+             applied_fps: 60,
+             restart_requested: false,
+@@ -697,10 +699,21 @@ impl DiPlayInput {
+         }
+         requested
+     }
++    pub fn carlink_host_ui_requested(&self) {
++        let mut state = self.state.lock().unwrap();
++        if state.active && state.carlink_host_ui {
++            // Ephemeral event: never cache/replay an earlier menu request.
++            Self::publish_locked(&mut state, "", Message::Json(serde_json::json!({"type":"host-ui-request"})));
++        }
++    }
+     pub fn control(&self, m: &Message) -> Result<bool> {
+         match m {
+-            Message::Json(v) if v["type"] == "hello" && self.plugins_enabled() => {
+-                self.context_peer(v);
++            Message::Json(v) if v["type"] == "hello" => {
++                // Opaque client suffix negotiates the private CarLink extension.
++                // Legacy browser consumers never receive unknown OXP messages.
++                self.state.lock().unwrap().carlink_host_ui = v["role"] == "consumer"
++                    && v["client"].as_str().is_some_and(|c| c.ends_with(";carlink-host-ui=1"));
++                if self.plugins_enabled() { self.context_peer(v); }
+                 Ok(true)
+             }
+             Message::Json(v) if v["type"] == "display-settings" => {
+@@ -1798,3 +1811,26 @@ mod carlink_production_key_tests {
+         input.end(current).unwrap();
+     }
+ }
++
++#[cfg(test)]
++mod carlink_host_ui_tests {
++    use super::*;
++    #[test]
++    fn carlink_host_ui_is_negotiated_ephemeral_and_preserves_session() {
++        let input = DiPlayInput::new(Arc::new(JsonEvents::new(Arc::new(|_| {}))));
++        let (tx, rx) = sync_channel(8);
++        { let mut s = input.state.lock().unwrap(); s.output = Some(tx); s.active = true; }
++        input.carlink_host_ui_requested(); assert!(rx.try_recv().is_err());
++        let hello = |client| Message::Json(serde_json::json!({"type":"hello","version":0,"role":"consumer","name":"test","client":client}));
++        input.control(&hello("carlink-live-rust;carlink-host-ui=1")).unwrap();
++        input.carlink_host_ui_requested();
++        let event = rx.try_recv().unwrap();
++        assert!(matches!(event, Message::Json(v) if v["type"] == "host-ui-request"));
++        { let s = input.state.lock().unwrap(); assert!(s.active); assert!(!s.declarations.contains_key("")); }
++        input.control(&hello("legacy-web")).unwrap();
++        input.carlink_host_ui_requested(); assert!(rx.try_recv().is_err());
++        input.control(&hello("carlink-live-rust;carlink-host-ui=1")).unwrap();
++        input.state.lock().unwrap().active = false;
++        input.carlink_host_ui_requested(); assert!(rx.try_recv().is_err());
++    }
++}
+diff --git a/rust/direlay-linux/src/linux_wireless_platform.rs b/rust/direlay-linux/src/linux_wireless_platform.rs
+index f0ad326..7f498a2 100644
+--- a/rust/direlay-linux/src/linux_wireless_platform.rs
++++ b/rust/direlay-linux/src/linux_wireless_platform.rs
+@@ -462,8 +462,6 @@ fn air_play_config(
+         data: crate::branding::OEM_ICON_PNG.to_vec(),
+     }];
+     config.oem_label = crate::branding::OEM_ICON_LABEL.into();
+-    // CarLink has no local car UI to return to; omit the inert OEM app tile.
+-    config.icons.clear();
+     config
+ }
+ fn identification(
+@@ -617,6 +615,12 @@ struct SessionListener {
+     events: Arc<JsonEvents>,
+     active: Mutex<Vec<Weak<AirPlaySession>>>,
+ }
++fn carlink_host_ui_request(kind: &str, params: &BplistValue) -> bool {
++    kind == "requestUI" && match params.get("url") {
++        None => true,
++        Some(value) => value.as_str().is_some_and(|url| url.is_empty() || url.starts_with("oem:")),
++    }
++}
+ impl AirPlaySessionListener for SessionListener {
+     fn on_session_active(&self, s: Arc<AirPlaySession>) {
+         if !self.closed.load(Ordering::Acquire) {
+@@ -649,6 +653,10 @@ impl AirPlaySessionListener for SessionListener {
+     }
+     fn on_command(&self, _: &AirPlaySession, kind: &str, params: &BplistValue) {
+         if let Some(input) = &self.input {
++            // Only the OEM return tile requests the local vehicle UI.
++            if carlink_host_ui_request(kind, params) {
++                input.carlink_host_ui_requested();
++            }
+             input.airplay_context(kind, params);
+         }
+         self.events
+@@ -970,7 +978,7 @@ mod network_tests {
+         assert!(shared_network(&saved, "").is_none());
+     }
+     #[test]
+-    fn carlink_air_play_config_omits_inert_oem_tile() {
++    fn carlink_air_play_config_offers_functional_menu_tile() {
+         let config = air_play_config(
+             "02:00:00:00:00:02".into(),
+             "02:00:00:00:00:03".into(),
+@@ -978,10 +986,11 @@ mod network_tests {
+             false,
+         );
+         let info = AirPlayInfoPlist::build(&config).unwrap();
+-        assert_eq!(info.get("oemIconVisible"), Some(&BplistValue::Boolean(false)));
+-        for key in ["oemIconLabel", "oemIcons"] {
+-            assert!(info.get(key).is_none(), "unexpected OEM tile field: {key}");
+-        }
++        assert_eq!(info.get("oemIconVisible"), Some(&BplistValue::Boolean(true)));
++        assert_eq!(info.get("oemIconLabel").and_then(BplistValue::as_str), Some("CarLink菜单"));
++        let icons = info.get("oemIcons").and_then(BplistValue::as_array).unwrap();
++        assert_eq!(icons.len(), 1);
++        assert_eq!(icons[0].get("imageData").and_then(BplistValue::as_data), Some(crate::branding::OEM_ICON_PNG));
+     }
+     #[test]
+     fn car_bluetooth_audio_offers_the_iphone_no_carplay_audio() {
+@@ -1034,3 +1043,16 @@ mod carlink_enrollment_credentials_tests {
+         assert!(!captured.lock().unwrap().join(" ").contains(&secret));
+     }
+ }
++
++#[cfg(test)]
++mod carlink_host_ui_request_tests {
++    use super::*;
++    #[test]
++    fn carlink_host_ui_filters_video_player_and_unrelated_commands() {
++        let params = |url: &str| BplistValue::dict([("url", url.into())]);
++        assert!(carlink_host_ui_request("requestUI", &params("oem://")));
++        assert!(carlink_host_ui_request("requestUI", &BplistValue::Dictionary(Default::default())));
++        assert!(!carlink_host_ui_request("requestUI", &params("videoplayback:")));
++        assert!(!carlink_host_ui_request("modesChanged", &params("oem://")));
++    }
++}
+diff --git a/rust/direlay-linux/src/stream_connection.rs b/rust/direlay-linux/src/stream_connection.rs
+index 03c825f..279897d 100644
+--- a/rust/direlay-linux/src/stream_connection.rs
++++ b/rust/direlay-linux/src/stream_connection.rs
+@@ -118,6 +118,7 @@ impl StreamConnection {
+                             {
+                                 oxp_wire::write(&mut stream, m).map_err(std::io::Error::other)?;
+                             }
++                            s.carlink_host_ui = false;
+                             s.output = Some(tx);
+                         }
+                         let mut reader = stream.try_clone()?;

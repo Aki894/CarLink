@@ -60,6 +60,8 @@ class Harness:
         self.stall_prepare = stall_prepare
         self.managed_handoff=managed_handoff
         self.radio_handoff=False
+        self.return_projection = 0
+        self.sight_connection = None
         self.control_open = False
         self.sight = socket.socket()
         self.sight.bind(('127.0.0.1', 0))
@@ -231,7 +233,7 @@ class Harness:
         if operation == 'hisight-open':
             return {'session': 3, 'initial': b'ANNOUNCE'.hex()}
         if operation == 'hisight-receive':
-            return {'pending': [], 'state': {'media_endpoint': 50100,
+            return {'events':[dict(return_to_car=True)] if bytes.fromhex(value['data'])==b'PAUSE' else [], 'pending': [], 'state': {'media_endpoint': 50100,
                                              'input_endpoint': 50101}}
         if operation == 'hisight-play':
             return {'pending': [b'PLAY'.hex()]}
@@ -251,13 +253,14 @@ class Harness:
         if operation == 'set-video':
             self.video.set()
         active = self.video.is_set() and not self.ended.is_set()
-        return {'state': {'active': active, 'connected': active,
+        return {'state': {'active': active, 'connected': active, 'return_projection': self.return_projection,
                           'video_ended': self.ended.is_set(), 'video_frames': int(active),
                           'epoch_video_frames': int(active)}}
 
     def sight_worker(self):
         endpoint, _ = self.sight.accept()
         self.sockets.append(endpoint)
+        self.sight_connection = endpoint
         endpoint.settimeout(15)
         assert exact(endpoint, len(b'ANNOUNCE')) == b'ANNOUNCE'
         endpoint.sendall(b'SETUP')
@@ -338,6 +341,16 @@ def run(binary):
     try:
         owner.authenticate()
         control = owner.project()
+        # The native HiCar BackToCar action pauses presentation without closing
+        # the authenticated session or touching any speaker/microphone service.
+        owner.sight_connection.sendall(b'PAUSE')
+        owner.wait(lambda: ('media','open-menu') in owner.trace)
+        before_play=owner.trace.count(('session','hisight-play'))
+        owner.return_projection=1
+        owner.wait(lambda: owner.trace.count(('session','hisight-play'))==before_play+1)
+        time.sleep(.35)
+        assert owner.trace.count(('session','hisight-play'))==before_play+1
+        assert not owner.event('hisight_closed') and owner.process.poll() is None
         # Independent speaker lifetimes must reach the media owner with their
         # advertised UDP endpoints, including call takeover and resume cleanup.
         stages = (

@@ -92,6 +92,7 @@ def harness(opus_library=None):
             send_fragmented(source, dict(type='hello', version=0, role='producer'))
             hello, caps = probe.receive(source), probe.receive(source)
             assert hello['type'] == 'hello' and hello['role'] == 'consumer' and hello['version'] == 0
+            assert hello['client'].endswith(';carlink-host-ui=1')
             assert caps['type'] == 'capabilities' and caps['microphone'] is True and caps['prefersH264'] is True
             assert caps['displays']['0']['frameRate'] == 'FPS_30'
             assert caps['displays']['0']['widthPx'] == 800 and caps['displays']['0']['heightPx'] == 480
@@ -132,6 +133,15 @@ with harness() as (child, source, sink, listener, path):
     video(2, b'\x65\x80')
     frame = live_until(sink, lambda f: f[0] == 2)
     assert frame[3] == parameters + b'\0\0\0\1\x65\x80', 'stale or incorrectly converted video'
+
+    # Native OEM menu requests keep the audio/video session alive. The mux
+    # return notification is intentionally not forwarded to stock OXP clients.
+    probe.send_json(source, {'type': 'host-ui-request'})
+    assert live_until(sink, lambda f: f[0] == 8) == (8, 0, 0, b'')
+    sink.sendall(live_frame(129, json.dumps({'type': 'return-projection'}).encode()))
+    video(3, b'\x65\x81')
+    assert live_until(sink, lambda f: f[0] == 2)[3].endswith(b'\x65\x81')
+    assert child.poll() is None
 
     # Feedback crosses the actual process in the opposite direction.
     for value in [{'type': 'key-press', 'code': 3},

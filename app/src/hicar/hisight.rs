@@ -43,13 +43,13 @@ fn port(transport:&str,name:&str)->Option<u16>{transport.split(';').find_map(|fi
 pub struct Session{
     key:Vec<u8>,crypto:Crypto,buffer:Vec<u8>,failed:bool,pending:Vec<Vec<u8>>,
     encrypted:bool,options_sent:bool,target:String,sequence:u32,setup:Option<u32>,
-    media:Option<u16>,input:Option<u16>,peer_teardown:bool,teardown:Option<u32>,acknowledged:bool,
+    media:Option<u16>,input:Option<u16>,peer_teardown:bool,paused:bool,teardown:Option<u32>,acknowledged:bool,
 }
 impl Drop for Session{fn drop(&mut self){wipe(&mut self.key);wipe(&mut self.buffer);}}
 impl Session{
     pub fn new(key:&[u8])->Result<Self>{
         if !matches!(key.len(),16|32){return Err("invalid authenticated HiSight key".into());}
-        Ok(Self{key:key[..16].to_vec(),crypto:Crypto::load()?,buffer:vec![],failed:false,pending:vec![],encrypted:false,options_sent:false,target:"*".into(),sequence:2,setup:None,media:None,input:None,peer_teardown:false,teardown:None,acknowledged:false})
+        Ok(Self{key:key[..16].to_vec(),crypto:Crypto::load()?,buffer:vec![],failed:false,pending:vec![],encrypted:false,options_sent:false,target:"*".into(),sequence:2,setup:None,media:None,input:None,peer_teardown:false,paused:false,teardown:None,acknowledged:false})
     }
     fn pack(&self,data:&[u8],plain:bool)->Result<Vec<u8>>{
         if self.failed{return Err("HiSight session requires reset".into());}
@@ -66,9 +66,11 @@ impl Session{
         self.pending.push(self.pack(&data,plain)?);Ok(())
     }
     pub fn request(&mut self,method:&str)->Result<u32>{
-        if !self.encrypted||self.peer_teardown||!matches!(method,"SETUP"|"PLAY"){return Err("invalid HiSight request state".into());}
+        if !self.encrypted||self.peer_teardown||!matches!(method,"SETUP"|"PLAY"|"PAUSE"){return Err("invalid HiSight request state".into());}
         self.sequence=self.sequence.checked_add(1).filter(|n|*n<=999999999).ok_or("HiSight sequence exhausted")?;
-        self.queue(message(&format!("{method} {} RTSP/1.0",self.target),&self.sequence.to_string(),&[],&[("Transport","RTP/AVP/UDP;unicast;client_port=0".into())])?,false)?;Ok(self.sequence)
+        let headers=if method=="PAUSE"{vec![]}else{vec![("Transport","RTP/AVP/UDP;unicast;client_port=0".into())]};
+        self.queue(message(&format!("{method} {} RTSP/1.0",self.target),&self.sequence.to_string(),&[],&headers)?,false)?;
+        if method=="PLAY"{self.paused=false;}Ok(self.sequence)
     }
     pub fn teardown(&mut self)->Result<Option<Vec<u8>>>{
         if !self.encrypted||self.media.is_none()||self.peer_teardown||self.teardown.is_some()||self.failed{return Ok(None);}
@@ -131,8 +133,18 @@ impl Session{
                             self.target=target.into();
                         }
                         if parameters.get("his_trigger_method")==Some(&"SETUP"){self.setup=Some(self.request("SETUP")?);}
+                        else if parameters.get("his_trigger_method")==Some(&"PAUSE")&&self.media.is_some(){
+                            self.request("PAUSE")?;
+                            if !self.paused{self.paused=true;events.push(json!({"return_to_car":true}));}
+                        }
+                        else if parameters.get("his_trigger_method")==Some(&"PLAY")&&self.media.is_some(){self.request("PLAY")?;}
                         else if parameters.get("his_trigger_method")==Some(&"TEARDOWN"){self.peer_teardown=true;}
                     },
+                    "PAUSE"=>{
+                        self.queue(message("RTSP/1.0 200 OK",seq,&[],&[])?,false)?;
+                        if self.media.is_some()&&!self.paused{self.paused=true;events.push(json!({"return_to_car":true}));}
+                    },
+                    "PLAY"=>{self.queue(message("RTSP/1.0 200 OK",seq,&[],&[])?,false)?;self.paused=false;},
                     "TEARDOWN"=>{self.queue(message("RTSP/1.0 200 OK",seq,&[],&[])?,false)?;self.peer_teardown=true;},
                     "RTSP/1.0" if self.teardown.is_some_and(|n|seq==&n.to_string())=>{self.acknowledged=m.start.starts_with("RTSP/1.0 200 ");},
                     "RTSP/1.0" if self.setup.is_some_and(|n|seq==&n.to_string())=>{
@@ -156,4 +168,21 @@ pub fn differential(v:&Value)->Result<Value>{
         if step["play"]==true{session.request("PLAY")?;}
         out.push(json!({"events":events,"plaintexts":plaintexts.iter().map(|v|hex(v)).collect::<Vec<_>>(),"pending":session.pending().iter().map(|v|hex(v)).collect::<Vec<_>>(),"teardown":teardown.map(|v|hex(&v)),"state":session.state()}));
     }Ok(json!({"steps":out}))
+}
+
+#[cfg(test)]mod menu_tests{
+    use super::*;
+    #[test]fn native_pause_and_play_preserve_the_projection_session(){
+        let mut session=Session::new(&[3;16]).unwrap();session.encrypted=true;session.media=Some(41000);session.input=Some(41001);
+        let request=message("SET_PARAMETER * RTSP/1.0","7",b"his_trigger_method: PAUSE\r\n",&[]).unwrap();
+        let packet=session.pack(&request,false).unwrap();let (events,_)=session.receive(&packet,false).unwrap();
+        assert!(events.iter().any(|e|e["return_to_car"]==true));assert!(!session.peer_teardown);assert_eq!(session.media,Some(41000));
+        let pending=session.pending();assert_eq!(pending.len(),2);
+        let plain=session.crypto.transform(&session.key,&pending[1][4..20],&pending[1][20..]).unwrap();assert!(plain.starts_with(b"PAUSE * RTSP/1.0\r\n"));
+        let direct=session.pack(&message("PAUSE * RTSP/1.0","8",&[],&[]).unwrap(),false).unwrap();
+        let (events,_)=session.receive(&direct,false).unwrap();assert!(!events.iter().any(|e|e["return_to_car"]==true));assert_eq!(session.pending().len(),1);
+        session.request("PLAY").unwrap();assert!(!session.paused);
+        let pending=session.pending();let plain=session.crypto.transform(&session.key,&pending[0][4..20],&pending[0][20..]).unwrap();assert!(plain.starts_with(b"PLAY * RTSP/1.0\r\n"));
+        let (events,_)=session.receive(&direct,false).unwrap();assert!(events.iter().any(|e|e["return_to_car"]==true));assert!(!session.peer_teardown);assert_eq!(session.input,Some(41001));
+    }
 }

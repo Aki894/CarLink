@@ -265,7 +265,7 @@ def check(binary, library, font):
             # mux, which supplies its own menu_rows snapshot to the manager.
             marker=hu.mark();hu.feedback(dict(type='key-press',code=6))
             until(lambda:frame_where(lambda f:f['kind']==2 and f['sha256']!=initial['sha256'],marker), 'focused second menu row')
-            # The new three-row menu starts with protocol switching, followed
+            # The idle menu starts with protocol switching, followed
             # by connect/disconnect and boot-default selection. Navigate back
             # to row zero before selecting HiCar; row one is no longer a saved
             # Huawei phone entry.
@@ -290,11 +290,26 @@ def check(binary, library, font):
 
             assert not any(f['kind']==2 and f['sha256']==source_hash['hicar'] for f in hu.snapshot(menu['sequence'])), 'source video leaked through the menu'
             assert ctl(op='status')['status']['backend_pid']==old_backend, 'opening the menu restarted the source'
-            # Hit row zero with an actual down/up pair. No private menu_rows or
-            # direct connect operation is provided by this simulated HU.
+            # The first row now returns to the current projection, with no
+            # source restart. Volume changes preserve the source and USB too.
+            marker_return=hu.mark()
+            for down in (True,False):
+                hu.feedback(dict(type='touch',contacts=[dict(id=0,x=.5,y=.2,down=down)]));time.sleep(.06)
+            same=until(lambda:status_where(lambda s:s['active'] and not s['menu_visible']), 'first row returns to projection')
+            assert same['backend_pid']==old_backend and same['carlife_pid']==first_life
+            until(lambda:frame_where(lambda f:f['kind']==2 and f['sha256']==source_hash['hicar'],marker_return), 'projection resumed after first row')
+            marker_volume=hu.mark();ctl(op='menu',visible=True)
+            until(lambda:frame_where(lambda f:f['kind']==2 and f['sha256'] not in source_hash.values(),marker_volume), 'volume test menu')
+            ctl(op='volume',percent=50)
+            half=hashlib.sha256(struct.pack('<hh',600,-600)*882).hexdigest()
+            until(lambda:frame_where(lambda f:f['kind']==3 and f['sha256']==half,marker_volume), 'half-gain PCM while menu is open')
+            unchanged=ctl(op='status')['status'];assert unchanged['volume_percent']==50 and unchanged['backend_pid']==old_backend and unchanged['carlife_pid']==first_life
+            marker_unity=hu.mark();ctl(op='volume',percent=100)
+            until(lambda:frame_where(lambda f:f['kind']==3 and f['sha256']==pcm_hash['hicar'],marker_unity), 'unity restored after volume adjustment')
+            # Hit protocol row one with a real down/up pair.
             marker=hu.mark()
             for down in (True,False):
-                hu.feedback(dict(type='touch',contacts=[dict(id=0,x=.5,y=.2,down=down)]))
+                hu.feedback(dict(type='touch',contacts=[dict(id=0,x=.5,y=.3,down=down)]))
                 time.sleep(.06)
             selected=until(lambda:status_where(lambda s:s['protocol']=='carplay' and s['active'] and not s['menu_visible']), 'CarPlay selected by menu touch')
             assert selected['target']['address']==cp['address'] and selected['carlife_pid']==first_life
@@ -316,7 +331,7 @@ def check(binary, library, font):
                 prior_menu=next(f for f in reversed(hu.snapshot()) if f['kind']==2 and f['sha256'] not in source_hash.values())
                 marker_default=hu.mark()
                 for down in (True,False):
-                    hu.feedback(dict(type='touch',contacts=[dict(id=0,x=.5,y=.4,down=down)]));time.sleep(.06)
+                    hu.feedback(dict(type='touch',contacts=[dict(id=0,x=.5,y=.6,down=down)]));time.sleep(.06)
                 current=until(lambda:status_where(lambda s:s['default_protocol']==expected), 'boot default '+expected)
                 assert current['protocol']=='carplay' and current['backend_pid']==selected['backend_pid'] and current['active']
                 until(lambda:frame_where(lambda f:f['kind']==2 and f['sha256'] not in source_hash.values() and f['sha256']!=prior_menu['sha256'],marker_default), 'updated default-protocol menu')
@@ -326,7 +341,7 @@ def check(binary, library, font):
             prior_menu=next(f for f in reversed(hu.snapshot()) if f['kind']==2 and f['sha256'] not in source_hash.values())
             marker_disconnect=hu.mark()
             for down in (True,False):
-                hu.feedback(dict(type='touch',contacts=[dict(id=0,x=.5,y=.3,down=down)]));time.sleep(.06)
+                hu.feedback(dict(type='touch',contacts=[dict(id=0,x=.5,y=.4,down=down)]));time.sleep(.06)
             paused=until(lambda:status_where(lambda s:s['menu_visible'] and not s['active'] and s['paused'] and s['backend_pid'] is None), 'manual disconnect pauses current protocol')
             assert paused['protocol']=='carplay' and paused['carlife_pid']==first_life
             until(lambda:frame_where(lambda f:f['kind']==2 and f['sha256'] not in source_hash.values() and f['sha256']!=prior_menu['sha256'],marker_disconnect), 'paused reconnect menu')

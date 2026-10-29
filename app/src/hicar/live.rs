@@ -189,7 +189,7 @@ struct Engine{
     video:Option<TcpStream>,video_bytes:Vec<u8>,video_decoder:media::Video,video_open:bool,video_ended:bool,
     input:Option<TcpStream>,input_port:Option<u16>,input_queue:VecDeque<InputPacket>,contact:Option<(u16,u16)>,keys:BTreeSet<String>,input_next:Instant,input_start:Instant,
     audio_ports:BTreeMap<String,u16>,audio:media::Audio,audio_ready:bool,audio_generation:u64,decoders:BTreeMap<u32,Decoder>,playout:AudioPlayout,parameters:[Option<Vec<u8>>;2],
-    clock:Option<Clock>,clock_offset:Option<i64>,clock_updated:Option<u64>,clock_rtt:Option<i64>,video_frames:u64,epoch_video_frames:u64,key_frames:u64,input_events:u64,audio_frames:u64,pcm_blocks:u64,invalid:u64,audio_resets:u64,
+    clock:Option<Clock>,clock_offset:Option<i64>,clock_updated:Option<u64>,clock_rtt:Option<i64>,video_frames:u64,epoch_video_frames:u64,key_frames:u64,input_events:u64,return_projection:u64,audio_frames:u64,pcm_blocks:u64,invalid:u64,audio_resets:u64,
 }
 impl Drop for Engine{fn drop(&mut self){self.stop_video();self.decoders.clear();self.link.session(false);let until=Instant::now()+Duration::from_millis(100);while !self.link.queue.is_empty()&&Instant::now()<until{let _=self.link.step();std::thread::sleep(Duration::from_millis(2));}wipe(&mut self.key);}}
 impl Engine{
@@ -202,9 +202,9 @@ impl Engine{
         let mut key=unhex(string(config,"key")?)?;if !matches!(key.len(),16|32){wipe(&mut key);return Err("invalid authenticated media key".into());}
         if let Some(Value::String(text))=config.get_mut("key"){unsafe{wipe(text.as_bytes_mut());}}
         if key.len()>16{wipe(&mut key[16..]);key.truncate(16);}
-        Ok(Self{uplink:None,mic_generation:0,mic_packets:0,mic_service:None,key,crypto,local,peer,audio_binary,udp,link:Link::new(source),video:None,video_bytes:vec![],video_decoder:media::Video::new(),video_open:false,video_ended:false,input:None,input_port:None,input_queue:VecDeque::new(),contact:None,keys:BTreeSet::new(),input_next:Instant::now(),input_start:Instant::now(),audio_ports:BTreeMap::new(),audio:media::Audio::new(),audio_ready:false,audio_generation:0,decoders:BTreeMap::new(),playout:AudioPlayout::default(),parameters:[None,None],clock:None,clock_offset:None,clock_updated:None,clock_rtt:None,video_frames:0,epoch_video_frames:0,key_frames:0,input_events:0,audio_frames:0,pcm_blocks:0,invalid:0,audio_resets:0})
+        Ok(Self{uplink:None,mic_generation:0,mic_packets:0,mic_service:None,key,crypto,local,peer,audio_binary,udp,link:Link::new(source),video:None,video_bytes:vec![],video_decoder:media::Video::new(),video_open:false,video_ended:false,input:None,input_port:None,input_queue:VecDeque::new(),contact:None,keys:BTreeSet::new(),input_next:Instant::now(),input_start:Instant::now(),audio_ports:BTreeMap::new(),audio:media::Audio::new(),audio_ready:false,audio_generation:0,decoders:BTreeMap::new(),playout:AudioPlayout::default(),parameters:[None,None],clock:None,clock_offset:None,clock_updated:None,clock_rtt:None,video_frames:0,epoch_video_frames:0,key_frames:0,input_events:0,return_projection:0,audio_frames:0,pcm_blocks:0,invalid:0,audio_resets:0})
     }
-    fn state(&self)->Value{json!({"active":self.link.active&&self.link.socket.is_some()&&self.link.established,"connected":self.link.socket.is_some(),"waiting_key":self.link.wait_key,"video_open":self.video_open,"video_ended":self.video_ended,"input_connected":self.input.is_some(),"video_frames":self.video_frames,"epoch_video_frames":self.epoch_video_frames,"key_frames":self.key_frames,"audio_frames":self.audio_frames,"pcm_blocks":self.pcm_blocks,"input_events":self.input_events,"audio_generation":self.audio_generation,"audio_ready":self.audio_ready,"audio_packets":self.audio.packets,"audio_lost":self.audio.lost,"audio_duplicates":self.audio.duplicates,"rejected":self.invalid,"audio_resets":self.audio_resets,"audio_underruns":self.playout.underruns,"mix_late":self.playout.late,"pcm_queued_blocks":self.decoders.values().map(|d|d.pcm.len()/PCM).sum::<usize>(),"pending":self.link.queue.len(),"pending_bytes":self.link.size,"sent":self.link.sent,"dropped":self.link.dropped,"reconnects":self.link.reconnects,"clock_offset_us":self.clock_offset,"clock_updated_us":self.clock_updated,"clock_rtt_us":self.clock_rtt,"microphone_active":self.uplink.is_some(),"microphone_packets":self.mic_packets,"audio_streams":self.decoders.len(),"call_active":self.link.audio_role==3&&(self.audio_ready||self.mic_service.as_deref()==Some("modemMic"))})}
+    fn state(&self)->Value{json!({"active":self.link.active&&self.link.socket.is_some()&&self.link.established,"connected":self.link.socket.is_some(),"waiting_key":self.link.wait_key,"video_open":self.video_open,"video_ended":self.video_ended,"input_connected":self.input.is_some(),"video_frames":self.video_frames,"epoch_video_frames":self.epoch_video_frames,"key_frames":self.key_frames,"audio_frames":self.audio_frames,"pcm_blocks":self.pcm_blocks,"input_events":self.input_events,"return_projection":self.return_projection,"audio_generation":self.audio_generation,"audio_ready":self.audio_ready,"audio_packets":self.audio.packets,"audio_lost":self.audio.lost,"audio_duplicates":self.audio.duplicates,"rejected":self.invalid,"audio_resets":self.audio_resets,"audio_underruns":self.playout.underruns,"mix_late":self.playout.late,"pcm_queued_blocks":self.decoders.values().map(|d|d.pcm.len()/PCM).sum::<usize>(),"pending":self.link.queue.len(),"pending_bytes":self.link.size,"sent":self.link.sent,"dropped":self.link.dropped,"reconnects":self.link.reconnects,"clock_offset_us":self.clock_offset,"clock_updated_us":self.clock_updated,"clock_rtt_us":self.clock_rtt,"microphone_active":self.uplink.is_some(),"microphone_packets":self.mic_packets,"audio_streams":self.decoders.len(),"call_active":self.link.audio_role==3&&(self.audio_ready||self.mic_service.as_deref()==Some("modemMic"))})}
     fn stop_audio(&mut self){self.audio_ready=false;self.decoders.clear();self.playout.reset();self.link.audio(false);}
     fn reset_decoder(&mut self,id:u32){self.decoders.remove(&id);self.audio_resets+=1;if self.decoders.is_empty()&&self.link.audio_role!=3{self.link.audio(false);}}
     fn stop_microphone(&mut self){self.mic_service=None;if self.uplink.take().is_some(){self.link.microphone(self.mic_generation,false);}}
@@ -217,6 +217,7 @@ impl Engine{
             self.uplink=Some(super::super::uplink::Uplink::new(&self.audio_binary,self.mic_generation,remote)?);self.mic_service=Some(service.into());self.link.microphone(self.mic_generation,true);
         },
         "microphone-stop"=>{if v["service"].is_null()||v["service"].as_str()==self.mic_service.as_deref(){self.stop_microphone();}},
+        "open-menu"=>{self.link.prune(8);self.link.push(8,0,&[],0);},
         "audio-service"=>{
             let service=string(v,"service")?;if !matches!(service,"speaker1"|"modemSpeaker"){return Err("invalid audio service".into());}
             let active=v["active"].as_bool().ok_or("invalid audio service state")?;
@@ -299,6 +300,7 @@ impl Engine{
         for key in self.keys.clone(){if let Ok(body)=media::key(&key,false){self.queue_input(body,Duration::ZERO,Some(key));}}
     }
     fn feedback(&mut self,v:Value){
+        if v["type"]=="return-projection"{self.return_projection=self.return_projection.wrapping_add(1);self.link.recover();return;}
         if v["type"]=="keyframe"{self.link.recover();return;}
         if self.input.is_none(){
             if self.video_open{if let Some(port)=self.input_port{self.input=connect(self.local,self.peer,port,Duration::from_millis(100)).ok();if self.input.is_some(){self.release_inputs();}}}
@@ -353,6 +355,14 @@ impl Engine{
 fn audio_port_allowed(ports:&BTreeMap<String,u16>,role:u8,port:u16,call_stream:bool)->bool{
     let normal=ports.get("speaker1").copied();let call=ports.get("modemSpeaker").copied();
     if role==3{call_stream||(call==Some(port)&&call!=normal)}else{!call_stream&&(call!=Some(port)||call==normal)}
+}
+#[test]fn native_menu_entry_preserves_audio_and_return_requests_only_video_recovery(){
+    let mut config=json!({"local_ip":"127.0.0.1","peer_ip":"127.0.0.1","audio_binary":"/unused-audio","live_socket":"/unused-live","key":"03030303030303030303030303030303"});
+    let mut engine=Engine::new(&mut config).unwrap();engine.audio_ready=true;engine.link.active=true;engine.link.audio_role=3;engine.link.audio=true;
+    let generation=engine.audio_generation;engine.command(&json!({"op":"open-menu"})).unwrap();
+    assert_eq!(engine.link.queue.iter().filter(|p|p.kind==8).count(),1);assert!(engine.audio_ready);assert!(engine.link.active);assert!(engine.link.audio);assert_eq!(engine.link.audio_role,3);
+    let packet=&engine.link.queue.back().unwrap().wire;assert_eq!(packet.len(),16);assert_eq!(&packet[4..8],&[8,0,0,0]);
+    engine.feedback(json!({"type":"return-projection"}));assert_eq!(engine.return_projection,1);assert!(engine.link.wait_key);assert_eq!(engine.audio_generation,generation);assert!(engine.audio_ready);assert!(engine.link.audio);
 }
 #[test]fn service_ports_and_rtp_usage_isolate_call_from_media(){
     let ports=BTreeMap::from([("speaker1".into(),1000),("modemSpeaker".into(),2000)]);

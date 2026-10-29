@@ -31,8 +31,10 @@ fn connect_seconds()->u64{30}fn stable_seconds()->u64{10}fn pair_seconds()->u64{
 #[serde(rename_all="lowercase")]enum Policy{#[default]Last,Favorite,Manual}
 #[derive(Default,Clone,Copy,PartialEq,Deserialize,Serialize)]
 #[serde(rename_all="lowercase")]enum BootProtocol{#[default]Last,Carplay,Hicar}
-#[derive(Default,Deserialize,Serialize)]
-struct Store{#[serde(default)]selected_protocol:Option<Protocol>,#[serde(default)]boot_protocol:BootProtocol,#[serde(default)]devices:Vec<Device>,#[serde(default)]last:Option<Device>,#[serde(default)]paused:bool,#[serde(default)]policy:Policy,#[serde(default)]favorite:Option<Device>,#[serde(default)]preferred:Option<Device>,#[serde(default)]boot_id:Option<String>}
+#[derive(Deserialize,Serialize)]
+struct Store{#[serde(default)]selected_protocol:Option<Protocol>,#[serde(default)]boot_protocol:BootProtocol,#[serde(default)]devices:Vec<Device>,#[serde(default)]last:Option<Device>,#[serde(default)]paused:bool,#[serde(default)]policy:Policy,#[serde(default)]favorite:Option<Device>,#[serde(default)]preferred:Option<Device>,#[serde(default)]boot_id:Option<String>,#[serde(default="default_volume")]volume_percent:u8}
+fn default_volume()->u8{100}
+impl Default for Store{fn default()->Self{Self{selected_protocol:None,boot_protocol:BootProtocol::Last,devices:vec![],last:None,paused:false,policy:Policy::Last,favorite:None,preferred:None,boot_id:None,volume_percent:100}}}
 fn private_dir(path:&Path)->Result<()>{
     fs::create_dir_all(path).map_err(|_|"cannot create private manager directory")?;
     let meta=fs::symlink_metadata(path).map_err(|_|"cannot inspect private manager directory")?;
@@ -78,7 +80,7 @@ fn save(path:&Path,store:&Store)->Result<()>{
 }
 #[derive(Clone,Serialize)]
 struct Status{schema:u32,generation:u64,default_protocol:BootProtocol,protocol:Option<Protocol>,target:Option<Device>,active:bool,pairing:bool,paused:bool,call_active:bool,
-    carlife_pid:Option<u32>,backend_pid:Option<u32>,usb_connected:bool,menu_visible:bool,last_error:Option<String>,last_stage:Option<String>}
+    carlife_pid:Option<u32>,backend_pid:Option<u32>,usb_connected:bool,menu_visible:bool,volume_percent:u8,last_error:Option<String>,last_stage:Option<String>}
 fn event(name:&str){println!("{}",json!({"event":name}));}
 fn diagnostic_stage(name:&str)->bool{matches!(name,"bluetooth_reconnect_ready"|"bluetooth_reconnect_failed"|"ready"|"controller_setting"|"rfcomm_connected"|"rust_connection_worker_ready"|"rust_hisight_ready"|"rust_dmsdp_ready"|"rust_media_ready"|"rust_radio_ready"|"tcp_connected"|"hisight_connected"|"auth_parse_stopped"|"control_parse_stopped"|"control_peer_timeout"|"hisight_parse_stopped"|"parse_stopped"|"stream_error"|"tcp_stream_error"|"hisight_error"|"stopped")}
 fn stage_summary(v:&Value)->Option<Value>{
@@ -142,7 +144,7 @@ impl Drop for PairPin{fn drop(&mut self){unsafe{crate::hicar::crypto::wipe(self.
 struct Owner{config:Config,store:Store,status:Status,life:Option<Process>,backend:Option<Process>,choice:Option<Choice>,
     life_started:Instant,life_retry_at:Instant,life_failures:u8,life_ready:bool,last_media_report:Option<Instant>,
     started:Instant,recovery_deadline:Option<Instant>,ready:Option<Instant>,seen_media:bool,committed:bool,pair_deadline:Option<Instant>,repair_used:bool,
-    retry_at:Instant,tried:VecDeque<String>,last_auth:Option<Instant>,refusals:u8,mux:Option<crate::manager_menu::Mux>,menu_focus:usize,menu_pending:Option<Value>,menu_idle:bool,wireless_ready:bool,source_ready:bool,session_epoch:u64,closed_hicar_epoch:Option<u64>,source_floor:u64,bound_source_id:u64,pair_pin:Option<PairPin>}
+    retry_at:Instant,tried:VecDeque<String>,last_auth:Option<Instant>,refusals:u8,mux:Option<crate::manager_menu::Mux>,menu_focus:usize,menu_pending:Option<Value>,menu_idle:bool,sound_page:bool,wireless_ready:bool,source_ready:bool,session_epoch:u64,closed_hicar_epoch:Option<u64>,source_floor:u64,bound_source_id:u64,pair_pin:Option<PairPin>}
 impl Owner{
     fn new(config:Config)->Result<Self>{
         if config.schema!=1||config.devices.len()>8||!(2..=120).contains(&config.connect_seconds)||!(1..=60).contains(&config.stable_seconds)||!(5..=120).contains(&config.pair_seconds){return Err("unsupported manager configuration".into());}
@@ -150,6 +152,7 @@ impl Owner{
         for args in [&config.carlife,&config.carplay,&config.hicar]{if args.len()>64||args.iter().any(|v|v.contains('\0')||v.len()>4096){return Err("invalid backend command".into());}}
         for d in &config.devices{d.validate()?;}
         let mut store=if config.state.exists(){serde_json::from_slice::<Store>(&private_read(&config.state)?).map_err(|_|"invalid device store")?}else{Store::default()};
+        if store.volume_percent>100{return Err("stored volume must be between 0 and 100".into());}
         if store.devices.len()>8{return Err("too many stored devices".into());}for d in &store.devices{d.validate()?;}
         if let Some(last)=&store.last{last.validate()?;if !store.devices.iter().any(|d|d.protocol==last.protocol&&d.address.eq_ignore_ascii_case(&last.address)){store.last=None;}}
         for d in config.devices.iter().filter(|_|!config.state.exists()){if !store.devices.iter().any(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address)){store.devices.push(d.clone());}}
@@ -159,8 +162,9 @@ impl Owner{
             store.selected_protocol=match store.boot_protocol{BootProtocol::Carplay=>Some(Protocol::Carplay),BootProtocol::Hicar=>Some(Protocol::Hicar),BootProtocol::Last=>store.selected_protocol.or(store.preferred.as_ref().or(store.last.as_ref()).map(|d|d.protocol))};
         }
         let paused=store.paused;let protocol=store.selected_protocol.or(store.preferred.as_ref().or(store.last.as_ref()).map(|d|d.protocol)).or(config.initial).unwrap_or(Protocol::Carplay);let default_protocol=store.boot_protocol;
-        Ok(Self{config,store,status:Status{schema:1,generation:0,default_protocol,protocol:Some(protocol),target:None,active:false,pairing:false,paused,call_active:false,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,last_error:None,last_stage:None},
-            life:None,backend:None,choice:None,life_started:Instant::now(),life_retry_at:Instant::now(),life_failures:0,life_ready:false,last_media_report:None,started:Instant::now(),recovery_deadline:None,ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,wireless_ready:false,source_ready:false,session_epoch:0,closed_hicar_epoch:None,source_floor:0,bound_source_id:0,pair_pin:None})
+        let volume_percent=store.volume_percent;
+        Ok(Self{config,store,status:Status{schema:1,generation:0,default_protocol,protocol:Some(protocol),target:None,active:false,pairing:false,paused,call_active:false,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,volume_percent,last_error:None,last_stage:None},
+            life:None,backend:None,choice:None,life_started:Instant::now(),life_retry_at:Instant::now(),life_failures:0,life_ready:false,last_media_report:None,started:Instant::now(),recovery_deadline:None,ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,sound_page:false,wireless_ready:false,source_ready:false,session_epoch:0,closed_hicar_epoch:None,source_floor:0,bound_source_id:0,pair_pin:None})
     }
     fn selected_protocol(&self)->Protocol{self.store.selected_protocol.or(self.status.protocol).or(self.store.preferred.as_ref().or(self.store.last.as_ref()).map(|d|d.protocol)).or(self.config.initial).unwrap_or(Protocol::Carplay)}
     fn automatic(&self)->Option<Choice>{
@@ -258,7 +262,7 @@ impl Owner{
             if Instant::now()>=until{let _=child.kill();let _=child.wait();break false;}thread::sleep(Duration::from_millis(20));};
         if !success{return Err("Bluetooth control failed".into());}Ok(())
     }
-    fn show_recovery_menu(&mut self){let explicit=self.status.menu_visible&&!self.menu_idle;self.status.menu_visible=true;self.menu_idle=!explicit;self.menu_pending=None;self.menu_focus=0;if let Some(mux)=&self.mux{let (rows,_)=self.menu_model();let _=mux.set_menu(rows,0,true);}}
+    fn show_recovery_menu(&mut self){self.sound_page=false;let explicit=self.status.menu_visible&&!self.menu_idle;self.status.menu_visible=true;self.menu_idle=!explicit;self.menu_pending=None;self.menu_focus=0;if let Some(mux)=&self.mux{let (rows,_)=self.menu_model();let _=mux.set_menu(rows,0,true);}}
     fn source_lost(&mut self){self.recovery_deadline=Some(Instant::now()+Duration::from_secs(8));self.status.call_active=false;self.wireless_ready=false;self.status.active=false;self.ready=None;self.seen_media=false;self.show_recovery_menu();self.started=Instant::now()-Duration::from_secs((if self.status.protocol==Some(Protocol::Hicar){120}else{self.config.connect_seconds}).saturating_sub(8));}
     fn hicar_session_closed(&mut self){
         // Media workers can finish a report after their control channel has
@@ -346,10 +350,22 @@ impl Owner{
         if name=="hisight_closed" {self.wireless_ready=false;self.hicar_session_closed();}
         Ok(())
     }
+    fn return_projection(&mut self){
+        if self.status.active{if let Some(mux)=&self.mux{mux.resume_projection();}self.status.menu_visible=false;}
+        self.sound_page=false;self.menu_idle=false;self.menu_focus=0;self.menu_pending=None;
+    }
     fn command(&mut self,v:Value)->Result<Value>{
         match v["op"].as_str().ok_or("missing control operation")?{
             "status"=>{},
-            "menu"=>{if self.mux.is_none(){return Err("car menu is not configured".into());}self.status.menu_visible=v["visible"].as_bool().ok_or("menu visibility required")?||!self.status.active;self.menu_idle=false;self.menu_focus=0;self.menu_pending=None;},
+            "menu"=>{if self.mux.is_none(){return Err("car menu is not configured".into());}if v["visible"].as_bool().ok_or("menu visibility required")?{self.status.menu_visible=true;self.sound_page=false;self.menu_idle=false;self.menu_focus=0;self.menu_pending=None;}else{self.return_projection();}},
+            "return_projection"=>{if !self.status.active{return Err("no active projection".into());}self.return_projection();},
+            "sound"=>{self.sound_page=true;self.menu_focus=0;self.status.menu_visible=true;self.menu_idle=false;},
+            "menu_root"=>{self.sound_page=false;self.menu_focus=0;},
+            "volume"=>{
+                let level=v["percent"].as_u64().filter(|n|*n<=100).ok_or("volume must be between 0 and 100")? as u8;
+                if let Some(mux)=&self.mux{mux.set_volume(level)?;}
+                self.store.volume_percent=level;self.status.volume_percent=level;save(&self.config.state,&self.store)?;
+            },
             "devices"=>return Ok(json!({"ok":true,"devices":self.store.devices})),
             "remember"=>{let d:Device=serde_json::from_value(v["device"].clone()).map_err(|_|"invalid device record")?;d.validate()?;
                 self.store.devices.retain(|x|!(x.protocol==d.protocol&&x.address.eq_ignore_ascii_case(&d.address)));
@@ -400,6 +416,13 @@ impl Owner{
         }Ok(json!({"ok":true,"status":self.status}))
     }
     fn menu_model(&self)->(Vec<String>,Vec<Value>){
+        if self.sound_page{
+            let mut rows=vec![];let mut actions=vec![];
+            if self.status.active{rows.push("返回投屏".into());actions.push(json!({"op":"return_projection"}));}
+            rows.extend([format!("减小音量 −5% · 当前 {}%",self.store.volume_percent),format!("增大音量 +5% · 当前 {}%",self.store.volume_percent),"返回主菜单".into()]);
+            actions.extend([json!({"op":"volume","percent":self.store.volume_percent.saturating_sub(5)}),json!({"op":"volume","percent":self.store.volume_percent.saturating_add(5).min(100)}),json!({"op":"menu_root"})]);
+            return (rows,actions);
+        }
         let protocol=self.selected_protocol();let current=if protocol==Protocol::Carplay{"CarPlay"}else{"HiCar"};let other=if protocol==Protocol::Carplay{"HiCar"}else{"CarPlay"};
         let first=format!("当前协议：{current}，点击切换到 {other}");
         let (second,action)=if self.status.active{
@@ -409,10 +432,13 @@ impl Owner{
             (if let Some(pin)=&self.pair_pin{format!("配对中 · PIN：{}",pin.0)}else{"配对中".into()},json!({"op":"connect_device"}))
         }else{("连接设备 · 正在自动重连".into(),json!({"op":"connect_device"}))};
         let (label,next)=match self.store.boot_protocol{BootProtocol::Last=>("上一次选择","hicar"),BootProtocol::Hicar=>("华为 HiCar","carplay"),BootProtocol::Carplay=>("苹果 CarPlay","last")};
-        (vec![first,second,format!("默认协议：{label}")],vec![json!({"op":"switch_protocol"}),action,json!({"op":"default_protocol","mode":next})])
+        let mut rows=vec![];let mut actions=vec![];
+        if self.status.active{rows.push("返回投屏".into());actions.push(json!({"op":"return_projection"}));}
+        rows.extend([first,second,format!("声音：{}% · 点击调整",self.store.volume_percent),format!("默认协议：{label}")]);
+        actions.extend([json!({"op":"switch_protocol"}),action,json!({"op":"sound"}),json!({"op":"default_protocol","mode":next})]);(rows,actions)
     }
     fn source_event_current(&mut self,v:&Value)->bool{
-        if !matches!(v["type"].as_str(),Some("source-state"|"presentation-state"|"call-state")){return true;}
+        if !matches!(v["type"].as_str(),Some("source-state"|"presentation-state"|"call-state"))&&!(v["type"]=="open-menu"&&v.get("source_id").is_some()){return true;}
         let Some(id)=v["source_id"].as_u64()else{
             // Unit fixtures predate source IDs. Runtime callbacks always carry
             // an ID assigned by the resident mux, never by a backend payload.
@@ -424,7 +450,7 @@ impl Owner{
     fn menu_input(&mut self,v:Value)->Result<()>{
         if !self.source_event_current(&v){return Ok(());}
         if v["type"]=="call-state"{self.status.call_active=v["active"]==true;return Ok(());}
-        if v["type"]=="open-menu"{self.status.menu_visible=true;self.menu_idle=false;self.menu_focus=0;self.menu_pending=None;return Ok(());}
+        if v["type"]=="open-menu"{self.status.menu_visible=true;self.sound_page=false;self.menu_idle=false;self.menu_focus=0;self.menu_pending=None;return Ok(());}
         if v["type"]=="presentation-state"{
             // The CarPlay producer derives this flag from the OXP session phase.
             // HiCar derives it from display-surface state, which may pause during
@@ -446,12 +472,12 @@ impl Owner{
         let kind=v["type"].as_str().unwrap_or("");if kind=="menu-error"{self.status.last_error=Some("local menu encoder failed".into());return Ok(());}let mut chosen=None;
         if kind=="key-press"||kind=="key"{match v["code"].as_u64(){
             Some(3|5)=>self.menu_focus=self.menu_focus.saturating_sub(1),Some(4|6)=>self.menu_focus=(self.menu_focus+1).min(rows.len()-1),
-            Some(2)=>chosen=Some(self.menu_focus),Some(0|1)=>{if self.menu_pending.is_some(){self.menu_pending=None;self.menu_focus=0;}else if self.status.pairing&&self.pair_pin.is_some(){self.cancel_pairing()?;return Ok(());}else if self.status.active{self.status.menu_visible=false;self.menu_idle=false;}},_=>{}}}
+            Some(2)=>chosen=Some(self.menu_focus),Some(0|1)=>{if self.menu_pending.is_some(){self.menu_pending=None;self.menu_focus=0;}else if self.status.active{self.return_projection();}else if self.sound_page{self.sound_page=false;self.menu_focus=0;}else if self.status.pairing&&self.pair_pin.is_some(){self.cancel_pairing()?;return Ok(());}},_=>{}}}
         if kind=="menu-focus"{if let Some(i)=v["index"].as_u64().filter(|i|(*i as usize)<rows.len()){self.menu_focus=i as usize;}}
         if kind=="menu-select"{chosen=v["index"].as_u64().map(|n|n as usize);}
         if let Some(i)=chosen.filter(|i|*i<actions.len()){let action=actions[i].clone();match action["op"].as_str(){
             Some("menu_cancel")=>{self.menu_pending=None;self.menu_focus=0;},
-            _=>{self.menu_pending=None;self.menu_focus=0;let close=action["op"]=="connect";self.command(action)?;if close{self.status.menu_visible=true;self.menu_idle=true;}}
+            _=>{self.menu_pending=None;if action["op"]!="volume"{self.menu_focus=0;}let close=action["op"]=="connect";self.command(action)?;if close{self.status.menu_visible=true;self.menu_idle=true;}}
         }}Ok(())
     }
     fn can_commit(&self)->bool{
@@ -467,6 +493,7 @@ impl Owner{
         }Ok(())
     }
     fn tick(&mut self)->Result<()>{
+        if let Some(mux)=&self.mux{mux.set_volume(self.store.volume_percent)?;}
         let mut inputs=vec![];if let Some(mux)=&self.mux{for _ in 0..16{if let Some(v)=mux.try_input(){inputs.push(v);}else{break;}}}
         for v in inputs{self.menu_input(v)?;}
         if self.menu_idle&&self.status.active{self.status.menu_visible=false;self.menu_idle=false;}
@@ -609,7 +636,7 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
             owner.store.paused=paused;owner.status.paused=paused;owner.store.policy=policy;
             let device=Device{protocol:Protocol::Carplay,address:"02:00:00:00:00:01".into(),name:"saved phone".into(),auto:true,last_used:1};
             owner.store.devices.push(device.clone());owner.store.last=Some(device);
-            let (rows,actions)=owner.menu_model();assert_eq!(rows.len(),3);assert_eq!(actions.len(),3);
+            let (rows,actions)=owner.menu_model();assert_eq!(rows.len(),4);assert_eq!(actions.len(),4);
             if !paused{assert!(rows[1].contains("012345"));}
             assert!(!serde_json::to_string(&owner.status).unwrap().contains("012345"));
             assert!(!owner.command(json!({"op":"status"})).unwrap().to_string().contains("012345"));
@@ -619,6 +646,28 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
             assert_eq!(owner.automatic().is_some(),!paused&&policy==Policy::Last);assert_eq!(fs::read_to_string(&path).unwrap(),record);
             fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
         }
+    }
+    #[test]fn projection_menu_returns_first_and_volume_survives_reload_without_muting_feature(){
+        let root=test_root("projection-menu-volume");let mut owner=test_owner(&root);
+        assert_eq!(owner.store.volume_percent,100);
+        owner.status.active=true;owner.status.menu_visible=false;owner.status.backend_pid=Some(123);owner.status.carlife_pid=Some(456);
+        owner.menu_input(json!({"type":"open-menu"})).unwrap();
+        let (rows,actions)=owner.menu_model();assert_eq!(rows[0],"返回投屏");assert_eq!(actions[0]["op"],"return_projection");
+        assert_eq!(rows.len(),5);assert_eq!(owner.menu_focus,0);
+        owner.command(json!({"op":"sound"})).unwrap();assert!(owner.sound_page);
+        for level in [0,35,100]{owner.command(json!({"op":"volume","percent":level})).unwrap();assert_eq!(owner.status.volume_percent,level);}
+        owner.command(json!({"op":"volume","percent":65})).unwrap();
+        for invalid in [json!(101),json!(-1),json!(true),json!(1.5),Value::Null]{assert!(owner.command(json!({"op":"volume","percent":invalid})).is_err());}
+        let stored:Store=serde_json::from_slice(&private_read(&owner.config.state).unwrap()).unwrap();assert_eq!(stored.volume_percent,65);
+        let legacy:Store=serde_json::from_value(json!({})).unwrap();assert_eq!(legacy.volume_percent,100);
+        let (rows,_)=owner.menu_model();assert!(rows.iter().all(|row|!row.contains("静音")));
+        owner.menu_input(json!({"type":"key-press","code":1,"menu_rows":rows})).unwrap();
+        assert!(!owner.status.menu_visible&&!owner.sound_page);assert!(owner.status.active);
+        assert_eq!(owner.status.backend_pid,Some(123));assert_eq!(owner.status.carlife_pid,Some(456));
+        owner.source_floor=5;owner.bound_source_id=5;
+        owner.menu_input(json!({"type":"open-menu","source_id":4})).unwrap();assert!(!owner.status.menu_visible);
+        owner.menu_input(json!({"type":"open-menu","source_id":5})).unwrap();assert!(owner.status.menu_visible);
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]fn repeated_current_selection_preserves_receiver_even_during_call(){
         let root=test_root("idempotent-selection");let mut owner=test_owner(&root);
@@ -776,7 +825,7 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         assert!(owner.automatic().is_none());owner.tried.clear();assert_eq!(owner.automatic().unwrap().protocol,Protocol::Hicar);
         owner.command(json!({"op":"disconnect"})).unwrap();assert_eq!(owner.status.protocol,Some(Protocol::Hicar));assert!(owner.automatic().is_none());
         owner.command(json!({"op":"default_protocol","mode":"carplay"})).unwrap();assert!(owner.store.boot_protocol==BootProtocol::Carplay);
-        let (rows,actions)=owner.menu_model();assert_eq!(rows.len(),3);assert_eq!(actions.len(),3);assert_eq!(actions[1]["op"],"connect_device");
+        let (rows,actions)=owner.menu_model();assert_eq!(rows.len(),4);assert_eq!(actions.len(),4);assert_eq!(actions[1]["op"],"connect_device");
         fs::remove_dir_all(root).unwrap();
     }
     #[test]fn connect_device_accepts_saved_phones_instead_of_new_device_only_enrollment(){

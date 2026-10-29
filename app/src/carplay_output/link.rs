@@ -49,6 +49,13 @@ impl Link {
             queue_max: 0., send_max: 0., video_frames: 0, video_bytes: 0, report_at: Instant::now() }
     }
     pub fn connected(&self) -> bool { self.socket.is_some() }
+    pub fn open_menu(&mut self) {
+        // UI ownership is independent of the source session and all audio.
+        // Duplicate clicks collapse, without touching an already partial frame.
+        if self.active && !self.queue.iter().any(|p| p.kind == 8) {
+            self.put(8, 0, 0, &[]);
+        }
+    }
     fn recount(&mut self) { self.size = self.queue.iter().map(|p| p.wire.len()).sum(); }
     fn emit(&mut self, event: Feedback) {
         // Only locally generated keyframe/release events use this queue. A
@@ -94,7 +101,7 @@ impl Link {
         // still finish before any replacement envelope is written.
         let mut controls = VecDeque::new();
         self.queue.retain_mut(|p| {
-            if p.offset == 0 && matches!(p.kind, 5 | 7) {
+            if p.offset == 0 && matches!(p.kind, 5 | 7 | 8) {
                 controls.push_back(Pending::new(p.kind, p.flags, 0, &p.wire[16..]));
                 false
             } else { p.offset > 0 }
@@ -413,5 +420,24 @@ mod tests {
         let kinds=link.queue.iter().map(|p|p.kind).collect::<Vec<_>>();
         assert_eq!(kinds, vec![5,7,6]); assert!(link.roles[3]); assert!(link.microphone.is_some());
         assert!(link.queue.iter().any(|p|p.kind==5&&p.flags==3&&p.wire[16..]==[1]));
+    }
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+    #[test]
+    fn native_menu_is_ephemeral_preserves_audio_and_survives_video_config() {
+        let mut link = Link::new("/nonexistent/carlink-menu-test".into());
+        link.open_menu(); assert!(link.queue.is_empty());
+        link.session(true); link.audio_state(3, true);
+        link.open_menu(); link.open_menu();
+        assert_eq!(link.queue.iter().filter(|p|p.kind == 8).count(), 1);
+        link.configure(800, 480, 30).unwrap();
+        assert!(link.active && link.roles[3]);
+        let menu = link.queue.iter().find(|p|p.kind == 8).unwrap();
+        assert_eq!(menu.flags, 0); assert_eq!(menu.wire.len(), 16);
+        assert!(!link.queue.iter().any(|p|p.kind == 4 && p.flags == 0));
+        link.disconnect(); assert!(!link.queue.iter().any(|p|p.kind == 8));
     }
 }

@@ -78,7 +78,7 @@ pub fn start(listen:SocketAddr,socket:PathBuf)->Result<Web,String>{
  ("GET","/style.css")=>response(&mut s,200,"text/css; charset=utf-8",include_bytes!("../ui/manager.css")),
  ("GET","/api/status")|("GET","/api/devices")|("POST","/api/control")=>{
  let v=if m=="GET"{Ok(json!({"op":if p.ends_with("status"){"status"}else{"devices"}}))}else{serde_json::from_slice::<Value>(&body).map_err(|_|"invalid JSON".to_string())};
- let checked=v.and_then(|v|{if !matches!(v["op"].as_str(),Some("status"|"devices"|"connect"|"pair"|"pause"|"resume"|"disconnect"|"menu"|"policy"|"forget")){return Err("unsupported web operation".into());}Ok(v)});
+ let checked=v.and_then(|v|{if !matches!(v["op"].as_str(),Some("status"|"devices"|"connect"|"pair"|"pause"|"resume"|"disconnect"|"menu"|"volume"|"policy"|"forget")){return Err("unsupported web operation".into());}Ok(v)});
  match checked{
   Ok(v) if matches!(v["op"].as_str(),Some("connect"|"pair"|"disconnect"|"forget"|"resume"))=>{
    // A source change may tear down the very AP carrying this browser. Finish

@@ -1,0 +1,27 @@
+diff --git a/rust/oxp-wire/src/lib.rs b/rust/oxp-wire/src/lib.rs
+index c2d5f31..03792f2 100644
+--- a/rust/oxp-wire/src/lib.rs
++++ b/rust/oxp-wire/src/lib.rs
+@@ -653,6 +653,8 @@ pub fn validate_json(v: &Value) -> Result<()> {
+             string(&v["client"], true)?;
+         }
+         "restart" => fields(v, &["type"], &[])?,
++        // Private extension, sent only after CarLink hello negotiation.
++        "host-ui-request" => fields(v, &["type"], &[])?,
+         "keyframe" => {
+             fields(v, &["type", "screen"], &[])?;
+             integer(&v["screen"], 255)?;
+@@ -818,3 +820,13 @@ pub fn decode_view_area(v: &Value) -> Result<(u32, Option<oxp_core::model::ViewA
+         },
+     ))
+ }
++
++#[cfg(test)]
++mod carlink_menu_tests {
++    use super::*;
++    #[test]
++    fn carlink_host_ui_extension_has_no_unbounded_or_ambiguous_fields() {
++        assert!(validate_json(&serde_json::json!({"type":"host-ui-request"})).is_ok());
++        assert!(validate_json(&serde_json::json!({"type":"host-ui-request","active":false})).is_err());
++    }
++}
