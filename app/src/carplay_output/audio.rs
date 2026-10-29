@@ -61,7 +61,7 @@ fn packet_samples(format:&Format,payload:&[u8])->Result<u64>{
 struct Packet{data:Vec<u8>,offset:usize,queued:Instant}
 pub struct Decoder{
     child:Child,input:ChildStdin,output:ChildStdout,format:Format,queue:VecDeque<Packet>,pcm:Vec<u8>,
-    origin:Option<u64>,samples:u64,submitted_samples:u64,next:Option<Instant>,failed:bool,ogg_sequence:u32,granule:u64,waiting:Option<Instant>,
+    origin:Option<u64>,samples:u64,submitted_samples:u64,next:Option<Instant>,failed:bool,ogg_sequence:u32,granule:u64,waiting:Option<Instant>,failure:Option<&'static str>,packets:u64,decoded_bytes:u64,last_pts:u64,
 }
 fn nonblocking(fd:i32)->Result<()>{unsafe{let flags=libc::fcntl(fd,libc::F_GETFL);if flags<0||libc::fcntl(fd,libc::F_SETFL,flags|libc::O_NONBLOCK)<0{return Err("audio pipe nonblocking setup failed".into());}}Ok(())}
 impl Decoder{
@@ -74,46 +74,60 @@ impl Decoder{
         let mut child=command.args(["-i","pipe:0","-vn","-threads","1","-ac","2","-ar","44100","-c:a","pcm_s16le","-f","s16le","-flush_packets","1","pipe:1"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|_|"audio decoder could not start")?;
         let input=child.stdin.take().unwrap();let output=child.stdout.take().unwrap();
         if let Err(error)=nonblocking(input.as_raw_fd()).and_then(|_|nonblocking(output.as_raw_fd())){let _=child.kill();let _=child.wait();return Err(error);}
-        Ok(Self{child,input,output,format:format.clone(),queue:VecDeque::new(),pcm:vec![],origin:None,samples:0,submitted_samples:0,next:None,failed:false,ogg_sequence:0,granule:0,waiting:None})
+        Ok(Self{child,input,output,format:format.clone(),queue:VecDeque::new(),pcm:vec![],origin:None,samples:0,submitted_samples:0,next:None,failed:false,ogg_sequence:0,granule:0,waiting:None,failure:None,packets:0,decoded_bytes:0,last_pts:0})
     }
     pub fn failed(&self)->bool{self.failed}
+    fn fail(&mut self,reason:&'static str){self.failed=true;self.failure.get_or_insert(reason);}
+    pub fn failure(&self)->Value{
+        let rate=if self.format.codec=="OPUS"{48000}else{self.format.sample_rate} as f64;
+        serde_json::json!({"reason":self.failure.unwrap_or("unknown"),"packets":self.packets,
+            "submitted_ms":self.submitted_samples as f64*1000./rate,"played_ms":self.samples as f64*1000./44100.,
+            "decoded_ms":self.decoded_bytes as f64*1000./176400.,
+            "source_pts_span_ms":self.last_pts.saturating_sub(self.origin.unwrap_or(self.last_pts)) as f64/1000.,
+            "queue_packets":self.queue.len(),"pcm_bytes":self.pcm.len(),
+            "waiting_ms":self.waiting.map(|t|t.elapsed().as_secs_f64()*1000.),
+            "queue_age_ms":self.queue.front().map(|p|p.queued.elapsed().as_secs_f64()*1000.),
+            "playout_late_ms":self.next.map(|t|Instant::now().saturating_duration_since(t).as_secs_f64()*1000.)})
+    }
     pub fn feed(&mut self,payload:&[u8],pts:u64)->Result<bool>{
         if self.failed{return Ok(false);}
         if payload.is_empty()||payload.len()>65536||self.format.codec=="PCM_S16LE"&&payload.len()%(2*self.format.channels as usize)!=0{return Err("invalid source audio packet".into());}
-        if self.queue.len()>=16||self.queue.front().is_some_and(|p|p.queued.elapsed()>BUDGET){self.failed=true;return Ok(false);}
+        if self.queue.len()>=16{self.fail("input_queue_full");return Ok(false);}
+        if self.queue.front().is_some_and(|p|p.queued.elapsed()>BUDGET){self.fail("input_queue_expired");return Ok(false);}
         let samples=packet_samples(&self.format,payload)?;
         let submitted=self.submitted_samples.saturating_add(samples);
         let rate=if self.format.codec=="OPUS"{48000}else{self.format.sample_rate} as u128;
         // Include compressed bytes already handed to FFmpeg and its pipe: a
         // small Rust queue alone does not bound native decoder audio latency.
-        if (submitted as u128*44100).saturating_sub(self.samples as u128*rate)>22050*rate{self.failed=true;return Ok(false);}
+        if (submitted as u128*44100).saturating_sub(self.samples as u128*rate)>22050*rate{self.fail("sample_budget_exceeded");return Ok(false);}
         let mut data=match self.format.codec.as_str(){"AAC_LC"=>adts(payload,self.format.sample_rate,self.format.channels)?,_=>payload.to_vec()};
         if self.format.codec=="OPUS"{
             let samples=opus_samples(payload)?;data=if self.ogg_sequence==0{opus_headers(self.format.channels)?}else{vec![]};
             self.ogg_sequence=self.ogg_sequence.max(2);self.granule+=samples as u64;data.extend(ogg_page(payload,self.ogg_sequence,self.granule,false)?);self.ogg_sequence=self.ogg_sequence.wrapping_add(1);
         }
         if data.len()>65536{return Err("source audio packet exceeds limit".into());}
-        self.submitted_samples=submitted;self.origin.get_or_insert(pts);let now=Instant::now();self.waiting.get_or_insert(now);self.queue.push_back(Packet{data,offset:0,queued:now});Ok(true)
+        self.submitted_samples=submitted;self.packets+=1;self.last_pts=pts;self.origin.get_or_insert(pts);let now=Instant::now();self.waiting.get_or_insert(now);self.queue.push_back(Packet{data,offset:0,queued:now});Ok(true)
     }
     pub fn poll(&mut self)->Result<Vec<(Vec<u8>,u64)>>{
         if self.failed{return Ok(vec![]);}
-        if self.child.try_wait().map_err(|_|"audio decoder status unavailable")?.is_some(){self.failed=true;return Ok(vec![]);}
-        if self.queue.front().is_some_and(|p|p.queued.elapsed()>BUDGET)||self.waiting.is_some_and(|t|t.elapsed()>BUDGET){self.failed=true;return Ok(vec![]);}
+        if self.child.try_wait().map_err(|_|"audio decoder status unavailable")?.is_some(){self.fail("native_exited");return Ok(vec![]);}
+        if self.queue.front().is_some_and(|p|p.queued.elapsed()>BUDGET){self.fail("input_queue_expired");return Ok(vec![]);}
+        if self.waiting.is_some_and(|t|t.elapsed()>BUDGET){self.fail("native_output_timeout");return Ok(vec![]);}
         // Bound both work per poll and decoded storage. The owner polls all
         // streams, so a busy decoder cannot starve video or the microphone.
         for _ in 0..16{
             let Some(packet)=self.queue.front_mut() else{break};
             match self.input.write(&packet.data[packet.offset..]){
-                Ok(0)=>{self.failed=true;break},Ok(n)=>{packet.offset+=n;if packet.offset==packet.data.len(){self.queue.pop_front();}},
-                Err(e)if e.kind()==ErrorKind::WouldBlock=>break,Err(e)if e.kind()==ErrorKind::Interrupted=>continue,Err(_)=>{self.failed=true;break},
+                Ok(0)=>{self.fail("native_input_closed");break},Ok(n)=>{packet.offset+=n;if packet.offset==packet.data.len(){self.queue.pop_front();}},
+                Err(e)if e.kind()==ErrorKind::WouldBlock=>break,Err(e)if e.kind()==ErrorKind::Interrupted=>continue,Err(_)=>{self.fail("native_input_error");break},
             }
         }
         for _ in 0..6{
             let available=6*PCM-self.pcm.len();if available==0{break;}
             let mut bytes=[0u8;PCM];let wanted=available.min(PCM);
             match self.output.read(&mut bytes[..wanted]){
-                Ok(0)=>{self.failed=true;break},Ok(n)=>{self.pcm.extend(&bytes[..n]);self.waiting=if self.queue.is_empty(){None}else{Some(Instant::now())};},
-                Err(e)if e.kind()==ErrorKind::WouldBlock=>break,Err(e)if e.kind()==ErrorKind::Interrupted=>continue,Err(_)=>{self.failed=true;break},
+                Ok(0)=>{self.fail("native_output_closed");break},Ok(n)=>{self.decoded_bytes+=n as u64;self.pcm.extend(&bytes[..n]);self.waiting=if self.queue.is_empty(){None}else{Some(Instant::now())};},
+                Err(e)if e.kind()==ErrorKind::WouldBlock=>break,Err(e)if e.kind()==ErrorKind::Interrupted=>continue,Err(_)=>{self.fail("native_output_error");break},
             }
         }
         if self.pcm.len()<PCM{return Ok(vec![]);}
@@ -148,16 +162,54 @@ impl Drop for Decoder{fn drop(&mut self){let _=self.child.kill();let _=self.chil
         // FFmpeg's live raw-PCM reader retains part of a short burst until
         // more input arrives. Keep stdin open and supply a real 20 ms stream;
         // requiring a finite 160 ms burst to drain would test EOF semantics.
-        let deadline=Instant::now()+Duration::from_secs(2);let mut blocks=vec![];let mut input_due=Instant::now()+Duration::from_millis(20);
-        while Instant::now()<deadline&&blocks.len()<5{
-            let now=Instant::now();if now>=input_due{assert!(decoder.feed(&source,100000).unwrap());input_due=now+Duration::from_millis(20);}
-            blocks.extend(decoder.poll().unwrap());assert!(!decoder.failed());std::thread::sleep(Duration::from_millis(2));
+        let started=Instant::now();let deadline=started+Duration::from_secs(8);let mut blocks=vec![];let mut input_due=started+Duration::from_millis(20);let mut fed=8u64;
+        while Instant::now()<deadline{
+            let now=Instant::now();while now>=input_due{assert!(decoder.feed(&source,100000+fed*20000).unwrap(),"{}",decoder.failure());fed+=1;input_due+=Duration::from_millis(20);}
+            blocks.extend(decoder.poll().unwrap());assert!(!decoder.failed(),"{}",decoder.failure());std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(blocks.len()>=5,"live PCM output stalled: blocks={}, queued={}, pcm_bytes={}",blocks.len(),decoder.queue.len(),decoder.pcm.len());
+        assert!(blocks.len()>=350,"sustained live PCM output stalled: blocks={}, diagnostics={}",blocks.len(),decoder.failure());
         for (i,(pcm,pts)) in blocks.iter().enumerate(){assert_eq!(pcm.len(),PCM);assert_eq!(*pts,100000+i as u64*20000);assert!(pcm.chunks_exact(2).all(|b|b==1234i16.to_le_bytes()));}
         // Six 100 ms packets hit the latency cap before the 16-packet cap.
         let mut bounded=Decoder::new(Path::new(&binary),&format).unwrap();
         for _ in 0..5{assert!(bounded.feed(&vec![0;17640],0).unwrap());}
         assert!(!bounded.feed(&vec![0;17640],0).unwrap());assert!(bounded.failed());
+        assert_eq!(bounded.failure()["reason"],"sample_budget_exceeded");
     }
+    #[test]fn native_aac_decoder_sustains_eight_seconds_of_realtime_music(){
+        let Some(binary)=std::env::var_os("CARLINK_AUDIO_TEST_BINARY") else{return};
+        // Generate valid, compact AAC with the same pinned native tool used on
+        // the board; no external fixture or encoder dependency is required.
+        let pcm:Vec<u8>=(0..12000).flat_map(|i|{
+            let sample=((i as f64*std::f64::consts::TAU*440./48000.).sin()*8000.) as i16;
+            [sample.to_le_bytes(),sample.to_le_bytes()].concat()
+        }).collect();
+        let mut encoder=Command::new(&binary).args(["-hide_banner","-loglevel","error","-f","s16le","-ar","48000","-ac","2","-i","pipe:0","-c:a","aac","-b:a","64000","-f","adts","pipe:1"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        encoder.stdin.take().unwrap().write_all(&pcm).unwrap();let encoded=encoder.wait_with_output().unwrap();assert!(encoded.status.success());
+        let mut packets=vec![];let mut offset=0;
+        while offset<encoded.stdout.len(){
+            let header=&encoded.stdout[offset..offset+7];
+            let size=((header[3] as usize&3)<<11)|((header[4] as usize)<<3)|((header[5] as usize)>>5);
+            assert!(size>7&&offset+size<=encoded.stdout.len());
+            packets.push(encoded.stdout[offset+7..offset+size].to_vec());offset+=size;
+        }
+        assert!(packets.len()>=10);
+        let format=Format{role:0,codec:"AAC_LC".into(),sample_rate:48000,channels:2};
+        let mut decoder=Decoder::new(Path::new(&binary),&format).unwrap();let started=Instant::now();let mut fed=0u64;let mut blocks=0u64;let mut first=None;let mut audible=false;
+        while started.elapsed()<Duration::from_secs(8){
+            // Three-packet bursts exercise real radio/IPC delivery without
+            // relaxing the total 500 ms native+Rust+playout sample budget.
+            let elapsed=started.elapsed().as_micros() as u64;
+            while fed/3*64000<=elapsed{
+                assert!(decoder.feed(&packets[fed as usize%packets.len()],100000+fed*1024*1_000_000/48000).unwrap(),"{}",decoder.failure());fed+=1;
+            }
+            for (pcm,pts)in decoder.poll().unwrap(){
+                first.get_or_insert(started.elapsed());assert_eq!(pts,100000+blocks*20000);assert_eq!(pcm.len(),PCM);
+                audible|=pcm.chunks_exact(2).any(|b|i16::from_le_bytes([b[0],b[1]]).unsigned_abs()>1000);blocks+=1;
+            }
+            assert!(!decoder.failed(),"{}",decoder.failure());std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(first.unwrap()<BUDGET);assert!(blocks>=350&&audible,"sustained AAC failed: blocks={blocks}, diagnostics={}",decoder.failure());
+    }
+
 }

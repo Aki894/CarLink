@@ -2,9 +2,11 @@
 
 CarLink 使用一个 Rust 管理器保持 CarLife USB 常驻，并独占调度一个 CarPlay 或 HiCar 无线后端。切换手机时保留 USB 会话；已连接手机不会被后来上车的另一部手机抢占。R3 的菜单、网页、未知 HiCar 添加与策略代码已实现，完整构建及既有台架回归已完成；真实触控板和多手机场景继续验收。
 
-## 三行菜单与连接生命周期
+## 菜单与连接生命周期
 
-屏幕菜单依次显示当前协议（点击切换另一协议）、连接/断开设备、默认协议。未连接时保持当前协议等待；手动断开后暂停回连，点击连接设备重新启用并开放配对。HiCar 配对行显示本机固定 PIN。三连返回键打开菜单，普通返回送给手机；菜单内返回恢复投屏。
+已连接时，屏幕菜单依次显示“返回投屏”、当前协议（点击切换另一协议）、连接/断开设备、声音调节、默认协议；打开菜单后焦点默认位于第一行。未连接时隐藏“返回投屏”，保持当前协议等待；手动断开后暂停回连，点击连接设备重新启用并开放配对。HiCar 配对行显示本机固定 PIN。三连返回键打开菜单，普通返回送给手机；菜单及声音页内按返回恢复投屏。
+
+声音页仅提供音量加减和返回菜单，没有独立静音按钮。范围 0–100%，每次调整 5%，设置保存到本机，重启和协议切换后继续使用。软件音量作用于音乐、导航/语音及通话的下行 PCM，采用约 20 ms 渐变，不改变麦克风上行；100% 为原始幅度，不额外放大。网页同步提供音量滑块。
 
 HiCar 已配对手机的主动回连使用 FE35 Nearby 控制、CCMP business 19 协商及动态 RFCOMM 认证通道。CarPlay 与 HiCar 接收端独占无线资源；切换先终止旧源、退休本地连接并隔离旧事件，再启动新源。CarLife USB 常驻。
 
@@ -14,7 +16,7 @@ HiCar 已配对手机的主动回连使用 FE35 Nearby 控制、CCMP business 19
 
 - 开机等待连接时显示 CarLink 设备菜单；通过触摸或 Lexus 焦点方向、确认、返回操作。真实 Remote Touch 的原车快捷键仍待实车确定。
 - 投屏期间，在当前热点内打开 `http://10.77.0.1:8088`（CarPlay）或 `http://192.168.49.1:8088`（HiCar），选择手机、添加设备或打开车机菜单。有线维护地址是 `http://192.168.77.2:8088`。
-- CarPlay 桌面继续隐藏额外品牌图标。菜单显示期间保持当前音频，返回投屏时请求源关键帧。
+- CarPlay 桌面使用上游已有车形图标，名称为“CarLink菜单”，点击打开本地菜单。HiCar 默认返回车机图标也接入同一菜单；当前保留系统图标与名称，不修改蓝牙/热点名称。菜单显示期间保持无线连接和音频；返回投屏时请求源关键帧，HiCar 同时恢复原生 PLAY。
 - 菜单添加设备会在当前已有投屏时要求确认。网页添加与忘记操作也有明确确认。
 
 菜单只编码本地静态 UI；源手机的压缩 H.264 与 PCM 直接转发。单个 live mux 持有 CarLife 输出连接，菜单和无线后端不会竞争同一个 Unix socket。队列按帧数、字节和等待时间限界，切换后等待新关键帧，清理旧源的未发送媒体与触点。
@@ -37,6 +39,8 @@ carlink manager ctl /run/carlink-manager/control.sock '{"op":"devices"}'
 carlink manager ctl /run/carlink-manager/control.sock '{"op":"pair","protocol":"hicar"}'
 carlink manager ctl /run/carlink-manager/control.sock '{"op":"pair","protocol":"carplay"}'
 carlink manager ctl /run/carlink-manager/control.sock '{"op":"menu","visible":true}'
+carlink manager ctl /run/carlink-manager/control.sock '{"op":"menu","visible":false}'
+carlink manager ctl /run/carlink-manager/control.sock '{"op":"volume","percent":70}'
 carlink manager ctl /run/carlink-manager/control.sock '{"op":"policy","mode":"manual"}'
 carlink manager ctl /run/carlink-manager/control.sock '{"op":"disconnect"}'
 carlink manager ctl /run/carlink-manager/control.sock '{"op":"resume"}'

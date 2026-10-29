@@ -659,6 +659,7 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         owner.command(json!({"op":"volume","percent":65})).unwrap();
         for invalid in [json!(101),json!(-1),json!(true),json!(1.5),Value::Null]{assert!(owner.command(json!({"op":"volume","percent":invalid})).is_err());}
         let stored:Store=serde_json::from_slice(&private_read(&owner.config.state).unwrap()).unwrap();assert_eq!(stored.volume_percent,65);
+        let reloaded=test_owner(&root);assert_eq!(reloaded.store.volume_percent,65);assert_eq!(reloaded.status.volume_percent,65);
         let legacy:Store=serde_json::from_value(json!({})).unwrap();assert_eq!(legacy.volume_percent,100);
         let (rows,_)=owner.menu_model();assert!(rows.iter().all(|row|!row.contains("静音")));
         owner.menu_input(json!({"type":"key-press","code":1,"menu_rows":rows})).unwrap();
@@ -667,6 +668,8 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         owner.source_floor=5;owner.bound_source_id=5;
         owner.menu_input(json!({"type":"open-menu","source_id":4})).unwrap();assert!(!owner.status.menu_visible);
         owner.menu_input(json!({"type":"open-menu","source_id":5})).unwrap();assert!(owner.status.menu_visible);
+        owner.sound_page=true;owner.source_lost();assert!(!owner.sound_page);assert!(owner.status.menu_visible);
+        assert!(!owner.menu_model().0.iter().any(|row|row=="返回投屏"));
         fs::remove_dir_all(root).unwrap();
     }
     #[test]fn repeated_current_selection_preserves_receiver_even_during_call(){

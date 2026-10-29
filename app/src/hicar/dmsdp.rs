@@ -130,7 +130,27 @@ impl Speaker{
 
 pub struct Session{
     key:Vec<u8>,crypto:Option<Crypto>,decoder:Decoder,messages:Messages,pending:Vec<Vec<u8>>,failed:bool,
-    negotiated:bool,device_info:Value,device_exchanged:bool,clock:Option<(u64,u64,u16)>,media_port:Option<u16>,speaker:Option<Speaker>,services:Vec<Speaker>,heartbeat_sequence:u32,
+    negotiated:bool,device_info:Value,device_exchanged:bool,clock:Option<(u64,u64,u16)>,media_port:Option<u16>,speaker:Option<Speaker>,services:Vec<Speaker>,heartbeat_sequence:u32,display_paused:bool,service_updates:VecDeque<u32>,
+}
+
+#[cfg(test)]mod native_menu_tests{
+    use super::*;
+    fn update(command:u32,sequence:Option<u32>,action:u32,service:&str)->Vec<u8>{
+        let mut body=wire::uint(command).unwrap();if let Some(sequence)=sequence{body.extend(sequence.to_be_bytes());}body.extend(action.to_be_bytes());
+        body.extend(ascii_json(&json!({"deviceId":"synthetic-owner","deviceName":"","serviceId":service,"serviceType":8,"properties":{},"status":{}})).unwrap());
+        let mut data=vec![b'$'];data.extend(3u32.to_be_bytes());data.extend(u32::MAX.to_be_bytes());data.extend((body.len() as u16).to_be_bytes());data.extend(body);data
+    }
+    #[test]fn sdk2_display_update_opens_menu_and_reports_resume_without_audio_teardown(){
+        let mut session=Session::new(&[],json!({"deviceId":"synthetic-owner","deviceName":"CarLink"}),false).unwrap();session.negotiated=true;
+        let mut events=vec![];session.binary(&update(103,None,202,"display1"),&mut events).unwrap();assert!(events.iter().any(|e|e["return_to_car"]==true));assert!(session.display_paused);
+        let response=session.pending();assert_eq!(response.len(),1);let mut pos=14;assert_eq!(unsigned(&response[0],&mut pos).unwrap(),103);assert_eq!(u32::from_be_bytes(response[0][pos..pos+4].try_into().unwrap()),202);
+        events.clear();session.binary(&update(103,None,202,"display1"),&mut events).unwrap();assert!(!events.iter().any(|e|e["return_to_car"]==true));session.pending();
+        session.display_status(203).unwrap();assert!(!session.display_paused);session.pending();
+        events.clear();session.binary(&update(107,Some(7),202,"display1"),&mut events).unwrap();assert!(events.iter().any(|e|e["return_to_car"]==true));assert_eq!(session.pending().len(),2);
+        session.display_status(203).unwrap();session.pending();events.clear();session.binary(&update(107,Some(7),202,"display1"),&mut events).unwrap();assert!(!events.iter().any(|e|e["return_to_car"]==true));assert_eq!(session.pending().len(),1);assert!(!session.display_paused);
+        events.clear();session.binary(&update(103,None,202,"speaker1"),&mut events).unwrap();assert!(!events.iter().any(|e|e["return_to_car"]==true));assert!(session.pending().is_empty());
+        assert!(session.negotiated);assert!(!session.failed);
+    }
 }
 impl Drop for Session{fn drop(&mut self){wipe(&mut self.key);}}
 impl Session{
@@ -139,7 +159,7 @@ impl Session{
         if !device_info.is_null()&&!device_info.is_object(){return Err("invalid DMSDP device information".into());}
         if ascii_json(&device_info)?.len()>65536{return Err("device information exceeds limit".into());}
         let services=if audio&&device_info["properties"]["5002"]==true{vec![Speaker::named("mic1",2),Speaker::named("modemMic",9),Speaker::named("modemSpeaker",10)]}else{vec![]};
-        Ok(Self{key:key.iter().take(16).copied().collect(),crypto:if key.is_empty(){None}else{Some(Crypto::load()?)},decoder:Decoder::new(Format::Control),messages:Messages::new("DMSDP"),pending:vec![],failed:false,negotiated:false,device_info,device_exchanged:false,clock:None,media_port:None,speaker:audio.then(Speaker::new),services,heartbeat_sequence:1})
+        Ok(Self{key:key.iter().take(16).copied().collect(),crypto:if key.is_empty(){None}else{Some(Crypto::load()?)},decoder:Decoder::new(Format::Control),messages:Messages::new("DMSDP"),pending:vec![],failed:false,negotiated:false,device_info,device_exchanged:false,clock:None,media_port:None,speaker:audio.then(Speaker::new),services,heartbeat_sequence:1,display_paused:false,service_updates:VecDeque::new()})
     }
     fn healthy(&self)->Result<()>{if self.failed{Err("DMSDP session requires reset".into())}else{Ok(())}}
     fn pack(&self,data:&[u8],plain:bool)->Result<Vec<u8>>{
@@ -184,6 +204,15 @@ impl Session{
             if events.len()>256{return Err("too many DMSDP message events".into());}
         }Ok((events,plaintexts))
     }
+    /// SDK2 display updates are module 3 / command 103, not HiSight PAUSE.
+    pub fn display_status(&mut self,action:u32)->Result<()>{
+        if !matches!(action,202|203){return Err("invalid display service state".into());}
+        let id=self.device_info["deviceId"].as_str().ok_or("missing display device identifier")?;
+        let name=self.device_info["deviceName"].as_str().unwrap_or("CarLink");
+        let service=json!({"deviceId":id,"deviceName":name,"serviceId":"display1","serviceType":8,"properties":{"4001":1.0,"1009":800,"1010":480},"status":{}});
+        let mut payload=wire::uint(103)?;payload.extend(action.to_be_bytes());payload.extend(ascii_json(&service)?);
+        self.business(3,u32::MAX,&payload)?;self.display_paused=action==202;Ok(())
+    }
     fn binary(&mut self,data:&[u8],events:&mut Vec<Value>)->Result<()>{
         if data.len()<11||u16::from_be_bytes([data[9],data[10]])as usize!=data.len()-11{return Err("invalid binary control message".into());}
         let module=u32::from_be_bytes(data[1..5].try_into().unwrap());let kind=u32::from_be_bytes(data[5..9].try_into().unwrap());let body=&data[11..];
@@ -202,6 +231,25 @@ impl Session{
             match command{
                 101=>{let peer=super::json::parse(&body[pos..])?;if !peer.is_object()||peer.get("deviceId").and_then(Value::as_str).is_none(){return Err("missing peer device information".into());}
                     if !self.device_exchanged{let mut own=self.device_info.clone();own["businessId"]=peer.get("businessId").cloned().unwrap_or(json!(1));let mut payload=wire::uint(101)?;payload.extend(ascii_json(&own)?);self.business(3,u32::MAX,&payload)?;self.device_exchanged=true;events.push(json!({"device_info_sent":true}));}
+                },
+                103|107=>{
+                    let sequence=if command==107{
+                        let bytes=body.get(pos..pos+4).ok_or("truncated service update sequence")?;pos+=4;Some(u32::from_be_bytes(bytes.try_into().unwrap()))
+                    }else{None};
+                    let bytes=body.get(pos..pos+4).ok_or("truncated service update action")?;pos+=4;let action=u32::from_be_bytes(bytes.try_into().unwrap());
+                    let service=super::json::parse(&body[pos..])?;
+                    if !service.is_object()||service["serviceType"].as_u64().is_none()||service["serviceId"].as_str().is_none(){return Err("invalid service update metadata".into());}
+                    if let Some(sequence)=sequence{
+                        let mut confirm=wire::uint(106)?;confirm.extend(sequence.to_be_bytes());self.business(3,u32::MAX,&confirm)?;
+                        if self.service_updates.contains(&sequence){return Ok(());}
+                        if self.service_updates.len()>=32{self.service_updates.pop_front();}self.service_updates.push_back(sequence);
+                    }
+                    // Only this explicitly addressed native return action opens
+                    // the local menu. Ordinary RTSP pauses never change menus.
+                    if service["serviceType"]==8&&service["serviceId"]=="display1"{
+                        events.push(json!({"display_service_action":action}));
+                        if matches!(action,202|203){let open=action==202&&!self.display_paused;self.display_status(action)?;if open{events.push(json!({"return_to_car":true}));}}
+                    }
                 },
                 104=>{if !self.device_exchanged||body.len()-pos!=4{return Err("invalid service discovery request".into());}let mask=u32::from_be_bytes(body[pos..].try_into().unwrap());events.push(json!({"service_request_mask":mask}));
                     for service_type in [8,4,2,256,512]{if mask&service_type==0||service_type==4&&self.speaker.is_none()||matches!(service_type,2|256|512)&&self.services.is_empty(){continue;}

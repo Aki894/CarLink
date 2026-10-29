@@ -15,7 +15,9 @@ fn now_us()->u64{let mut t=libc::timespec{tv_sec:0,tv_nsec:0};unsafe{libc::clock
 fn diagnostic(event:&str,stream:u8,format:&Value){
     let role=format["role"].as_str().filter(|v|matches!(*v,"MEDIA"|"ALERT"|"VOICE"|"TELEPHONY")).unwrap_or("OTHER");
     let codec=format["codec"].as_str().filter(|v|matches!(*v,"PCM_S16LE"|"AAC_LC"|"AAC_ADTS"|"OPUS")).unwrap_or("OTHER");
-    let line=json!({"event":event,"stream":stream,"role":role,"codec":codec,"rate":format["sampleRate"].as_u64(),"channels":format["channels"].as_u64()}).to_string()+"\n";
+    let mut record=json!({"event":event,"stream":stream,"role":role,"codec":codec,"rate":format["sampleRate"].as_u64(),"channels":format["channels"].as_u64()});
+    if event=="audio_decoder_failed"{record["failure"]=format["failure"].clone();}
+    let line=record.to_string()+"\n";
     eprint!("{line}");
     let path=Path::new("/run/carlink-carplay/audio-diagnostics.jsonl");let truncate=path.symlink_metadata().is_ok_and(|m|m.len()>65536);
     if let Ok(mut file)=fs::OpenOptions::new().write(true).create(true).append(!truncate).truncate(truncate).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path){let _=file.write_all(line.as_bytes());}
@@ -66,6 +68,13 @@ struct Adapter{
 impl Adapter{
     fn new(config:Config)->Self{Self{link:link::Link::new(config.live.clone()),microphone:microphone::Microphone::new(config.opus.clone()),config,formats:BTreeMap::new(),decoders:BTreeMap::new(),retry:BTreeMap::new(),active:false,hello:false,parameters:vec![],video_format:Value::Null,last_video:None,capture_offset:None,output:Output::new(),report_at:Instant::now(),source_frames:0,source_bytes:0,source_dropped:0,source_age_max:0.}}
     fn request_microphone(&mut self,values:Vec<Value>)->Result<()>{for value in values{self.link.microphone(&value)?;}Ok(())}
+    fn decoder_failed(&self,stream:u8){
+        if let (Some(decoder),Some(format))=(self.decoders.get(&stream),self.formats.get(&stream)){
+            diagnostic("audio_decoder_failed",stream,&json!({"role":["MEDIA","ALERT","VOICE","TELEPHONY"][format.role as usize],
+                "codec":format.codec,"sampleRate":format.sample_rate,"channels":format.channels,"failure":decoder.failure()}));
+        }
+    }
+
     fn json(&mut self,value:Value)->Result<()>{
         if !self.hello{
             if value["type"]!="hello"||value["version"].as_u64()!=Some(0)||value["role"]!="producer"{return Err("expected OXP v0 producer hello".into());}
@@ -141,6 +150,7 @@ impl Adapter{
         }else if message.kind==2{
             let Some(format)=self.formats.get(&message.stream).cloned()else{return Ok(());};
             if self.decoders.get(&message.stream).is_some_and(|d|d.failed()){
+                self.decoder_failed(message.stream);
                 self.decoders.remove(&message.stream);self.retry.insert(message.stream,Instant::now()+Duration::from_millis(500));
             }
             if !self.decoders.contains_key(&message.stream){
@@ -162,6 +172,7 @@ impl Adapter{
             if decoder.failed(){failed.push((*stream,role));}
         }
         for (stream,role)in failed{
+            self.decoder_failed(stream);
             self.decoders.remove(&stream);self.retry.insert(stream,Instant::now()+Duration::from_millis(500));
             if !self.decoders.keys().any(|id|self.formats.get(id).is_some_and(|f|f.role==role)){
                 self.link.audio_state(role,false);

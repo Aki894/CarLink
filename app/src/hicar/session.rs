@@ -227,12 +227,13 @@ pub fn differential(v:&Value)->Result<Value>{
                     let initial=session.initial()?;let state=session.state();control=Some((next_control,session));
                     Ok(value!({"session":next_control,"initial":hex(&initial),"state":state}))
                 },
-                "dmsdp-receive"|"dmsdp-heartbeat"|"dmsdp-ports"|"dmsdp-stop-audio"|"dmsdp-close"=>{
+                "dmsdp-receive"|"dmsdp-display-resume"|"dmsdp-heartbeat"|"dmsdp-ports"|"dmsdp-stop-audio"|"dmsdp-close"=>{
                     let token=number(&command,"session")?;
                     let (_,session)=control.as_mut().filter(|(n,_)|*n==token).ok_or("stale DMSDP session")?;
                     if op=="dmsdp-close"{control=None;return Ok(value!({}));}
                     let (events,plaintexts)=if op=="dmsdp-receive"{session.receive(&unhex(text(&command,"data")?)?,command["now_us"].as_u64().ok_or("missing monotonic timestamp")?,command["capture"]==true)?}else{(vec![],vec![])};
                     let heartbeat=if op=="dmsdp-heartbeat"{Some(session.heartbeat()?)}else{None};
+                    if op=="dmsdp-display-resume"{session.display_status(203)?;}
                     if op=="dmsdp-stop-audio"{session.stop_audio()?;}
                     if op=="dmsdp-ports"{let ports=command["ports"].as_array().filter(|v|v.len()==2).ok_or("invalid speaker ports")?;
                         let port=ports[0].as_u64().and_then(|v|u16::try_from(v).ok()).ok_or("invalid speaker RTP port")?;

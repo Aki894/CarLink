@@ -135,14 +135,14 @@ impl Session{
                         if parameters.get("his_trigger_method")==Some(&"SETUP"){self.setup=Some(self.request("SETUP")?);}
                         else if parameters.get("his_trigger_method")==Some(&"PAUSE")&&self.media.is_some(){
                             self.request("PAUSE")?;
-                            if !self.paused{self.paused=true;events.push(json!({"return_to_car":true}));}
+                            self.paused=true;
                         }
                         else if parameters.get("his_trigger_method")==Some(&"PLAY")&&self.media.is_some(){self.request("PLAY")?;}
                         else if parameters.get("his_trigger_method")==Some(&"TEARDOWN"){self.peer_teardown=true;}
                     },
                     "PAUSE"=>{
                         self.queue(message("RTSP/1.0 200 OK",seq,&[],&[])?,false)?;
-                        if self.media.is_some()&&!self.paused{self.paused=true;events.push(json!({"return_to_car":true}));}
+                        if self.media.is_some(){self.paused=true;}
                     },
                     "PLAY"=>{self.queue(message("RTSP/1.0 200 OK",seq,&[],&[])?,false)?;self.paused=false;},
                     "TEARDOWN"=>{self.queue(message("RTSP/1.0 200 OK",seq,&[],&[])?,false)?;self.peer_teardown=true;},
@@ -176,13 +176,13 @@ pub fn differential(v:&Value)->Result<Value>{
         let mut session=Session::new(&[3;16]).unwrap();session.encrypted=true;session.media=Some(41000);session.input=Some(41001);
         let request=message("SET_PARAMETER * RTSP/1.0","7",b"his_trigger_method: PAUSE\r\n",&[]).unwrap();
         let packet=session.pack(&request,false).unwrap();let (events,_)=session.receive(&packet,false).unwrap();
-        assert!(events.iter().any(|e|e["return_to_car"]==true));assert!(!session.peer_teardown);assert_eq!(session.media,Some(41000));
+        assert!(!events.iter().any(|e|e["return_to_car"]==true));assert!(!session.peer_teardown);assert_eq!(session.media,Some(41000));
         let pending=session.pending();assert_eq!(pending.len(),2);
         let plain=session.crypto.transform(&session.key,&pending[1][4..20],&pending[1][20..]).unwrap();assert!(plain.starts_with(b"PAUSE * RTSP/1.0\r\n"));
         let direct=session.pack(&message("PAUSE * RTSP/1.0","8",&[],&[]).unwrap(),false).unwrap();
         let (events,_)=session.receive(&direct,false).unwrap();assert!(!events.iter().any(|e|e["return_to_car"]==true));assert_eq!(session.pending().len(),1);
         session.request("PLAY").unwrap();assert!(!session.paused);
         let pending=session.pending();let plain=session.crypto.transform(&session.key,&pending[0][4..20],&pending[0][20..]).unwrap();assert!(plain.starts_with(b"PLAY * RTSP/1.0\r\n"));
-        let (events,_)=session.receive(&direct,false).unwrap();assert!(events.iter().any(|e|e["return_to_car"]==true));assert!(!session.peer_teardown);assert_eq!(session.input,Some(41001));
+        let (events,_)=session.receive(&direct,false).unwrap();assert!(!events.iter().any(|e|e["return_to_car"]==true));assert!(!session.peer_teardown);assert_eq!(session.input,Some(41001));
     }
 }

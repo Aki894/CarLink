@@ -171,6 +171,26 @@ def check(binary):
         focus_events=[[e for e in step['events'] if e.get('audio_focus')] for step in focus['result']['steps'][1:]]
         assert focus_events==[[dict(audio_focus=True,active=True,usage=usage,focus_type=kind)] for kind,usage in [(2,2),(3,12),(2,13),(2,1)]]+[[dict(audio_focus=True,active=False)],[]]
         count+=1
+        # SDK2 BackToCar uses cmd103 + BE32 action + service JSON. The older
+        # sequenced cmd107 additionally requires cmd106 with the original id.
+        service=json.dumps(dict(deviceId='synthetic-owner',deviceName='',serviceId='display1',serviceType=8,properties={},status={}),separators=(',',':')).encode()
+        updates=[(103,None,202),(103,None,202),(103,None,203),(107,7,202),(107,7,202)]
+        steps=[dict(receive=negotiation.hex())]
+        for command,sequence,action in updates:
+            tail=(sequence.to_bytes(4,'big') if sequence is not None else b'')+action.to_bytes(4,'big')+service
+            steps.append(dict(receive=wire(business(3,command,tail)).hex()))
+        result=worker.call(dict(op='dmsdp-session',key=key.hex(),device_info=info,audio=True,steps=steps))
+        assert result.get('ok'),'SDK2 display update rejected'
+        results=result['result']['steps'][1:]
+        assert [any(e.get('return_to_car') for e in step['events']) for step in results]==[True,False,False,True,False]
+        assert [len(step['pending']) for step in results]==[1,1,1,2,1]
+        for index,action in [(0,202),(2,203)]:
+            reply=normalize(bytes.fromhex(results[index]['pending'][0]),cipher)
+            assert reply['command']==103 and int.from_bytes(bytes.fromhex(reply['body'])[:4],'big')==action
+        confirm=normalize(bytes.fromhex(results[4]['pending'][0]),cipher)
+        assert confirm['command']==106 and confirm['body']=='00000007'
+        assert all(not e.get('audio_stopped') and not e.get('microphone_stopped') for step in results for e in step['events'])
+        count+=1
         invalid=[
             [dict(receive=b'\x01\0\x01x'.hex())], [dict(receive=b'\0\0\0'.hex())],
             [dict(receive=(b'\0'+(1498).to_bytes(2,'big')).hex())],

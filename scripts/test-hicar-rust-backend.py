@@ -214,7 +214,7 @@ class Harness:
                 def framed(payload,kind=0):
                     return bytes([kind])+len(payload).to_bytes(2,'big')+payload
                 negotiation=framed(b'SET_PARAMETER * DMSDP/1.0\r\nCSeq: 1\r\nCryptoVer: 1\r\nCryptoSwitch: 222\r\nCryptoAlg: null\r\n\r\n')
-                request=dict(op='dmsdp-session',key='',device_info=None,audio=False,steps=[dict(receive=negotiation.hex()),dict(receive=framed(data).hex())])
+                request=dict(op='dmsdp-session',key='',device_info=dict(deviceId='synthetic-owner',deviceName='CarLink'),audio=False,steps=[dict(receive=negotiation.hex()),dict(receive=framed(data).hex())])
                 native=subprocess.run([self.binary,'hicar','codec'],input=json.dumps(request)+'\n',text=True,capture_output=True,check=True,timeout=5)
                 decoded=json.loads(native.stdout)
                 assert decoded['ok'], decoded
@@ -233,7 +233,7 @@ class Harness:
         if operation == 'hisight-open':
             return {'session': 3, 'initial': b'ANNOUNCE'.hex()}
         if operation == 'hisight-receive':
-            return {'events':[dict(return_to_car=True)] if bytes.fromhex(value['data'])==b'PAUSE' else [], 'pending': [], 'state': {'media_endpoint': 50100,
+            return {'events':[], 'pending': [], 'state': {'media_endpoint': 50100,
                                              'input_endpoint': 50101}}
         if operation == 'hisight-play':
             return {'pending': [b'PLAY'.hex()]}
@@ -341,15 +341,22 @@ def run(binary):
     try:
         owner.authenticate()
         control = owner.project()
-        # The native HiCar BackToCar action pauses presentation without closing
-        # the authenticated session or touching any speaker/microphone service.
+        # The actual SDK2 native exit uses module3/cmd103 + BE32 action202
+        # + service JSON; a generic RTSP PAUSE must never open our menu.
         owner.sight_connection.sendall(b'PAUSE')
+        time.sleep(.08)
+        assert ('media','open-menu') not in owner.trace
+        body=bytes([103|128])+(202).to_bytes(4,'big')+json.dumps(dict(deviceId='synthetic-owner',deviceName='',serviceId='display1',serviceType=8,properties={},status={}),separators=(',',':')).encode()
+        native_exit=b'$'+(3).to_bytes(4,'big')+bytes([255])*4+len(body).to_bytes(2,'big')+body
+        control.sendall(native_exit)
         owner.wait(lambda: ('media','open-menu') in owner.trace)
         before_play=owner.trace.count(('session','hisight-play'))
+        before_resume=owner.trace.count(('session','dmsdp-display-resume'))
         owner.return_projection=1
-        owner.wait(lambda: owner.trace.count(('session','hisight-play'))==before_play+1)
+        owner.wait(lambda: owner.trace.count(('session','dmsdp-display-resume'))==before_resume+1)
         time.sleep(.35)
-        assert owner.trace.count(('session','hisight-play'))==before_play+1
+        assert owner.trace.count(('session','dmsdp-display-resume'))==before_resume+1
+        assert owner.trace.count(('session','hisight-play'))==before_play
         assert not owner.event('hisight_closed') and owner.process.poll() is None
         # Independent speaker lifetimes must reach the media owner with their
         # advertised UDP endpoints, including call takeover and resume cleanup.

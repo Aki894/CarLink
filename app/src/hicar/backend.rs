@@ -324,6 +324,7 @@ impl Owner{
             if e["microphone_ready"]==true||e["microphone_stopped"]==true||e["audio_ready"]==true||e["audio_stopped"]==true{
                 println!("{}",json!({"event":"hicar_audio_service","service":e["service"].as_str().filter(|n|matches!(*n,"speaker1"|"mic1"|"modemMic"|"modemSpeaker")).unwrap_or("speaker1"),"ready":e["microphone_ready"]==true||e["audio_ready"]==true,"stopped":e["microphone_stopped"]==true||e["audio_stopped"]==true}));
             }
+            if e["return_to_car"]==true{self.media_call(json!({"op":"open-menu"}))?;}
             for command in self.audio_services.apply(e){self.media_call(command)?;}
         }}
         if !self.clock_set{if let Some(clock)=state["clock"].as_array(){self.media_call(json!({"op":"clock-start","port":clock[2]}))?;self.clock_set=true;}}
@@ -333,7 +334,6 @@ impl Owner{
             let mut sight=Channel::new(fd,Kind::Sight,self.epoch)?;sight.token=Some(num(&result,"session")?);sight.enqueue(unhex(text(&result,"initial")?)?)?;self.channels.push(sight);event("hisight_connected",self.epoch);
         }}Ok(())}
     fn receive_sight(&mut self,c:&mut Channel,bytes:&[u8])->Result<()>{let result=self.worker.call(&json!({"op":"hisight-receive","session":c.token,"data":hex(bytes),"capture":false}))?;pending(c,&result)?;
-        if result["events"].as_array().is_some_and(|events|events.iter().any(|e|e["return_to_car"]==true)){self.media_call(json!({"op":"open-menu"}))?;}
         let state=&result["state"];if state["peer_teardown"]==true{c.closing=true;}
         if !self.video_set{if let Some(port)=state["media_endpoint"].as_u64(){self.media_call(json!({"op":"set-video","media_port":port,"input_port":state["input_endpoint"]}))?;self.video_set=true;
             let play=self.worker.call(&json!({"op":"hisight-play","session":c.token}))?;pending(c,&play)?;
@@ -373,8 +373,8 @@ impl Owner{
         let response=self.media_call(json!({"op":"status"}))?;let state=&response["state"];
         if let Some(request)=state["return_projection"].as_u64(){if request!=self.return_projection{
             self.return_projection=request;
-            for c in &mut self.channels{if c.kind==Kind::Sight&&!c.closing{
-                let result=self.worker.call(&json!({"op":"hisight-play","session":c.token}))?;pending(c,&result)?;
+            for c in &mut self.channels{if c.kind==Kind::Control&&!c.closing{
+                let result=self.worker.call(&json!({"op":"dmsdp-display-resume","session":c.token}))?;pending(c,&result)?;
             }}
         }}
         if force||self.last_stats.elapsed()>=Duration::from_secs(1){let mut out=state.clone();out["event"]="bridge_stats".into();out["session_epoch"]=self.epoch.into();println!("{out}");self.last_stats=Instant::now();}
