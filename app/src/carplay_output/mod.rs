@@ -70,7 +70,8 @@ impl Adapter{
     fn request_microphone(&mut self,values:Vec<Value>)->Result<()>{for value in values{self.link.microphone(&value)?;}Ok(())}
     fn decoder_failed(&self,stream:u8){
         if let (Some(decoder),Some(format))=(self.decoders.get(&stream),self.formats.get(&stream)){
-            diagnostic("audio_decoder_failed",stream,&json!({"role":["MEDIA","ALERT","VOICE","TELEPHONY"][format.role as usize],
+            let role_name=["MEDIA","ALERT","VOICE","TELEPHONY"][format.role as usize];
+            diagnostic("audio_decoder_failed",stream,&json!({"role":role_name,
                 "codec":format.codec,"sampleRate":format.sample_rate,"channels":format.channels,"failure":decoder.failure()}));
         }
     }
