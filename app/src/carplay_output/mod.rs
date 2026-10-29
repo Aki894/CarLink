@@ -7,11 +7,19 @@ mod microphone;
 mod opus;
 
 use serde_json::{json,Value};
-use std::{collections::{BTreeMap,VecDeque},fs,io::{Read,Write,ErrorKind},os::{fd::AsRawFd,unix::{fs::{DirBuilderExt,MetadataExt,PermissionsExt},net::{UnixListener,UnixStream}}},path::{Path,PathBuf},sync::atomic::{AtomicBool,Ordering},time::{Duration,Instant}};
+use std::{collections::{BTreeMap,VecDeque},fs,io::{Read,Write,ErrorKind},os::{fd::AsRawFd,unix::{fs::{DirBuilderExt,MetadataExt,OpenOptionsExt,PermissionsExt},net::{UnixListener,UnixStream}}},path::{Path,PathBuf},sync::atomic::{AtomicBool,Ordering},time::{Duration,Instant}};
 type Result<T> = std::result::Result<T,String>;
 static STOP:AtomicBool=AtomicBool::new(false);
 extern "C" fn stop(_:i32){STOP.store(true,Ordering::Relaxed);}
 fn now_us()->u64{let mut t=libc::timespec{tv_sec:0,tv_nsec:0};unsafe{libc::clock_gettime(libc::CLOCK_MONOTONIC,&mut t);}t.tv_sec as u64*1_000_000+t.tv_nsec as u64/1000}
+fn diagnostic(event:&str,stream:u8,format:&Value){
+    let role=format["role"].as_str().filter(|v|matches!(*v,"MEDIA"|"ALERT"|"VOICE"|"TELEPHONY")).unwrap_or("OTHER");
+    let codec=format["codec"].as_str().filter(|v|matches!(*v,"PCM_S16LE"|"AAC_LC"|"AAC_ADTS"|"OPUS")).unwrap_or("OTHER");
+    let line=json!({"event":event,"stream":stream,"role":role,"codec":codec,"rate":format["sampleRate"].as_u64(),"channels":format["channels"].as_u64()}).to_string()+"\n";
+    eprint!("{line}");
+    let path=Path::new("/run/carlink-carplay/audio-diagnostics.jsonl");let truncate=path.symlink_metadata().is_ok_and(|m|m.len()>65536);
+    if let Ok(mut file)=fs::OpenOptions::new().write(true).create(true).append(!truncate).truncate(truncate).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path){let _=file.write_all(line.as_bytes());}
+}
 struct Config{socket:PathBuf,live:PathBuf,audio:PathBuf,opus:Option<PathBuf>,width:u32,height:u32,source_clock:bool}
 impl Config{
     fn parse(args:&[String])->Result<Self>{
@@ -40,6 +48,7 @@ impl Output{
         if self.bytes+bytes.len()>1024*1024||self.queue.len()>=128{return Err("OXP control output exceeded bound".into());}
         self.bytes+=bytes.len();self.queue.push_back(Outgoing{bytes,offset:0,queued:Instant::now()});Ok(())
     }
+    fn clear_microphone(&mut self){self.queue.retain(|p|p.offset>0||p.bytes.get(4)!=Some(&3));self.bytes=self.queue.iter().map(|p|p.bytes.len()).sum();}
     fn pump(&mut self,socket:&mut UnixStream)->Result<()>{for _ in 0..16{
         let Some(front)=self.queue.front_mut()else{break;};
         if front.queued.elapsed()>Duration::from_secs(2){return Err("OXP control output stalled".into());}
@@ -81,6 +90,7 @@ impl Adapter{
             Some("mic")if self.active=>{
                 let stream=value["stream"].as_u64().filter(|s|*s<=255).ok_or("invalid microphone stream")? as u8;
                 let request=if value["request"].is_null(){None}else{Some(&value["request"])};
+                diagnostic(if request.is_some(){"microphone_request"}else{"microphone_stopped"},stream,&value["request"]);
                 let demands=self.microphone.configure(stream,request)?;self.request_microphone(demands)?;
             },
             Some("video-format")if value["screen"].as_u64()==Some(0)=>{
@@ -96,6 +106,7 @@ impl Adapter{
             },
             Some("audio-format")=>{
                 let stream=value["stream"].as_u64().filter(|s|*s<=255).ok_or("invalid audio stream")? as u8;
+                diagnostic(if value["format"].is_null(){"audio_stopped"}else{"audio_format"},stream,&value["format"]);
                 self.decoders.remove(&stream);self.retry.remove(&stream);
                 if let Some(old)=self.formats.remove(&stream){self.link.audio_state(old.role,false);}
                 if !value["format"].is_null(){if let Ok(format)=audio::Format::parse(&value["format"]){
@@ -132,6 +143,7 @@ impl Adapter{
             if !self.decoders.contains_key(&message.stream){
                 if self.retry.get(&message.stream).is_some_and(|t|Instant::now()<*t){return Ok(());}
                 let decoder=audio::Decoder::new(&self.config.audio,&format)?;
+                diagnostic("audio_decoder_started",message.stream,&json!({"role":["MEDIA","ALERT","VOICE","TELEPHONY"][format.role as usize],"codec":format.codec,"sampleRate":format.sample_rate,"channels":format.channels}));
                 self.decoders.insert(message.stream,decoder);self.link.audio_state(format.role,true);
             }
             let pts=if self.config.source_clock{self.capture_offset.and_then(|offset|message.pts.checked_add(offset)).unwrap_or(message.sender)}else{message.pts};
@@ -139,16 +151,30 @@ impl Adapter{
         }Ok(())
     }
     fn step(&mut self)->Result<()>{
+        let mut failed=vec![];
         for (stream,decoder)in &mut self.decoders{
             let role=self.formats.get(stream).ok_or("audio format disappeared")?.role;
             for (pcm,pts)in decoder.poll()?{self.link.media(3,pcm,pts,role);}
+            if decoder.failed(){failed.push((*stream,role));}
+        }
+        for (stream,role)in failed{
+            self.decoders.remove(&stream);self.retry.insert(stream,Instant::now()+Duration::from_millis(500));
+            if !self.decoders.keys().any(|id|self.formats.get(id).is_some_and(|f|f.role==role)){
+                self.link.audio_state(role,false);
+                // The OXP format, rather than missing media, owns call lifetime.
+                // Reset a failed track while retaining the call/switch guard.
+                if role==3&&self.formats.values().any(|f|f.role==3){self.link.audio_state(3,true);}
+            }
         }
         for feedback in self.link.step(){match feedback{
             link::Feedback::Control(value)=>{if let Ok(bytes)=wire::control(&value){self.output.push(bytes)?;}},
-            link::Feedback::Microphone{generation,pcm}=>{for bytes in self.microphone.feed(generation,&pcm)?{self.output.push(bytes)?;}},
+            link::Feedback::Microphone{generation,pcm}=>{
+                let result=self.microphone.feed(generation,&pcm).and_then(|packets|{for bytes in packets{self.output.push(bytes)?;}Ok(())});
+                if result.is_err(){self.output.clear_microphone();let stopped=self.microphone.stop(None);self.request_microphone(stopped)?;println!("{}",json!({"event":"microphone_error","capture_stopped":true}));}
+            },
         }}
         if self.report_at.elapsed()>=Duration::from_secs(5){
-            let elapsed=self.report_at.elapsed().as_secs_f64().max(.001);let mut report=self.link.report();
+            let elapsed=self.report_at.elapsed().as_secs_f64().max(0.001);let mut report=self.link.report();
             report["source_video_ms_max"]=self.source_age_max.into();report["source_video_dropped"]=self.source_dropped.into();
             report["source_video_fps"]=(self.source_frames as f64/elapsed).into();report["source_video_mbps"]=(self.source_bytes as f64*8./elapsed/1_000_000.).into();
             println!("{report}");self.source_frames=0;self.source_bytes=0;self.source_age_max=0.;self.report_at=Instant::now();

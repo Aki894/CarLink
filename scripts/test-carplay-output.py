@@ -1,7 +1,8 @@
 """CI host Rust OXP consumer against the existing Python wire reference.
 
 Usage: python3 scripts/test-carplay-output.py HOST_CARLINK_BINARY
-No codec, Bluetooth, USB, phone or native Opus library is required.
+No codec, Bluetooth, USB, phone or real Opus library is required. A host C
+compiler builds a temporary failure-injection library during Linux CI only.
 """
 import base64
 import contextlib
@@ -65,16 +66,19 @@ def send_fragmented(sock, value):
 
 
 @contextlib.contextmanager
-def harness():
+def harness(opus_library=None):
     with tempfile.TemporaryDirectory(prefix='carlink-output-ci-') as folder:
         folder = Path(folder)
         live_path, oxp_path = folder / 'live', folder / 'oxp'
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(live_path)); listener.listen(2); listener.settimeout(5)
         log = (folder / 'child.log').open('wb')
-        child = subprocess.Popen([str(APP), 'carplay-output', '--unix', str(oxp_path),
+        command = [str(APP), 'carplay-output', '--unix', str(oxp_path),
             '--live-socket', str(live_path), '--audio-binary', '/nonexistent/codec-forbidden',
-            '--width', '800', '--height', '480'], stdout=log, stderr=log,
+            '--width', '800', '--height', '480']
+        if opus_library is not None:
+            command.extend(['--opus-library', str(opus_library)])
+        child = subprocess.Popen(command, stdout=log, stderr=log,
             env=dict(os.environ, CARLINK_LOW_LATENCY='1'))
         source = sink = None
         try:
@@ -162,6 +166,58 @@ with harness() as (child, source, sink, listener, path):
     child.wait(timeout=5)
     assert not path.exists(), 'OXP socket retained after EOF'
 
+# A real FFI encode failure must stop microphone capture without killing video.
+# The fixture exports the actual Opus ABI; no system codec or device is used.
+with tempfile.TemporaryDirectory(prefix='carlink-opus-failure-ci-') as folder:
+    folder = Path(folder)
+    fixture, library = folder / 'opus-failure.c', folder / 'opus-failure.so'
+    fixture.write_text(r'''
+#include <stdint.h>
+void *opus_encoder_create(int32_t rate, int channels, int application, int *error) {
+    (void)rate; (void)channels; (void)application;
+    *error = 0;
+    return (void *)(uintptr_t)1;
+}
+int opus_encoder_ctl(void *handle, int request, ...) {
+    (void)handle; (void)request;
+    return 0;
+}
+int opus_encode(void *handle, const int16_t *pcm, int frame_size,
+                unsigned char *output, int32_t capacity) {
+    (void)handle; (void)pcm; (void)frame_size; (void)output; (void)capacity;
+    return -1;
+}
+void opus_encoder_destroy(void *handle) { (void)handle; }
+''', encoding='ascii')
+    subprocess.run(['gcc', '-shared', '-fPIC', str(fixture), '-o', str(library)], check=True)
+    with harness(library) as (child, source, sink, listener, path):
+        parameters = active_video(source)
+        live_until(sink, lambda f: f[0] == 1)
+
+        def send_idr(sequence):
+            nal = bytes([0x65, sequence])
+            payload = struct.pack('>I', len(nal)) + nal
+            now = time.monotonic_ns() // 1000
+            header = probe.HEADER.pack(1, 0, 1, 0, sequence, 1000 + sequence, now)
+            source.sendall(struct.pack('<I', len(header) + len(payload)) + header + payload)
+            received = live_until(sink, lambda f: f[0] == 2)
+            assert received[3] == parameters + b'\0\0\0\1' + nal
+
+        send_idr(1)
+        probe.send_json(source, {'type': 'mic', 'stream': 3, 'request': {
+            'codec': 'OPUS', 'sampleRate': 24000, 'channels': 1, 'frameMs': 20}})
+        request = json.loads(live_until(sink, lambda f: f[0] == 7 and json.loads(f[3])['active'])[3])
+        generation = request['generation']
+        # 512 mono samples at 16 kHz produce over 960 resampled samples,
+        # forcing one actual encode() invocation and its injected error.
+        capture = struct.pack('<h', 731) * 512
+        sink.sendall(live_frame(130, struct.pack('<Q', generation) + capture))
+        stopped = json.loads(live_until(sink, lambda f: f[0] == 7 and not json.loads(f[3])['active'])[3])
+        assert stopped['generation'] == generation
+        assert child.poll() is None, 'native microphone error killed output process'
+        send_idr(2)
+        assert child.poll() is None, 'video did not survive native microphone error'
+
 # Invalid configuration and truncated/oversized wire input must terminate only
 # this output process and remove its owned socket, without a codec/device.
 for case in ('invalid-format', 'truncated', 'oversized'):
@@ -178,4 +234,4 @@ for case in ('invalid-format', 'truncated', 'oversized'):
         assert child.returncode != 0, case
         assert not path.exists(), case + ': OXP socket retained'
 
-print('Rust CarPlay output: real OXP hello/capabilities, binary video, stale-frame fencing, reverse input, PCM microphone generations, call stop and malformed/EOF cleanup passed')
+print('Rust CarPlay output: real OXP hello/capabilities, binary video, stale-frame fencing, reverse input, PCM microphone generations, native microphone error isolation, call stop and malformed/EOF cleanup passed')

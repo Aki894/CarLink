@@ -39,10 +39,29 @@ pub fn opus_headers(channels:u8)->Result<Vec<u8>>{
     let mut tags=b"OpusTags".to_vec();tags.extend(7u32.to_le_bytes());tags.extend(b"CarLink");tags.extend(0u32.to_le_bytes());
     let mut out=ogg_page(&head,0,0,true)?;out.extend(ogg_page(&tags,1,0,false)?);Ok(out)
 }
+fn packet_samples(format:&Format,payload:&[u8])->Result<u64>{
+    match format.codec.as_str(){
+        "PCM_S16LE"=>Ok((payload.len()/(2*format.channels as usize)) as u64),
+        "AAC_LC"=>Ok(1024),
+        "OPUS"=>Ok(opus_samples(payload)? as u64),
+        "AAC_ADTS"=>{
+            let mut offset=0;let mut samples=0;
+            while offset<payload.len(){
+                let header=payload.get(offset..offset+7).ok_or("truncated ADTS packet")?;
+                let size=((header[3] as usize&3)<<11)|((header[4] as usize)<<3)|((header[5] as usize)>>5);
+                let minimum=if header[1]&1==0{9}else{7};
+                let rates=[96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350];
+                let channels=(header[2]&1)<<2|header[3]>>6;
+                if header[0]!=255||header[1]&0xf6!=0xf0||size<=minimum||size>payload.len()-offset||rates.get(((header[2]>>2)&15) as usize)!=Some(&format.sample_rate)||channels!=format.channels{return Err("invalid ADTS packet".into());}
+                samples+=1024*((header[6]&3) as u64+1);offset+=size;
+            }Ok(samples)
+        },_=>Err("unsupported audio codec".into()),
+    }
+}
 struct Packet{data:Vec<u8>,offset:usize,queued:Instant}
 pub struct Decoder{
     child:Child,input:ChildStdin,output:ChildStdout,format:Format,queue:VecDeque<Packet>,pcm:Vec<u8>,
-    origin:Option<u64>,samples:u64,next:Option<Instant>,failed:bool,ogg_sequence:u32,granule:u64,waiting:Option<Instant>,
+    origin:Option<u64>,samples:u64,submitted_samples:u64,next:Option<Instant>,failed:bool,ogg_sequence:u32,granule:u64,waiting:Option<Instant>,
 }
 fn nonblocking(fd:i32)->Result<()>{unsafe{let flags=libc::fcntl(fd,libc::F_GETFL);if flags<0||libc::fcntl(fd,libc::F_SETFL,flags|libc::O_NONBLOCK)<0{return Err("audio pipe nonblocking setup failed".into());}}Ok(())}
 impl Decoder{
@@ -55,20 +74,26 @@ impl Decoder{
         let mut child=command.args(["-i","pipe:0","-vn","-threads","1","-ac","2","-ar","44100","-c:a","pcm_s16le","-f","s16le","-flush_packets","1","pipe:1"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|_|"audio decoder could not start")?;
         let input=child.stdin.take().unwrap();let output=child.stdout.take().unwrap();
         if let Err(error)=nonblocking(input.as_raw_fd()).and_then(|_|nonblocking(output.as_raw_fd())){let _=child.kill();let _=child.wait();return Err(error);}
-        Ok(Self{child,input,output,format:format.clone(),queue:VecDeque::new(),pcm:vec![],origin:None,samples:0,next:None,failed:false,ogg_sequence:0,granule:0,waiting:None})
+        Ok(Self{child,input,output,format:format.clone(),queue:VecDeque::new(),pcm:vec![],origin:None,samples:0,submitted_samples:0,next:None,failed:false,ogg_sequence:0,granule:0,waiting:None})
     }
     pub fn failed(&self)->bool{self.failed}
     pub fn feed(&mut self,payload:&[u8],pts:u64)->Result<bool>{
         if self.failed{return Ok(false);}
         if payload.is_empty()||payload.len()>65536||self.format.codec=="PCM_S16LE"&&payload.len()%(2*self.format.channels as usize)!=0{return Err("invalid source audio packet".into());}
         if self.queue.len()>=16||self.queue.front().is_some_and(|p|p.queued.elapsed()>BUDGET){self.failed=true;return Ok(false);}
+        let samples=packet_samples(&self.format,payload)?;
+        let submitted=self.submitted_samples.saturating_add(samples);
+        let rate=if self.format.codec=="OPUS"{48000}else{self.format.sample_rate} as u128;
+        // Include compressed bytes already handed to FFmpeg and its pipe: a
+        // small Rust queue alone does not bound native decoder audio latency.
+        if (submitted as u128*44100).saturating_sub(self.samples as u128*rate)>22050*rate{self.failed=true;return Ok(false);}
         let mut data=match self.format.codec.as_str(){"AAC_LC"=>adts(payload,self.format.sample_rate,self.format.channels)?,_=>payload.to_vec()};
         if self.format.codec=="OPUS"{
             let samples=opus_samples(payload)?;data=if self.ogg_sequence==0{opus_headers(self.format.channels)?}else{vec![]};
             self.ogg_sequence=self.ogg_sequence.max(2);self.granule+=samples as u64;data.extend(ogg_page(payload,self.ogg_sequence,self.granule,false)?);self.ogg_sequence=self.ogg_sequence.wrapping_add(1);
         }
         if data.len()>65536{return Err("source audio packet exceeds limit".into());}
-        self.origin.get_or_insert(pts);let now=Instant::now();self.waiting.get_or_insert(now);self.queue.push_back(Packet{data,offset:0,queued:now});Ok(true)
+        self.submitted_samples=submitted;self.origin.get_or_insert(pts);let now=Instant::now();self.waiting.get_or_insert(now);self.queue.push_back(Packet{data,offset:0,queued:now});Ok(true)
     }
     pub fn poll(&mut self)->Result<Vec<(Vec<u8>,u64)>>{
         if self.failed{return Ok(vec![]);}
@@ -110,6 +135,9 @@ impl Drop for Decoder{fn drop(&mut self){let _=self.child.kill();let _=self.chil
         for invalid in [serde_json::json!({}),serde_json::json!({"role":"MEDIA","codec":"AAC_LC","sampleRate":true,"channels":1})]{assert!(Format::parse(&invalid).is_err());}
         assert_eq!(&adts(b"abc",48000,2).unwrap()[..3],&[255,241,76]);assert!(adts(&[],48000,2).is_err());assert!(adts(&[0;8185],48000,2).is_err());
         assert_eq!(opus_samples(&[248,255,254]).unwrap(),960);assert!(opus_samples(&[3]).is_err());
+        let aac=Format{role:0,codec:"AAC_ADTS".into(),sample_rate:48000,channels:2};
+        let packet=adts(b"payload",48000,2).unwrap();assert_eq!(packet_samples(&aac,&packet).unwrap(),1024);
+        assert_eq!(packet_samples(&aac,&[packet.as_slice(),packet.as_slice()].concat()).unwrap(),2048);assert!(packet_samples(&aac,&packet[..packet.len()-1]).is_err());
         let page=ogg_page(b"OpusHead",0,0,true).unwrap();assert_eq!(&page[..6],b"OggS\0\x02");assert_eq!(page[26],1);assert_ne!(&page[22..26],&[0;4]);
     }
     #[test]fn native_pcm_decoder_paces_and_reaps(){
@@ -120,5 +148,9 @@ impl Drop for Decoder{fn drop(&mut self){let _=self.child.kill();let _=self.chil
         let deadline=Instant::now()+Duration::from_secs(2);let mut blocks=vec![];
         while Instant::now()<deadline&&blocks.len()<5{blocks.extend(decoder.poll().unwrap());assert!(!decoder.failed());std::thread::sleep(Duration::from_millis(2));}
         assert!(blocks.len()>=5);for (i,(pcm,pts)) in blocks.iter().enumerate(){assert_eq!(pcm.len(),PCM);assert_eq!(*pts,100000+i as u64*20000);assert!(pcm.chunks_exact(2).all(|b|b==1234i16.to_le_bytes()));}
+        // Six 100 ms packets hit the latency cap before the 16-packet cap.
+        let mut bounded=Decoder::new(Path::new(&binary),&format).unwrap();
+        for _ in 0..5{assert!(bounded.feed(&vec![0;17640],0).unwrap());}
+        assert!(!bounded.feed(&vec![0;17640],0).unwrap());assert!(bounded.failed());
     }
 }

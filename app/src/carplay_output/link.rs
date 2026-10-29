@@ -82,13 +82,38 @@ impl Link {
             return Err("unsupported live dimensions".into());
         }
         let config = [width, height, fps].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-        self.config = Some(config.clone()); self.clear_complete();
-        self.put(4, u8::from(self.active), 0, &[]); self.put(1, 0, 0, &config); Ok(())
+        if self.config.as_ref() == Some(&config) {
+            self.recover_video();
+            return Ok(());
+        }
+        self.config = Some(config.clone());
+        // A format update is a video fence, not an audio/microphone epoch.
+        // Put complete demand transitions after the new configuration: an
+        // initial microphone request before kind 1 would otherwise be ignored
+        // by the CarLife source as unconfigured. An already-started frame must
+        // still finish before any replacement envelope is written.
+        let mut controls = VecDeque::new();
+        self.queue.retain_mut(|p| {
+            if p.offset == 0 && matches!(p.kind, 5 | 7) {
+                controls.push_back(Pending::new(p.kind, p.flags, 0, &p.wire[16..]));
+                false
+            } else { p.offset > 0 }
+        });
+        self.recount(); self.wait_key = true;
+        self.put(4, u8::from(self.active), 0, &[]); self.put(1, 0, 0, &config);
+        for control in controls { self.put(control.kind, control.flags, 0, &control.wire[16..]); }
+        if let Some(microphone) = self.microphone.clone() {
+            if !self.queue.iter().any(|p| p.kind == 7 && p.offset == 0 && p.wire[16..] == microphone) {
+                self.put(7, 0, 0, &microphone);
+            }
+        }
+        Ok(())
     }
     pub fn audio_state(&mut self, role: u8, active: bool) {
         if role > 3 { return; }
         self.roles[role as usize] = active;
-        self.queue.retain(|p| p.offset > 0 || p.kind != 3 || p.flags != role);
+        self.queue.retain(|p| p.offset > 0 || p.kind != 3
+            || p.flags != role && !(role == 3 && active && p.flags < 3));
         self.recount(); self.put(5, role, 0, &[u8::from(active)]);
         if role == 3 { println!("{}", json!({"event":"call_state","active":active})); }
     }
@@ -118,7 +143,8 @@ impl Link {
             _ => false,
         };
         if !valid || !self.connected() || !self.active || self.config.is_none()
-            || kind == 2 && self.wait_key && flags & 1 == 0 {
+            || kind == 2 && self.wait_key && flags & 1 == 0
+            || kind == 3 && self.roles[3] && flags < 3 {
             self.dropped += 1; return false;
         }
         let limit = if kind == 2 { 4 } else { 6 };
@@ -343,5 +369,49 @@ mod tests {
         link.step(); assert_eq!(link.dropped, 1); assert!(link.queue.is_empty());
         for i in 0..100 { link.audio_state(3, i % 2 == 0); }
         assert!(link.queue.len() <= MAX_CONTROL); assert!(link.size <= MAX_QUEUE); assert!(!link.roles[3]);
+    }
+    #[test] fn video_configuration_keeps_pending_call_stop_and_microphone_demand() {
+        let (mut link, _peer) = pair(); link.config = None;
+        link.audio_state(3, true); link.audio_state(3, false);
+        link.microphone(&json!({"generation":29,"active":true,"sample_rate":16000,"channels":1})).unwrap();
+        link.configure(800, 480, 30).unwrap();
+        let frames = link.queue.iter().map(|p| (p.kind, p.flags, p.wire[16..].to_vec())).collect::<Vec<_>>();
+        assert_eq!(frames[0].0, 4); assert_eq!(frames[1].0, 1);
+        let transitions = frames.iter().filter(|p| p.0 == 5).map(|p| p.2.clone()).collect::<Vec<_>>();
+        assert_eq!(transitions, vec![vec![1], vec![0]]);
+        assert_eq!(frames.iter().filter(|p| p.0 == 7).count(), 1);
+        assert_eq!(serde_json::from_slice::<Value>(&frames.last().unwrap().2).unwrap()["generation"], 29);
+    }
+    #[test] fn partial_microphone_demand_is_replayed_after_first_configuration() {
+        let (mut link, _peer) = pair(); link.config = None;
+        link.microphone(&json!({"generation":31,"active":true,"sample_rate":16000,"channels":1})).unwrap();
+        link.queue.front_mut().unwrap().offset = 8;
+        link.configure(800, 480, 30).unwrap();
+        let frames = link.queue.iter().map(|p| (p.kind, p.offset)).collect::<Vec<_>>();
+        assert_eq!(frames, vec![(7,8),(4,0),(1,0),(7,0)]);
+    }
+    #[test] fn call_takeover_keeps_partial_pcm_but_reserves_the_remaining_budget() {
+        let (mut link, _peer) = pair();
+        assert!(link.media(3, vec![1; 3528], 0, 0));
+        link.queue.front_mut().unwrap().offset = 8;
+        for role in [0,1,2,0,1] { assert!(link.media(3, vec![2; 3528], 0, role)); }
+        link.audio_state(3, true);
+        assert_eq!(link.queue.iter().filter(|p| p.kind == 3).count(), 1);
+        assert_eq!(link.queue.front().unwrap().offset, 8);
+        for role in 0..3 { assert!(!link.media(3, vec![3; 3528], 1, role)); }
+        assert!(link.media(3, vec![4; 3528], 1, 3));
+        link.audio_state(3, false);
+        assert!(!link.queue.iter().any(|p| p.kind == 3 && p.flags == 3));
+        assert!(link.media(3, vec![5; 3528], 2, 0));
+    }
+    #[test] fn unchanged_geometry_only_fences_video_and_keeps_call_controls() {
+        let (mut link, _peer) = pair(); link.configure(800, 480, 30).unwrap();
+        link.queue.clear(); link.size = 0;
+        link.audio_state(3, true);
+        link.microphone(&json!({"generation":33,"active":true,"sample_rate":16000,"channels":1})).unwrap();
+        link.configure(800, 480, 30).unwrap();
+        let kinds=link.queue.iter().map(|p|p.kind).collect::<Vec<_>>();
+        assert_eq!(kinds, vec![5,7,6]); assert!(link.roles[3]); assert!(link.microphone.is_some());
+        assert!(link.queue.iter().any(|p|p.kind==5&&p.flags==3&&p.wire[16..]==[1]));
     }
 }
