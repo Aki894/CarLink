@@ -1,5 +1,21 @@
 # 验证与部署记录
 
+## 2026-10-30：原生菜单入口、软件音量与 CarPlay 音频突发修复
+
+运行源码 `1aa023d3927e28b802bc9c166eaed2bc7474baca` 已部署至 `/opt/carlink/releases/calls-1aa023d3927e`，应用 SHA256 为 `de3361729e155f050da778d714f92129cf0060c5cb2099de38bfd95534065ce9`。部署后核对 11 个运行文件、菜单动态库映射和子进程路径；上一运行版本保留于 `/var/backups/carlink/calls-20261028T183249Z`，目录名使用板端时钟。
+
+- CarPlay 使用上游车形图标，名称为“CarLink菜单”；HiCar 保留系统返回车机图标和名称，接入相同本地菜单。HiCar 手机实际发送 DMSDP module 3 / command 103 的显示服务 action 202；兼容旧 command 107，并去重和回复其序号。返回投屏发送显示服务 action 203，普通 HiSight PAUSE 不触发菜单。
+- 投屏期间打开菜单保持无线会话与音乐；“返回投屏”位于第一行，返回键也可恢复画面。声音页提供 5% 步进的软件音量，设置持久化，PCM 使用约 20 ms 增益渐变；没有独立静音功能，麦克风上行保持原幅度。
+- 用户台架确认：CarPlay 图标、调音量、返回画面正常；HiCar 图标可进入和返回菜单，音乐不中断。音频修复版再次试听，用户确认没有卡顿。
+- CarPlay 卡顿诊断显示合法 AAC 批量到包触发 `input_queue_full`：队列 16 包、队首等待仅约 0.1–0.9 ms，解码器被反复重建。现将上游预送上限从 1000 ms 降至 200 ms，保留 400 ms 协议播放锚点和 500 ms 解码积压上限；Rust 输出在处理一批 OXP 音频包时同步推进非阻塞解码管道。
+- 新版两轮各 45 秒状态采样覆盖音乐播放、菜单调音量和返回投屏：播放开始后解码器启动次数保持 1，故障次数为 0，CarLife PID `12924`、CarPlay 后端 PID `11621` 均保持不变，USB 持续连接。调音量经过 55% / 40% 后返回 50%，音乐与投屏继续。
+- [应用构建 40909769468](https://github.com/Aki894/CarLink/actions/runs/40909769468) 成功：203 项主程序测试、加密 DMSDP 菜单闭环、真实输出进程菜单事件、原生解码器 18 包突发、持续 AAC 输出间隔，以及上游 48 包预送与暂停/刷新/恢复回归通过。
+- [完整固件 40911102836](https://github.com/Aki894/CarLink/actions/runs/40911102836) 的 native、rust-interop、firmware、镜像结构校验及产物上传全部成功。
+
+本地完整下载后，GitHub artifact digest、包内镜像 SHA256SUMS 和检查报告均核对通过。镜像 `CarLink-refresh-39459953269-1aa023d3.img.xz` SHA256 为 `3c030b068943494ee6f87bd6569503356bc23a33665203eeeeab43a60c551c59`；ZIP SHA256 为 `fa3ed41a2005c02cb1b40289df8439942989d784eed3f0e8ee8a55784b93f266`。
+
+本轮为台架验证；Lexus 实车声道与实体触控板探针另行开发。
+
 ## 2026-10-29：Rust CarPlay 媒体桥接与资源优化
 
 运行源码 `90ee05a450b6ef80cb3f309bcb8ba7c41a5cc49c` 已部署至 `/opt/carlink/releases/calls-90ee05a450b6`。主程序 SHA256 为 `b7184d5676d951813bf3f1bbb761cef92ffa1e3d5280d74f753359e9dcd514b0`；部署后核对 11 个运行文件、菜单动态库映射及各子进程路径。旧运行版本保留于 `/var/backups/carlink/calls-20261028T175858Z`（目录名使用板上时钟）。
