@@ -118,8 +118,10 @@ def check(binary):
         fake = root/'decoder.py'
         fake.write_text('''#!/usr/bin/env python3
 import os,sys
+from pathlib import Path
 encoder = 'adts' in sys.argv
 if encoder:
+    Path(__file__).with_suffix('.pid').write_text(str(os.getpid()))
     split = sys.argv.index('-i')
     before, after = sys.argv[:split], sys.argv[split+1:]
     assert before[before.index('-ar')+1] == '16000'
@@ -397,8 +399,35 @@ while True:
                         assert (stamp-lower) & 0xffffffff <= (upper-lower) & 0xffffffff
                     assert (stamp-origin) & 0xffffffff == sequence * 1920
                     assert rtp[12:16] == bytes([255,241,76,128])  # AAC-LC, 48k stereo
+                # Kill only the native encoder. The negotiated phone demand
+                # stays active; the owner restarts it with a fresh capture id.
+                encoder_pid = int(fake.with_suffix('.pid').read_text())
+                os.kill(encoder_pid, signal.SIGKILL)
+                failed = json.loads(until_frame(live, 7, lambda f: not json.loads(f[3])['active'])[3])
+                assert failed['generation'] == request['generation']
+                resumed = json.loads(until_frame(live, 7, lambda f: json.loads(f[3])['active'])[3])
+                assert resumed['generation'] > request['generation']
+                before_recovery = rpc(ipc, dict(op='status'))['state']
+                assert before_recovery['video_open'] and before_recovery['active']
+                fresh = struct.pack('<Q', resumed['generation']) + bytes(640)
+                new_packet = struct.pack('<IBBHQ', 12+len(fresh),130,0,0,0)+fresh
+                live.sendall(packet + new_packet)
+                encrypted, _ = microphone_peer.recvfrom(1500)
+                rtp = cipher.decrypt(encrypted[3:])
+                assert rtp[:4] == b'\x80\x60\x00\x02' and int.from_bytes(rtp[8:12],'big') == 1100
+                microphone_peer.settimeout(.1)
+                try:
+                    microphone_peer.recvfrom(1500)
+                    raise AssertionError('retired microphone generation leaked into restarted encoder')
+                except socket.timeout:
+                    pass
+                # Stopping demand during the next backoff cancels its retry.
+                os.kill(int(fake.with_suffix('.pid').read_text()), signal.SIGKILL)
+                until_frame(live, 7, lambda f: not json.loads(f[3])['active'])
                 rpc(ipc, dict(op='microphone-stop'))
-                assert not json.loads(until_frame(live,7)[3])['active']
+                time.sleep(.65)
+                cancelled = rpc(ipc, dict(op='status'))['state']
+                assert not cancelled['microphone_active'] and not cancelled['microphone_retry_pending']
                 live.sendall(struct.pack('<IBBHQ', 12+len(payload),130,0,0,0)+payload)
                 microphone_peer.settimeout(.1)
                 try:

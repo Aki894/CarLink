@@ -96,6 +96,12 @@ def install(project, app, receiver, rootfs):
             raise ValueError('Audio transcoder source lock mismatch: ' + key)
     for path in (app / 'carlink', receiver / 'bin/openxplay-relay', receiver / 'bin/oxp-relay', receiver / 'bin/carlink-audio'):
         armhf(path)
+    example = project / 'docs/examples/manager.json'
+    if not example.is_file():
+        raise ValueError('Missing manager runtime example')
+    manager = json.loads(example.read_text())
+    if manager.get('schema') != 1 or not manager.get('hicar'):
+        raise ValueError('Invalid manager runtime example')
     native_source = native_sha = None
     native_dir = os.environ.get('HICAR_NATIVE_DIR')
     if native_dir:
@@ -151,6 +157,7 @@ def install(project, app, receiver, rootfs):
                     app_source_commit=os.environ['APP_COMMIT'], app_run_id=os.environ['APP_RUN_ID'],
                     app_sha256=hashlib.sha256((app / 'carlink').read_bytes()).hexdigest(),
                     app_notices=(app/'share').is_dir(),
+                    runtime_profile='production' if native_source else 'baseline',
                     hicar_native_source=native_source, hicar_native_sha256=native_sha,
                     carplay_receiver=source, stage='CarLife MD and separate ARMv7 CarPlay receiver')
     (rootfs / 'etc/carlink-build.json').write_text(json.dumps(manifest, indent=2) + '\n')

@@ -33,7 +33,7 @@
     "--auth-store",
     "/var/lib/carlink/hicar/production/keys",
     "--network-interface",
-    "wlx002e2d91fc8e",
+    "auto",
     "--managed",
     "--live-socket",
     "/run/carlink/live.sock",

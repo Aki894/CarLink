@@ -176,13 +176,14 @@ with harness() as (child, source, sink, listener, path):
     child.wait(timeout=5)
     assert not path.exists(), 'OXP socket retained after EOF'
 
-# A real FFI encode failure must stop microphone capture without killing video.
+# A real FFI encode failure must restart microphone capture without killing video.
 # The fixture exports the actual Opus ABI; no system codec or device is used.
 with tempfile.TemporaryDirectory(prefix='carlink-opus-failure-ci-') as folder:
     folder = Path(folder)
     fixture, library = folder / 'opus-failure.c', folder / 'opus-failure.so'
     fixture.write_text(r'''
 #include <stdint.h>
+#include <stdio.h>
 void *opus_encoder_create(int32_t rate, int channels, int application, int *error) {
     (void)rate; (void)channels; (void)application;
     *error = 0;
@@ -195,23 +196,33 @@ int opus_encoder_ctl(void *handle, int request, ...) {
 int opus_encode(void *handle, const int16_t *pcm, int frame_size,
                 unsigned char *output, int32_t capacity) {
     (void)handle; (void)pcm; (void)frame_size; (void)output; (void)capacity;
-    return -1;
+    if (capacity < 3) return -1;
+    FILE *marker = fopen(FAILURE_MARKER, "r");
+    if (!marker) {
+        marker = fopen(FAILURE_MARKER, "w");
+        if (marker) fclose(marker);
+        return -1;
+    }
+    fclose(marker);
+    output[0] = 248; output[1] = 255; output[2] = 254;
+    return 3;
 }
 void opus_encoder_destroy(void *handle) { (void)handle; }
-''', encoding='ascii')
+'''.replace('FAILURE_MARKER', json.dumps(str(folder / 'failed-once'))), encoding='ascii')
     subprocess.run(['gcc', '-shared', '-fPIC', str(fixture), '-o', str(library)], check=True)
     with harness(library) as (child, source, sink, listener, path):
         parameters = active_video(source)
         live_until(sink, lambda f: f[0] == 1)
 
-        def send_idr(sequence):
+        def send_idr(sequence, wait=True):
             nal = bytes([0x65, sequence])
             payload = struct.pack('>I', len(nal)) + nal
             now = time.monotonic_ns() // 1000
             header = probe.HEADER.pack(1, 0, 1, 0, sequence, 1000 + sequence, now)
             source.sendall(struct.pack('<I', len(header) + len(payload)) + header + payload)
-            received = live_until(sink, lambda f: f[0] == 2)
-            assert received[3] == parameters + b'\0\0\0\1' + nal
+            if wait:
+                received = live_until(sink, lambda f: f[0] == 2)
+                assert received[3] == parameters + b'\0\0\0\1' + nal
 
         send_idr(1)
         probe.send_json(source, {'type': 'mic', 'stream': 3, 'request': {
@@ -225,8 +236,27 @@ void opus_encoder_destroy(void *handle) { (void)handle; }
         stopped = json.loads(live_until(sink, lambda f: f[0] == 7 and not json.loads(f[3])['active'])[3])
         assert stopped['generation'] == generation
         assert child.poll() is None, 'native microphone error killed output process'
-        send_idr(2)
+        send_idr(2, wait=False)
+        video_seen, resumed = False, None
+        while not video_seen or resumed is None:
+            item = live_receive(sink)
+            assert item[0] != 4 or item[1] != 0, 'microphone error deactivated projection'
+            if item[0] == 2:
+                assert item[3] == parameters + b'\0\0\0\1\x65\x02'
+                video_seen = True
+            elif item[0] == 7 and json.loads(item[3])['active']:
+                resumed = json.loads(item[3])
         assert child.poll() is None, 'video did not survive native microphone error'
+        assert resumed['generation'] > generation
+        # The new native instance succeeds without another phone mic request.
+        sink.sendall(live_frame(130, struct.pack('<Q', generation) + capture)
+                     + live_frame(130, struct.pack('<Q', resumed['generation']) + capture))
+        recovered = oxp_until(source, lambda v: isinstance(v, tuple) and v[0] == 3)
+        assert recovered[1] == 3 and recovered[-1] == bytes([248, 255, 254])
+        send_idr(3)
+        probe.send_json(source, {'type': 'mic', 'stream': 3, 'request': None})
+        stopped = json.loads(live_until(sink, lambda f: f[0] == 7 and not json.loads(f[3])['active'])[3])
+        assert stopped['generation'] == resumed['generation']
 
 # Invalid configuration and truncated/oversized wire input must terminate only
 # this output process and remove its owned socket, without a codec/device.
@@ -244,4 +274,4 @@ for case in ('invalid-format', 'truncated', 'oversized'):
         assert child.returncode != 0, case
         assert not path.exists(), case + ': OXP socket retained'
 
-print('Rust CarPlay output: real OXP hello/capabilities, binary video, stale-frame fencing, reverse input, PCM microphone generations, native microphone error isolation, call stop and malformed/EOF cleanup passed')
+print('Rust CarPlay output: real OXP hello/capabilities, binary video, stale-frame fencing, reverse input, PCM microphone generations, native microphone error recovery, call stop and malformed/EOF cleanup passed')

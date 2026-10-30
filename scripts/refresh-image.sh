@@ -114,7 +114,8 @@ fi
 [[ $# == 3 ]] || { echo 'Usage: refresh-image.sh BASE_DIRECTORY OUTPUT_DIRECTORY DRIVER_DIRECTORY' >&2; exit 2; }
 [[ $EUID == 0 ]] || { echo 'Image mounting requires root' >&2; exit 2; }
 [[ ${BASE_RUN_ID:-} =~ ^[0-9]+$ && ${REFRESH_COMMIT:-} =~ ^[0-9a-f]{40}$ ]]
-[[ -z ${DRIVER_RUN_ID:-} || ${DRIVER_RUN_ID} =~ ^[0-9]+$ ]]
+[[ ${DRIVER_RUN_ID:-} =~ ^[0-9]+$ ]] || { echo 'Formal firmware requires a matched AIC driver run' >&2; exit 2; }
+[[ -n ${HICAR_NATIVE_DIR:-} ]] || { echo 'Formal firmware requires the HiCar native runtime' >&2; exit 2; }
 [[ ${DRIVER_VARIANT:-main} == main || ${DRIVER_VARIANT:-main} == mcu1 ]]
 export DISABLE_ONBOARD_WIFI=${DISABLE_ONBOARD_WIFI:-false}
 [[ "$DISABLE_ONBOARD_WIFI" == false || "$DISABLE_ONBOARD_WIFI" == true ]]
@@ -252,6 +253,15 @@ for entry in m['modules']+m['firmware']:
     if not target.is_file() or target.stat().st_size==0: raise SystemExit('Installed payload missing: '+entry)
     if hashlib.sha256(target.read_bytes()).digest()!=hashlib.sha256((source/relative).read_bytes()).digest():
         raise SystemExit('Installed payload differs: '+entry)
+PY
+    cp "$work/driver/driver-build.json" "$rootfs/etc/carlink-aic-driver.json"
+    "$python" - "$work/driver" "$rootfs/etc/carlink-aic-checksums.json" <<'PY'
+import hashlib,json,pathlib,sys
+source=pathlib.Path(sys.argv[1]);manifest=json.loads((source/'driver-build.json').read_text());checks={}
+for relative in manifest['modules']+manifest['firmware']:
+    checks['lib/'+relative]=hashlib.sha256((source/relative).read_bytes()).hexdigest()
+checks['etc/udev/rules.d/90-carlink-aic8800.rules']=hashlib.sha256((source/'udev/90-carlink-aic8800.rules').read_bytes()).hexdigest()
+pathlib.Path(sys.argv[2]).write_text(json.dumps(checks,indent=2)+'\n')
 PY
     mkdir -p "$output/driver"
     cp "$driver_dir/driver.tar.gz" "$driver_dir/driver-build.json" "$driver_dir/SHA256SUMS" "$output/driver/"

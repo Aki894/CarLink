@@ -40,7 +40,9 @@ try:
         if scenario=='pair-hicar' and '--pair' in sys.argv:
             for address in ['not-a-bluetooth-address','02:00:00:00:00:03','02:00:00:00:00:02','02:00:00:00:00:04']:
                 print(json.dumps(dict(event='target_selected',address=address)),flush=True)
-        print(json.dumps(dict(event='bridge_stats',active=True,connected=scenario!='no-hu',video_frames=20)),flush=True)
+        args=sys.argv[3:];peer=args[args.index('--peer')+1] if '--peer' in args else None
+        if not (scenario=='hicar-first-offline' and peer=='02:00:00:00:00:02'):
+            print(json.dumps(dict(event='bridge_stats',active=True,connected=scenario!='no-hu',video_frames=20)),flush=True)
     usb_ready=False
     while not stopping:
         if role=='carlife':
@@ -273,26 +275,39 @@ def check(binary):
             time.sleep(2.3)
             assert ctl(op='status')['status']['backend_pid'] is None, 'manual policy was lost at restart'
             # A missing favorite never falls back to another registered phone.
+            cp_other=dict(cp,address='02:00:00:00:00:05',name='other iPhone',last_used=9999999999)
+            ctl(op='remember',device=cp_other)
             (root/'scenario').write_text('offline')
+            ctl(op='pause')
             ctl(op='policy',mode='favorite',protocol='carplay',address=cp['address'])
             marker=len(events())
             ctl(op='resume')
             until(lambda s:s['protocol']=='carplay' and s['backend_pid'] is not None)
             time.sleep(5)
             attempts=[e for e in events()[marker:] if e['event']=='start' and e['role']!='carlife']
-            assert attempts and all(e['role']=='carplay' for e in attempts), 'favorite policy fell back to another phone'
+            assert attempts and all(e['role']=='carplay' and e['args'][e['args'].index('--iphone')+1]==cp['address'] for e in attempts), 'favorite policy ignored the favorite address or fell back'
+            ctl(op='forget',protocol='carplay',address=cp_other['address'],confirm=True)
             (root/'scenario').write_text('')
             ctl(op='connect',protocol='hicar',address=hc['address'])
             chosen=until(lambda s:s['protocol']=='hicar' and s['active'])
             time.sleep(2.3)
             assert ctl(op='status')['status']['backend_pid']==chosen['backend_pid'], 'favorite stole the explicitly selected session'
+            ctl(op='policy',mode='favorite',protocol='carplay',address=cp['address'])
+            current=ctl(op='status')['status']
+            assert current['protocol']=='hicar' and current['backend_pid']==chosen['backend_pid'], 'future preference relabeled or replaced the active HiCar session'
+            ctl(op='connect',protocol='hicar',address=hc['address'])
+            assert ctl(op='status')['status']['backend_pid']==chosen['backend_pid'], 'reselecting the active target restarted it'
+            selected_store=json.loads((root/'devices.json').read_text())
+            assert selected_store['policy']=='last' and selected_store['selected_protocol']=='hicar', 'manual target did not override the future favorite'
             # Unknown HiCar pairing creates a pending record only after a valid
             # selected transport; stable delivered media is the persistence gate.
             (root/'scenario').write_text('pair-hicar')
             # A connection window accepts new or registered phones. Here a new
             # valid phone arrives first; later known/new candidates cannot steal it.
             ctl(op='remember',device=dict(hc,auto=False))
+            ctl(op='policy',mode='favorite',protocol='carplay',address=cp['address'])
             ctl(op='pair',protocol='hicar')
+            assert json.loads((root/'devices.json').read_text())['policy']=='last', 'cross-protocol pairing left an incompatible favorite'
             selected=until(lambda s:s['protocol']=='hicar' and s['active'] and s['target'] and s['target']['address']=='02:00:00:00:00:03')
             assert selected['pairing']
             assert not any(d['address']=='02:00:00:00:00:03' for d in ctl(op='devices')['devices']), 'pending target persisted before stable media'
@@ -335,6 +350,45 @@ def check(binary):
             p=subprocess.Popen([*runner,binary,'manager','run','--config',str(root/'config.json')],stdout=log,stderr=log)
             booted=until(lambda s:s['active'] and s['protocol']=='hicar')
             assert not booted['paused'], 'previous-boot pause suppressed automatic reconnect'
+            # Two Huawei targets: the latest/explicit A is absent, B is present.
+            # Rotate only within HiCar and preserve the USB owner. B then stays
+            # connected past the initial deadline despite no new media reports.
+            hc_other=dict(hc,address='02:00:00:00:00:04',name='other Huawei',last_used=1)
+            ctl(op='remember',device=hc_other)
+            (root/'scenario').write_text('hicar-first-offline')
+            ctl(op='disconnect');ctl(op='policy',mode='last')
+            marker=len(events())
+            ctl(op='connect',protocol='hicar',address=hc['address'])
+            absent=until(lambda s:s['protocol']=='hicar' and s['target'] and s['target']['address']==hc['address'] and not s['active'])
+            recovered=until(lambda s:s['protocol']=='hicar' and s['active'] and s['target'] and s['target']['address']==hc_other['address'])
+            assert recovered['carlife_pid']==absent['carlife_pid'], 'same-protocol rotation restarted USB'
+            attempts=[e for e in events()[marker:] if e['event']=='start' and e['role']!='carlife']
+            assert len(attempts)==2 and all(e['role']=='hicar' for e in attempts)
+            assert [e['args'][e['args'].index('--peer')+1] for e in attempts]==[hc['address'],hc_other['address']]
+            time.sleep(2.3)
+            assert ctl(op='status')['status']['backend_pid']==recovered['backend_pid'], 'quiet active HiCar expired on the initial attempt timer'
+            # A favorite must not use that working B as a fallback when A is away.
+            ctl(op='policy',mode='favorite',protocol='hicar',address=hc['address'])
+            ctl(op='disconnect');marker=len(events());ctl(op='resume')
+            until(lambda s:s['backend_pid'] is not None and s['target'] and s['target']['address']==hc['address'])
+            time.sleep(5)
+            attempts=[e for e in events()[marker:] if e['event']=='start' and e['role']!='carlife']
+            assert attempts and all(e['role']=='hicar' and e['args'][e['args'].index('--peer')+1]==hc['address'] for e in attempts), 'missing HiCar favorite fell back to B'
+            # Forgetting the favorite releases its policy; resume and a cold
+            # boot can select the other registered phone on the same protocol.
+            ctl(op='forget',protocol='hicar',address=hc['address'],confirm=True)
+            forgotten_store=json.loads((root/'devices.json').read_text())
+            assert forgotten_store['policy']=='last' and forgotten_store['favorite'] is None
+            (root/'scenario').write_text('');ctl(op='resume')
+            until(lambda s:s['active'] and s['target'] and s['target']['address']==hc_other['address'])
+            ctl(op='shutdown');assert p.wait(timeout=12)==0;p=None
+            stored=json.loads((root/'devices.json').read_text());stored['boot_id']='previous-forget-boot'
+            (root/'devices.json').write_text(json.dumps(stored))
+            p=subprocess.Popen([*runner,binary,'manager','run','--config',str(root/'config.json')],stdout=log,stderr=log)
+            until(lambda s:s['active'] and s['target'] and s['target']['address']==hc_other['address'])
+            ctl(op='remember',device=hc)
+            ctl(op='forget',protocol='hicar',address=hc_other['address'],confirm=True)
+            (root/'scenario').write_text('')
             ctl(op='forget',protocol='carplay',address=cp['address'],confirm=True)
             ctl(op='shutdown');assert p.wait(timeout=12)==0;p=None
             p=subprocess.Popen([*runner,binary,'manager','run','--config',str(root/'config.json')],stdout=log,stderr=log)
@@ -348,7 +402,7 @@ def check(binary):
             print(json.dumps(dict(connection_manager='passed',switches=9,usb_pid_preserved=True,target_only_bluetooth_disconnect=True,disconnect_failure_nonfatal=True,
                 independent_usb_recovery=True,pre_usb_success_not_committed=True,radio_overlap=False,offline_pairing_retained=True,
                 authentication_and_repeated_refusal_repaired=True,target_only=True,identity_unchanged=True,
-                manual_and_favorite_policy=True,boot_reconnect_preference=True,current_auto_record_respected=True,hicar_enrollment_stability_gate=True,pairing_window_accepts_new_and_existing_devices=True,user_preferences_survive_repair_and_stability=True,forget_confirmation_and_persistence=True)))
+                manual_and_favorite_policy=True,favorite_exact_target=True,favorite_forget_resume_and_boot=True,cross_protocol_pairing_reconciled=True,hicar_same_protocol_rotation=True,active_session_deadline_exempt=True,boot_reconnect_preference=True,current_auto_record_respected=True,hicar_enrollment_stability_gate=True,pairing_window_accepts_new_and_existing_devices=True,user_preferences_survive_repair_and_stability=True,forget_confirmation_and_persistence=True)))
         except BaseException:
             log.flush()
             print((root/'manager.log').read_text(encoding='utf-8',errors='replace')[-8000:],file=sys.stderr)

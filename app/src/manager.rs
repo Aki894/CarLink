@@ -35,6 +35,17 @@ fn connect_seconds()->u64{30}fn stable_seconds()->u64{10}fn pair_seconds()->u64{
 struct Store{#[serde(default)]selected_protocol:Option<Protocol>,#[serde(default)]boot_protocol:BootProtocol,#[serde(default)]devices:Vec<Device>,#[serde(default)]last:Option<Device>,#[serde(default)]paused:bool,#[serde(default)]policy:Policy,#[serde(default)]favorite:Option<Device>,#[serde(default)]preferred:Option<Device>,#[serde(default)]boot_id:Option<String>,#[serde(default="default_volume")]volume_percent:u8}
 fn default_volume()->u8{100}
 impl Default for Store{fn default()->Self{Self{selected_protocol:None,boot_protocol:BootProtocol::Last,devices:vec![],last:None,paused:false,policy:Policy::Last,favorite:None,preferred:None,boot_id:None,volume_percent:100}}}
+impl Store{
+    fn reconcile_favorite(&mut self,choice:Option<&Choice>){
+        if self.policy!=Policy::Favorite{return;}
+        let known=self.favorite.as_ref().filter(|f|self.devices.iter().any(|d|d.protocol==f.protocol&&d.address.eq_ignore_ascii_case(&f.address))).cloned();
+        let Some(favorite)=known else{self.favorite=None;self.policy=Policy::Last;return;};
+        // Legacy Favorite stores may predate selected_protocol. Otherwise an
+        // explicit boot protocol or selection remains stronger than a favorite.
+        if self.selected_protocol.is_none(){self.selected_protocol=Some(favorite.protocol);}
+        if self.selected_protocol!=Some(favorite.protocol)||choice.is_some_and(|c|c.protocol!=favorite.protocol||c.device.as_ref().is_none_or(|d|!d.address.eq_ignore_ascii_case(&favorite.address))){self.policy=Policy::Last;}
+    }
+}
 fn private_dir(path:&Path)->Result<()>{
     fs::create_dir_all(path).map_err(|_|"cannot create private manager directory")?;
     let meta=fs::symlink_metadata(path).map_err(|_|"cannot inspect private manager directory")?;
@@ -157,10 +168,12 @@ impl Owner{
         if let Some(last)=&store.last{last.validate()?;if !store.devices.iter().any(|d|d.protocol==last.protocol&&d.address.eq_ignore_ascii_case(&last.address)){store.last=None;}}
         for d in config.devices.iter().filter(|_|!config.state.exists()){if !store.devices.iter().any(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address)){store.devices.push(d.clone());}}
         if store.devices.len()>8{return Err("too many configured devices".into());}
+        store.reconcile_favorite(None);
         let boot=fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|s|s.trim().to_owned());
         if boot.is_some()&&store.boot_id!=boot{store.paused=false;store.boot_id=boot;
             store.selected_protocol=match store.boot_protocol{BootProtocol::Carplay=>Some(Protocol::Carplay),BootProtocol::Hicar=>Some(Protocol::Hicar),BootProtocol::Last=>store.selected_protocol.or(store.preferred.as_ref().or(store.last.as_ref()).map(|d|d.protocol))};
         }
+        store.reconcile_favorite(None);
         let paused=store.paused;let protocol=store.selected_protocol.or(store.preferred.as_ref().or(store.last.as_ref()).map(|d|d.protocol)).or(config.initial).unwrap_or(Protocol::Carplay);let default_protocol=store.boot_protocol;
         let volume_percent=store.volume_percent;
         Ok(Self{config,store,status:Status{schema:1,generation:0,default_protocol,protocol:Some(protocol),target:None,active:false,pairing:false,paused,call_active:false,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,volume_percent,last_error:None,last_stage:None},
@@ -170,7 +183,14 @@ impl Owner{
     fn automatic(&self)->Option<Choice>{
         if self.store.paused||self.store.policy==Policy::Manual{return None;}
         let protocol=self.selected_protocol();
-        let eligible=|d:&&Device|d.protocol==protocol&&d.auto&&!self.tried.contains(&d.address);
+        let eligible=|d:&&Device|d.protocol==protocol&&d.auto&&!self.tried.iter().any(|a|a.eq_ignore_ascii_case(&d.address));
+        if self.store.policy==Policy::Favorite {
+            let favorite=self.store.favorite.as_ref()?;
+            // Resolve the current record rather than cached auto/name metadata.
+            // A favorite policy never pairs or falls back to another target.
+            let device=self.store.devices.iter().find(|d|d.protocol==favorite.protocol&&d.address.eq_ignore_ascii_case(&favorite.address)).filter(eligible).cloned()?;
+            return Some(Choice{protocol,device:Some(device),pairing:false});
+        }
         let device=self.store.preferred.as_ref().or(self.store.last.as_ref()).and_then(|d|self.store.devices.iter().find(|v|v.protocol==protocol&&v.address.eq_ignore_ascii_case(&d.address))).filter(eligible).cloned()
             .or_else(||self.store.devices.iter().filter(eligible).max_by_key(|d|d.last_used).cloned());
         if let Some(device)=device{return Some(Choice{protocol,device:Some(device),pairing:false});}
@@ -178,6 +198,7 @@ impl Owner{
         if self.store.devices.iter().any(|d|d.protocol==protocol){return None;}
         Some(Choice{protocol,device:None,pairing:true})
     }
+    fn display_protocol(&self)->Protocol{if self.backend.is_some()||self.status.active||self.status.pairing{self.status.protocol.unwrap_or_else(||self.selected_protocol())}else{self.selected_protocol()}}
     fn handoff_to(&self,next:Protocol)->bool{self.status.active&&self.status.protocol==Some(Protocol::Hicar)&&next==Protocol::Carplay}
     fn stop_backend(&mut self)->Result<()>{
         self.stop_backend_for_handoff(false)
@@ -208,8 +229,10 @@ impl Owner{
     fn select(&mut self,choice:Choice)->Result<()>{
         if self.status.call_active{return Err("finish the active call before switching phones".into());}
         if choice.protocol==Protocol::Hicar&&((choice.device.is_none()&&!choice.pairing)||self.config.hicar.is_empty()){return Err("HiCar requires a selected target or explicit pairing window and configured backend".into());}
+        // Provision only the real production backend before PIN display or
+        // session interruption. Existing identities and pairing stay intact.
+        if choice.protocol==Protocol::Hicar{self.prepare_hicar_identity()?;}
         // Validate the persisted PIN before interrupting the current projection.
-        // Identity creation and rotation belong to provisioning, never this UI.
         let pair_pin=if choice.protocol==Protocol::Hicar&&choice.pairing{Some(self.read_pair_pin()?)}else{None};
         let handoff=self.handoff_to(choice.protocol);
         self.status.active=false;self.show_recovery_menu();
@@ -229,17 +252,24 @@ impl Owner{
         }
         if choice.protocol==Protocol::Hicar{if let Some(path)=&self.config.source_socket{if let Some(i)=args.iter().position(|v|v=="--live-socket"){args[i+1]=path.to_string_lossy().into_owned();}}}
         let process=spawn(&args,self.status.generation,self.config.source_socket.as_deref())?;
-        self.store.selected_protocol=Some(choice.protocol);save(&self.config.state,&self.store)?;
+        self.store.selected_protocol=Some(choice.protocol);self.store.reconcile_favorite(Some(&choice));save(&self.config.state,&self.store)?;
         self.status.protocol=Some(choice.protocol);self.status.target=choice.device.clone();self.status.pairing=choice.pairing;
         self.status.backend_pid=Some(process.child.id());self.status.menu_visible=true;self.menu_idle=true;self.status.last_error=None;self.status.last_stage=None;self.backend=Some(process);self.choice=Some(choice.clone());
         self.started=Instant::now();self.recovery_deadline=None;self.ready=None;self.seen_media=false;self.committed=false;self.repair_used=false;self.refusals=0;
         self.pair_pin=pair_pin;self.pair_deadline=choice.pairing.then(||Instant::now()+Duration::from_secs(self.config.pair_seconds));event("manager_backend_started");Ok(())
     }
+    fn hicar_identity_path(&self)->Result<&Path>{
+        if let Some(index)=self.config.hicar.iter().position(|v|v=="--identity"){
+            Ok(Path::new(self.config.hicar.get(index+1).ok_or("HiCar identity path is missing")?))
+        }else{Ok(Path::new("/var/lib/carlink/hicar/production/identity.json"))}
+    }
+    fn prepare_hicar_identity(&self)->Result<()>{
+        if self.config.hicar.get(1).is_some_and(|v|v=="hicar")&&self.config.hicar.get(2).is_some_and(|v|v=="run"){
+            crate::hicar::identity::Identity::ensure(self.hicar_identity_path()?,"CarLink")?;
+        }Ok(())
+    }
     fn read_pair_pin(&self)->Result<PairPin>{
-        let path=if let Some(index)=self.config.hicar.iter().position(|v|v=="--identity"){
-            Path::new(self.config.hicar.get(index+1).ok_or("HiCar identity path is missing")?)
-        }else{Path::new("/var/lib/carlink/hicar/production/identity.json")};
-        let identity=crate::hicar::identity::Identity::load(path)?;
+        let identity=crate::hicar::identity::Identity::load(self.hicar_identity_path()?)?;
         Ok(PairPin(identity.pin.clone()))
     }
     fn cancel_pairing(&mut self)->Result<()>{
@@ -371,7 +401,7 @@ impl Owner{
                 self.store.devices.retain(|x|!(x.protocol==d.protocol&&x.address.eq_ignore_ascii_case(&d.address)));
                 if self.store.devices.len()>=8{return Err("device store is full".into());}self.store.devices.push(d);save(&self.config.state,&self.store)?;},
             "switch_protocol"=>{
-                let protocol=if v.get("protocol").is_some(){serde_json::from_value(v["protocol"].clone()).map_err(|_|"invalid protocol")?}else{match self.selected_protocol(){Protocol::Carplay=>Protocol::Hicar,Protocol::Hicar=>Protocol::Carplay}};
+                let protocol=if v.get("protocol").is_some(){serde_json::from_value(v["protocol"].clone()).map_err(|_|"invalid protocol")?}else{match self.display_protocol(){Protocol::Carplay=>Protocol::Hicar,Protocol::Hicar=>Protocol::Carplay}};
                 if self.backend.is_some()&&!self.status.paused&&self.status.protocol==Some(protocol){return Ok(json!({"ok":true,"status":self.status}));}
                 if self.status.call_active{return Err("finish the active call before switching protocols".into());}
                 let handoff=self.handoff_to(protocol);
@@ -385,17 +415,24 @@ impl Owner{
             "connect"=>{let address=v["address"].as_str().ok_or("missing target address")?;
                 let protocol:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing protocol")?;
                 let d=self.store.devices.iter().find(|d|d.protocol==protocol&&d.address.eq_ignore_ascii_case(address)).cloned().ok_or("unknown target device")?;
-                if self.status.active&&!self.status.pairing&&self.backend.is_some()&&!self.status.paused&&self.choice.as_ref().is_some_and(|c|c.protocol==protocol&&c.device.as_ref().is_some_and(|current|current.address.eq_ignore_ascii_case(address))){return Ok(json!({"ok":true,"status":self.status}));}
-                self.tried.clear();self.select(Choice{protocol,device:Some(d),pairing:false})?;self.store.paused=false;self.status.paused=false;save(&self.config.state,&self.store)?;},
+                let override_favorite=self.store.policy==Policy::Favorite&&!self.store.favorite.as_ref().is_some_and(|f|f.protocol==protocol&&f.address.eq_ignore_ascii_case(address));
+                if self.status.active&&!self.status.pairing&&self.backend.is_some()&&!self.status.paused&&self.choice.as_ref().is_some_and(|c|c.protocol==protocol&&c.device.as_ref().is_some_and(|current|current.address.eq_ignore_ascii_case(address))){
+                    if override_favorite{self.store.selected_protocol=Some(protocol);self.store.reconcile_favorite(Some(&Choice{protocol,device:Some(d),pairing:false}));save(&self.config.state,&self.store)?;}
+                    return Ok(json!({"ok":true,"status":self.status}));
+                }
+                self.tried.clear();self.select(Choice{protocol,device:Some(d),pairing:false})?;
+                self.store.paused=false;self.status.paused=false;save(&self.config.state,&self.store)?;},
             "pair"=>{let protocol:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing protocol")?;
                 if self.store.devices.len()>=8{return Err("device store is full; forget a device first".into());}
                 self.select(Choice{protocol,device:None,pairing:true})?;self.menu_idle=true;},
             "cancel_pair"=>self.cancel_pairing()?,
             "policy"=>{let mode:Policy=serde_json::from_value(v["mode"].clone()).map_err(|_|"invalid connection policy")?;
                 if mode==Policy::Favorite{let p:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing favorite protocol")?;let a=v["address"].as_str().ok_or("missing favorite target")?;
+                    let favorite=self.store.devices.iter().find(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)).cloned().ok_or("unknown favorite target")?;
                     self.store.selected_protocol=Some(p);if self.backend.is_none(){self.status.protocol=Some(p);}
-                    self.store.favorite=Some(self.store.devices.iter().find(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)).cloned().ok_or("unknown favorite target")?);}
-                self.store.policy=mode;save(&self.config.state,&self.store)?;},
+                    self.store.favorite=Some(favorite);}
+                if mode==Policy::Last&&self.backend.is_some(){self.store.selected_protocol=self.status.protocol;}
+                self.store.policy=mode;self.tried.clear();self.retry_at=Instant::now();save(&self.config.state,&self.store)?;},
             "forget"=>{if v["confirm"]!=true{return Err("forget requires explicit confirmation".into());}
                 let p:Protocol=serde_json::from_value(v["protocol"].clone()).map_err(|_|"missing target protocol")?;let a=v["address"].as_str().ok_or("missing target")?;
                 if !self.store.devices.iter().any(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)){return Err("unknown target device".into());}
@@ -405,6 +442,7 @@ impl Owner{
                 if self.store.last.as_ref().is_some_and(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)){self.store.last=None;}
                 if self.store.preferred.as_ref().is_some_and(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)){self.store.preferred=None;}
                 if self.store.favorite.as_ref().is_some_and(|d|d.protocol==p&&d.address.eq_ignore_ascii_case(a)){self.store.favorite=None;}
+                self.store.reconcile_favorite(None);
                 self.store.paused=true;self.status.paused=true;save(&self.config.state,&self.store)?;},
             "repair"=>self.repair()?,
             "disconnect"=>{self.stop_backend()?;self.choice=None;self.status.protocol=Some(self.selected_protocol());self.status.target=None;self.status.pairing=false;self.pair_deadline=None;
@@ -423,7 +461,9 @@ impl Owner{
             actions.extend([json!({"op":"volume","percent":self.store.volume_percent.saturating_sub(5)}),json!({"op":"volume","percent":self.store.volume_percent.saturating_add(5).min(100)}),json!({"op":"menu_root"})]);
             return (rows,actions);
         }
-        let protocol=self.selected_protocol();let current=if protocol==Protocol::Carplay{"CarPlay"}else{"HiCar"};let other=if protocol==Protocol::Carplay{"HiCar"}else{"CarPlay"};
+        // A future favorite may select another protocol without replacing the
+        // currently running backend; the menu always labels the live owner.
+        let protocol=self.display_protocol();let current=if protocol==Protocol::Carplay{"CarPlay"}else{"HiCar"};let other=if protocol==Protocol::Carplay{"HiCar"}else{"CarPlay"};
         let first=format!("当前协议：{current}，点击切换到 {other}");
         let (second,action)=if self.status.active{
             (format!("断开 {}",self.status.target.as_ref().map(|d|d.name.as_str()).unwrap_or(current)),json!({"op":"disconnect"}))
@@ -532,13 +572,21 @@ impl Owner{
         if self.pair_deadline.is_some_and(|t|Instant::now()>=t)&&!self.status.active{
             self.stop_backend()?;self.pair_deadline=None;self.status.pairing=false;self.choice=None;self.retry_at=Instant::now()+Duration::from_secs(8);
         }
-        if !self.status.active&&!self.status.pairing&&self.backend.is_some()&&(if self.status.protocol==Some(Protocol::Hicar){self.recovery_deadline.is_some_and(|t|Instant::now()>=t)}else{self.started.elapsed()>Duration::from_secs(self.config.connect_seconds+if self.refusals>0{15}else{0})}){
+        if self.backend.is_some()&&self.attempt_expired(){
             if let Some(d)=&self.status.target{self.tried.push_back(d.address.clone());}
             self.stop_backend()?;self.retry_at=Instant::now()+Duration::from_secs(2);
         }
         if self.backend.is_none()&&!self.store.paused&&Instant::now()>=self.retry_at&&self.life.is_some(){
             if let Some(c)=self.automatic(){self.select(c)?;}else{self.tried.clear();self.retry_at=Instant::now()+Duration::from_secs(8);}
         }Ok(())
+    }
+    fn attempt_expired(&self)->bool{
+        if self.status.active||self.status.pairing||self.status.call_active{return false;}
+        if let Some(deadline)=self.recovery_deadline{return Instant::now()>=deadline;}
+        // HiCar can keep its discovery owner alive forever while a saved peer
+        // is absent. Apply the initial target budget just as for CarPlay. Once
+        // ACTIVE, a quiet/static session never expires on this timer.
+        self.started.elapsed()>Duration::from_secs(self.config.connect_seconds+if self.status.protocol==Some(Protocol::Carplay)&&self.refusals>0{15}else{0})
     }
     fn defer_carlife(&mut self){
         // A failing HU must see a meaningful detach interval. Do not reset on
@@ -788,6 +836,66 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         owner.menu_input(json!({"type":"open-menu"})).unwrap();assert!(owner.status.menu_visible);assert!(!owner.menu_idle);
         owner.store.paused=true;owner.store.boot_id=Some("previous-boot".into());save(&owner.config.state,&owner.store).unwrap();
         let restarted=test_owner(&root);assert!(!restarted.store.paused);assert_eq!(restarted.automatic().unwrap().protocol,Protocol::Hicar);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn favorite_uses_exact_current_target_and_keeps_live_protocol_label(){
+        let root=test_root("favorite-address");let mut owner=test_owner(&root);
+        let a=Device{protocol:Protocol::Hicar,address:"02:00:00:00:00:02".into(),name:"Huawei A".into(),auto:true,last_used:1};
+        let b=Device{protocol:Protocol::Hicar,address:"02:00:00:00:00:03".into(),name:"Huawei B".into(),auto:true,last_used:999};
+        let apple=Device{protocol:Protocol::Carplay,address:"02:00:00:00:00:01".into(),name:"Apple".into(),auto:true,last_used:2000};
+        owner.store.devices=vec![a.clone(),b.clone(),apple.clone()];owner.store.last=Some(b.clone());owner.store.preferred=Some(b.clone());
+        owner.command(json!({"op":"policy","mode":"favorite","protocol":"hicar","address":a.address})).unwrap();
+        assert_eq!(owner.automatic().unwrap().device.unwrap().address,a.address);
+        owner.tried.push_back(a.address.to_ascii_lowercase());assert!(owner.automatic().is_none()); // no B fallback
+        owner.tried.clear();owner.store.devices[0].auto=false;assert!(owner.automatic().is_none()); // fresh record, not cached auto=true
+        owner.store.devices[0].auto=true;
+        owner.config.hicar=vec!["/bin/sh".into(),"-c".into(),"exec sleep 60".into()];
+        owner.backend=Some(spawn(&owner.config.hicar,0,None).unwrap());owner.status.backend_pid=owner.backend.as_ref().map(|p|p.child.id());
+        owner.status.protocol=Some(Protocol::Hicar);owner.status.active=true;owner.status.target=Some(a);
+        let pid=owner.status.backend_pid;
+        owner.command(json!({"op":"policy","mode":"favorite","protocol":"carplay","address":apple.address})).unwrap();
+        assert_eq!(owner.status.protocol,Some(Protocol::Hicar));assert_eq!(owner.status.backend_pid,pid);
+        assert_eq!(owner.selected_protocol(),Protocol::Carplay);assert_eq!(owner.display_protocol(),Protocol::Hicar);
+        assert!(owner.menu_model().0[1].starts_with("当前协议：HiCar"));
+        let selected=owner.store.selected_protocol;
+        assert!(owner.command(json!({"op":"policy","mode":"favorite","protocol":"hicar","address":"02:00:00:00:00:ff"})).is_err());
+        assert_eq!(owner.store.selected_protocol,selected);assert_eq!(owner.status.backend_pid,pid);
+        owner.stop_backend().unwrap();assert_eq!(owner.automatic().unwrap().device.unwrap().address,apple.address);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn explicit_boot_protocol_and_missing_favorite_normalize_without_cross_protocol_fallback(){
+        for (tag,boot,expected,favorite_protocol) in [("boot-apple",BootProtocol::Carplay,Protocol::Carplay,Protocol::Hicar),("boot-huawei",BootProtocol::Hicar,Protocol::Hicar,Protocol::Carplay)]{
+            let root=test_root(tag);let mut owner=test_owner(&root);
+            let apple=Device{protocol:Protocol::Carplay,address:"02:00:00:00:00:01".into(),name:"Apple".into(),auto:true,last_used:1};
+            let huawei=Device{protocol:Protocol::Hicar,address:"02:00:00:00:00:02".into(),name:"Huawei".into(),auto:true,last_used:2};
+            owner.store.devices=vec![apple.clone(),huawei.clone()];owner.store.favorite=Some(if favorite_protocol==Protocol::Carplay{apple}else{huawei});
+            owner.store.policy=Policy::Favorite;owner.store.selected_protocol=Some(favorite_protocol);owner.store.boot_protocol=boot;owner.store.boot_id=Some("previous-boot".into());owner.store.paused=true;
+            save(&owner.config.state,&owner.store).unwrap();let booted=test_owner(&root);
+            assert!(!booted.store.paused);assert!(booted.store.policy==Policy::Last);assert_eq!(booted.selected_protocol(),expected);assert_eq!(booted.automatic().unwrap().protocol,expected);
+            save(&booted.config.state,&booted.store).unwrap();let restarted=test_owner(&root);assert!(restarted.store.policy==Policy::Last);assert_eq!(restarted.automatic().unwrap().protocol,expected);
+            let mut legacy=restarted;legacy.store.policy=Policy::Favorite;legacy.store.favorite=None;save(&legacy.config.state,&legacy.store).unwrap();
+            let missing=test_owner(&root);assert!(missing.store.policy==Policy::Last);assert_eq!(missing.automatic().unwrap().protocol,expected);
+            fs::remove_dir_all(root).unwrap();
+        }
+        let mut store=Store::default();store.policy=Policy::Manual;store.reconcile_favorite(None);assert!(store.policy==Policy::Manual);
+    }
+    #[test]fn initial_hicar_attempt_has_budget_but_live_and_recovering_sessions_keep_their_owners(){
+        let root=test_root("hicar-attempt-budget");let mut owner=test_owner(&root);owner.status.protocol=Some(Protocol::Hicar);
+        owner.started=Instant::now()-Duration::from_secs(31);assert!(owner.attempt_expired());
+        owner.status.active=true;assert!(!owner.attempt_expired()); // quiet/static projection
+        owner.status.active=false;owner.status.pairing=true;assert!(!owner.attempt_expired()); // pairing has its own window
+        owner.status.pairing=false;owner.status.call_active=true;assert!(!owner.attempt_expired());
+        owner.status.call_active=false;owner.recovery_deadline=Some(Instant::now()+Duration::from_secs(8));assert!(!owner.attempt_expired());
+        owner.recovery_deadline=Some(Instant::now()-Duration::from_millis(1));assert!(owner.attempt_expired());
+        owner.recovery_deadline=None;owner.started=Instant::now();assert!(!owner.attempt_expired());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn production_hicar_identity_is_ready_before_first_pairing_pin(){
+        let root=test_root("fresh-hicar-pin");let mut owner=test_owner(&root);let identity=root.join("fresh/identity.json");
+        owner.config.hicar=vec!["/not-launched".into(),"hicar".into(),"run".into(),"--identity".into(),identity.to_string_lossy().into_owned()];
+        owner.prepare_hicar_identity().unwrap();let bytes=fs::read(&identity).unwrap();let pin=owner.read_pair_pin().unwrap();
+        assert_eq!(pin.0.len(),6);assert!(pin.0.bytes().all(|b|b.is_ascii_digit()));assert_eq!(fs::metadata(&identity).unwrap().permissions().mode()&0o077,0);
+        owner.prepare_hicar_identity().unwrap();assert_eq!(fs::read(&identity).unwrap(),bytes);assert_eq!(owner.read_pair_pin().unwrap().0,pin.0);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]fn usb_retry_backoff_is_bounded_and_independent_of_wireless(){

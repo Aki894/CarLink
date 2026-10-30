@@ -1,5 +1,7 @@
 #!/bin/bash
 set -euo pipefail
+# Kernel baseline only. The formal release uses refresh-image.sh and its
+# shared runtime installer to add manager, native HiCar and matching AIC.
 [[ "${3:-}" == orangepizero ]] || { echo 'Unexpected board' >&2; exit 1; }
 install -m 0755 /tmp/overlay/carlink /usr/local/bin/carlink
 if [[ -d /tmp/overlay/carlink-app ]]; then

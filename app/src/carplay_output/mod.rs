@@ -190,6 +190,7 @@ impl Adapter{
     }
     fn step(&mut self)->Result<()>{
         self.poll_audio()?;
+        let retry=self.microphone.retry();if !retry.is_empty(){println!("{}",json!({"event":"microphone_recovered"}));self.request_microphone(retry)?;}
         for feedback in self.link.step(){match feedback{
             link::Feedback::Control(value)=>{
                 // The source remains active behind the local menu. Returning is
@@ -201,7 +202,7 @@ impl Adapter{
             },
             link::Feedback::Microphone{generation,pcm}=>{
                 let result=self.microphone.feed(generation,&pcm).and_then(|packets|{for bytes in packets{self.output.push(bytes)?;}Ok(())});
-                if result.is_err(){self.output.clear_microphone();let stopped=self.microphone.stop(None);self.request_microphone(stopped)?;println!("{}",json!({"event":"microphone_error","capture_stopped":true}));}
+                if result.is_err(){self.output.clear_microphone();let stopped=self.microphone.fault();self.request_microphone(stopped)?;println!("{}",json!({"event":"microphone_error","capture_stopped":true,"retry_scheduled":true}));}
             },
         }}
         if self.report_at.elapsed()>=Duration::from_secs(5){

@@ -37,6 +37,9 @@ class InstallTests(unittest.TestCase):
             os.environ.pop('HICAR_NATIVE_DIR', None)
         self.project.mkdir()
         shutil.copyfile(base / 'sources.lock.json', self.project / 'sources.lock.json')
+        example = self.project / 'docs/examples/manager.json'
+        example.parent.mkdir(parents=True)
+        shutil.copyfile(base / 'docs/examples/manager.json', example)
         native_lock = self.project / 'experiments/hicar/native/sources.json'
         native_lock.parent.mkdir(parents=True)
         shutil.copyfile(base / 'experiments/hicar/native/sources.json', native_lock)
@@ -57,11 +60,20 @@ class InstallTests(unittest.TestCase):
     def install(self):
         installer.install(self.project, self.app, self.receiver, self.image)
 
+    def test_missing_manager_example_rejected_before_install(self):
+        (self.project / 'docs/examples/manager.json').unlink()
+        with self.assertRaisesRegex(ValueError, 'Missing manager runtime example'):
+            self.install()
+        self.assertFalse((self.image / 'usr').exists())
+
     def test_valid_install_preserves_local_identity_boundary(self):
         self.install()
         manifest = json.loads((self.image / 'etc/carlink-build.json').read_text())
         self.assertEqual(manifest['app_sha256'], hashlib.sha256((self.app / 'carlink').read_bytes()).hexdigest())
         self.assertTrue((self.image / 'usr/local/bin/carlink-carplay').is_file())
+        self.assertEqual(json.loads((self.image / 'usr/share/carlink/manager.example.json').read_text()),
+                         json.loads((self.project / 'docs/examples/manager.json').read_text()))
+        self.assertEqual(manifest['runtime_profile'], 'production' if self.native else 'baseline')
         runtime = self.image / 'usr/local/lib/carlink/carplay'
         installer.armhf(runtime / 'lib/libcarlink_opus.so')
         self.assertTrue((runtime / 'opus.py').is_file())

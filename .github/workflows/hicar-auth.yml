@@ -1,11 +1,39 @@
-name: Experimental Linux HiCar authentication
+name: CarLink complete firmware
 on:
+  workflow_call:
+    inputs:
+      app_run_id:
+        description: App artifact run, including a completed app job in the calling run
+        type: string
+        required: true
+      base_run_id:
+        type: string
+        default: '39459953269'
+      base_artifact_name:
+        type: string
+        default: carlink-h3-image
+      driver_run_id:
+        type: string
+        default: '39670639717'
   workflow_dispatch:
     inputs:
       app_run_id:
         description: Successful app run used for the matching firmware refresh
         type: string
-        default: '39818918089'
+        required: true
+      base_run_id:
+        description: Successful kernel baseline run
+        type: string
+        default: '39459953269'
+      base_artifact_name:
+        description: Explicit baseline artifact name
+        type: choice
+        options: [carlink-h3-image, carlink-h3-baseline-image]
+        default: carlink-h3-image
+      driver_run_id:
+        description: Successful AIC driver build matching the selected kernel
+        type: string
+        default: '39670639717'
 permissions:
   contents: read
   actions: read
@@ -121,14 +149,16 @@ jobs:
             .build/hicar-native-host/libcarlink_hichain.so dist/hicar-auth/libcarlink_hichain.so
           python3 scripts/test-hicar-rust-session.py .build/hicar-rust-arm/carlink \
             .build/hicar-native-host/libcarlink_hichain.so dist/hicar-auth/libcarlink_hichain.so
+          python3 scripts/test-hicar-identity-init.py .build/hicar-rust-arm/carlink
           python3 scripts/test-manager.py .build/hicar-rust-arm/carlink
   firmware:
     needs: [native, rust-interop]
     uses: ./.github/workflows/refresh-image.yml
     with:
-      base_run_id: '39459953269'
+      base_run_id: ${{ inputs.base_run_id }}
+      base_artifact_name: ${{ inputs.base_artifact_name }}
       app_run_id: ${{ inputs.app_run_id }}
-      driver_run_id: '39670639717'
+      driver_run_id: ${{ inputs.driver_run_id }}
       variant: main
       disable_onboard_wifi: true
       hicar_native: true

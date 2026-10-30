@@ -35,6 +35,10 @@ impl Uplink{
         for fd in [input.as_raw_fd(),output.as_raw_fd()]{let flags=unsafe{libc::fcntl(fd,libc::F_GETFL)};if flags<0||unsafe{libc::fcntl(fd,libc::F_SETFL,flags|libc::O_NONBLOCK)}<0{let _=child.kill();let _=child.wait();return Err("cannot configure microphone pipes".into());}}
         Ok(Self{child,input,output,queue:VecDeque::new(),encoded:vec![],generation,port,sequence:0,samples:0,origin_us:None})
     }
+    pub fn next_sequence(&self)->u16{self.sequence}
+    pub fn next_capture_us(&self)->Option<u64>{self.origin_us.map(|origin|origin.saturating_add(self.samples.saturating_mul(1_000_000)/ENCODED_RATE as u64))}
+    pub fn resume_clock(&mut self,next:Option<u64>){self.origin_us=next.map(|next|next.max(monotonic_us()));}
+    pub fn resume_sequence(&mut self,sequence:u16){self.sequence=sequence;}
     pub fn feed(&mut self,generation:u64,data:Vec<u8>)->Result<()>{
         if generation!=self.generation{return Ok(());}
         if data.is_empty()||data.len()>16384||data.len()%2!=0{return Err("invalid microphone PCM".into());}
@@ -73,6 +77,33 @@ impl Uplink{
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn native_encoder_can_restart_without_rewinding_the_negotiated_stream(){
+        let Some(binary)=std::env::var_os("CARLINK_AUDIO_TEST_BINARY") else{return;};
+        let crypto=Crypto::load().unwrap();let key=[7u8;16];
+        let drain=|uplink:&mut Uplink,generation|{
+            let began=Instant::now();let mut next=began;
+            while began.elapsed()<Duration::from_secs(4){
+                if Instant::now()>=next{uplink.feed(generation,vec![0;1024]).unwrap();next+=Duration::from_millis(32);}
+                let packets=uplink.poll(&crypto,&key,0).unwrap();if !packets.is_empty(){return packets;}
+                std::thread::sleep(Duration::from_millis(2));
+            }panic!("native microphone encoder produced no live packets");
+        };
+        let mut first=Uplink::new(Path::new(&binary),41,12345).unwrap();let packets=drain(&mut first,41);
+        assert!(!packets.is_empty());let sequence=first.next_sequence();let cursor=first.next_capture_us();assert!(cursor.is_some());
+        // Kill/reap just the codec, retaining the authenticated phone transport
+        // and its virtual microphone sequence/clock ownership in the caller.
+        first.child.kill().unwrap();drop(first);
+        let mut resumed=Uplink::new(Path::new(&binary),42,12345).unwrap();resumed.resume_sequence(sequence);resumed.resume_clock(cursor);
+        resumed.feed(41,vec![0;640]).unwrap();assert!(resumed.queue.is_empty());
+        let packets=drain(&mut resumed,42);let wire=&packets[0];
+        let rtp=crypto.transform(&key,&wire[3..19],&wire[19..]).unwrap();
+        assert_eq!(u16::from_be_bytes(rtp[2..4].try_into().unwrap()),sequence);
+        assert_eq!(u32::from_be_bytes(rtp[8..12].try_into().unwrap()),MICROPHONE_STREAM);
+        let resumed_stamp=u32::from_be_bytes(rtp[4..8].try_into().unwrap());
+        let expected=absolute_timestamp(cursor.unwrap(),0,0);
+        assert!(resumed_stamp.wrapping_sub(expected)<RTP_RATE*5);
+        assert_eq!(super::super::media::adts(&rtp[12..]).unwrap()[0].rate,ENCODED_RATE);
+    }
     #[test]fn encoded_audio_clock_uses_output_samples_and_wraps(){
         assert_eq!(MICROPHONE_STREAM,1100);assert_eq!(CAPTURE_RATE,16000);assert_eq!(ENCODED_RATE,48000);
         assert_eq!(absolute_timestamp(123_000_000,0,0),11_070_000);

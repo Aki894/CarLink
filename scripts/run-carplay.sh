@@ -4,7 +4,7 @@ set -eu
 umask 077
 root=${CARLINK_CARPLAY_ROOT:-/usr/local/lib/carlink/carplay}
 state=${CARLINK_CARPLAY_STATE:-/var/lib/carlink/carplay}
-iface=${CARLINK_CARPLAY_WIFI:-wlx002e2d91fc8e}
+iface=${CARLINK_CARPLAY_WIFI:-auto}
 channel=${CARLINK_CARPLAY_CHANNEL:-149}
 country=${CARLINK_CARPLAY_COUNTRY:-CN}
 mode=${1:-probe}
@@ -16,6 +16,7 @@ esac
 for command in nmcli iw bluetoothctl; do
     command -v "$command" >/dev/null || { echo "Missing prerequisite: $command" >&2; exit 1; }
 done
+if [ "$iface" = auto ]; then iface=$(/usr/local/bin/carlink wifi-interface); fi
 test -d "/sys/class/net/$iface" || { echo "Wi-Fi interface missing: $iface" >&2; exit 1; }
 for file in identity.pk8 certificate.p7b; do
     test -s "$state/mfi/$file" || { echo "Missing local identity file: $state/mfi/$file" >&2; exit 1; }

@@ -81,6 +81,7 @@ test -x "$receiver/probe.py"
 test -x "$receiver/forward.py"
 test -x "$receiver/supervisor.py"
 test -x "$mountdir/usr/local/bin/carlink-run"
+python3 "$(dirname "$0")/verify-production-runtime.py" "$mountdir"
 python3 "$(dirname "$0")/install-boot-profile.py" --root "$mountdir" --verify
 for payload in lib/libcarlink_menu.so share/fonts/NotoSansCJKsc-Regular.otf share/source/menu/SOURCE.json share/licenses/menu/OFL.txt forward.py supervisor.py share/source/audio/SOURCE.json share/source/audio/ffmpeg.tar.gz share/licenses/audio/COPYING.LGPLv2.1 SOURCE.json SHA256SUMS share/source/relay.tar.gz share/source/stream.tar.gz \
     share/licenses/relay/LICENSE share/licenses/relay/LICENSE-GPL-3.0 share/licenses/relay/NOTICE \
@@ -111,8 +112,8 @@ readelf -h "$receiver/lib/libcarlink_menu.so" | grep -q 'Machine:.*ARM'
 readelf -h "$receiver/lib/libcarlink_menu.so" | grep -q 'Flags:.*hard-float ABI'
 fi
 
-# The native auth runtime is optional for legacy images. When declared, verify
-# its complete artifact manifest, ABI and exact source lock from the image.
+# Formal images require native auth above. Legacy baseline images may omit it;
+# when declared, check its full manifest, ABI and exact source lock below.
 python3 - "$mountdir" "$(dirname "$0")" <<'PY'
 import hashlib,importlib.util,json,sys
 from pathlib import Path
@@ -138,13 +139,16 @@ if expected is not None:
 PY
 test -x "$mountdir/usr/sbin/sshd"
 sudo grep -q '192.168.77.2/24' "$mountdir/etc/NetworkManager/system-connections/carlink-direct.nmconnection"
-grep -q '^CONFIG_RTW88_8821CU=m$' "$mountdir"/boot/config-*
 grep -q '^CONFIG_USB_CONFIGFS_F_FS=y$' "$mountdir"/boot/config-*
+require_payload "$mountdir/lib/modules" module btusb
+if [[ "$mode" == --baseline ]]; then
+grep -q '^CONFIG_RTW88_8821CU=m$' "$mountdir"/boot/config-*
 for module in rtw88_8821cu btusb btrtl; do
     require_payload "$mountdir/lib/modules" module "$module"
 done
 for fw in rtw88/rtw8821c_fw.bin rtl_bt/rtl8821c_fw.bin rtl_bt/rtl8821c_config.bin; do
     require_payload "$mountdir/lib/firmware" firmware "$fw"
 done
+fi
 require_no_g_serial "$mountdir/etc/modules" "$mountdir/etc/modules-load.d/"
 echo "Image structure, app, kernel configuration, modules and firmware checked (mode=$mode); current mode also checks projection/menu runtime/source/checksums. Hardware untested."

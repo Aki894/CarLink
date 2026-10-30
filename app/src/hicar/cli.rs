@@ -69,6 +69,15 @@ fn send(v:&Value)->Result<()>{let mut out=io::stdout().lock();serde_json::to_wri
 pub fn run(args:&[String])->Result<()>{
     let mut input=io::stdin().lock();
     match args.first().map(String::as_str){
+        #[cfg(unix)]
+        Some("identity-init")=>{
+            let mut path=std::path::PathBuf::from("/var/lib/carlink/hicar/production/identity.json");let mut name="CarLink".to_owned();let mut i=1;
+            while i<args.len(){let option=&args[i];let value=args.get(i+1).ok_or("identity-init option needs a value")?;i+=2;
+                match option.as_str(){"--identity"=>path=value.into(),"--name"=>name=value.clone(),_=>return Err("unknown identity-init option".into())}
+            }
+            let created=super::identity::Identity::ensure(&path,&name)?;
+            send(&value!({"ok":true,"initialized":true,"created":created}))
+        },
         Some("run")=>super::backend::run(&args[1..]),
         Some("media-worker") if args.len()==2=>super::live::run(args[1].parse().map_err(|_|"invalid private socket fd")?),
         Some("radio-worker") if args.len()==2=>super::radio::run(args[1].parse().map_err(|_|"invalid private socket fd")?),
@@ -85,7 +94,7 @@ pub fn run(args:&[String])->Result<()>{
             send(&value!({"schema":1,"wire_identity_sha256":hex(&crypto.sha256(wire.as_bytes())?),
                 "hardware_seed_sha256":hex(&crypto.sha256(id.device_id.as_bytes())?),"name_length":id.name.chars().count()}))
         },
-        _=>Err("Usage: carlink hicar codec | auth-worker | identity-check | session-worker FD (private adapter IPC)".into()),
+        _=>Err("Usage: carlink hicar run | identity-init [--identity PATH] [--name NAME] | codec | auth-worker | identity-check | session-worker FD (private adapter IPC)".into()),
     }
 }
 #[cfg(unix)]fn auth_worker(input:&mut impl BufRead)->Result<()>{

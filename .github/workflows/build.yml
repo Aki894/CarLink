@@ -6,11 +6,16 @@ on:
   workflow_dispatch:
     inputs:
       firmware:
-        description: Build the bootable Armbian image (kernel and native drivers)
+        description: Build complete dual-protocol firmware from the verified kernel baseline
         type: boolean
         default: true
+      kernel_baseline:
+        description: Rebuild the kernel/base image only (not a complete CarLink release)
+        type: boolean
+        default: false
 permissions:
   contents: read
+  actions: read
 defaults:
   run:
     shell: bash
@@ -33,6 +38,8 @@ jobs:
           done
           python3 -m py_compile scripts/*.py
           python3 scripts/test-boot-profile.py
+          python3 scripts/test-production-runtime.py
+          python3 scripts/test-release-source.py
           python3 -m unittest discover -s receiver -p 'test_*.py'
           bash -n scripts/verify-image.sh
           bash -n scripts/build-carplay.sh
@@ -86,6 +93,7 @@ jobs:
           cargo +"$RUST_VERSION" run --quiet --locked --manifest-path app/Cargo.toml -- doctor --json > /tmp/carlink-doctor.json
           python3 scripts/test-hicar-rust.py app/target/debug/carlink
           python3 scripts/test-hicar-rust-session.py app/target/debug/carlink
+          python3 scripts/test-hicar-identity-init.py app/target/debug/carlink
           python3 scripts/test-hicar-rust-hisight.py app/target/debug/carlink
           timeout 120s python3 scripts/test-hicar-rust-dmsdp.py app/target/debug/carlink
           timeout 120s python3 scripts/test-hicar-rust-live.py app/target/debug/carlink
@@ -114,6 +122,7 @@ jobs:
           printf '#!/bin/sh\nexec qemu-arm -L /usr/arm-linux-gnueabihf "%s/dist/carplay/bin/carlink-audio" "$@"\n' "$PWD" > .build/carplay-output-test-audio
           chmod +x .build/carplay-output-test-audio
           CARLINK_AUDIO_TEST_BINARY="$PWD/.build/carplay-output-test-audio" cargo +"$RUST_VERSION" test --locked --manifest-path app/Cargo.toml carplay_output:: -- --nocapture
+          CARLINK_AUDIO_TEST_BINARY="$PWD/.build/carplay-output-test-audio" cargo +"$RUST_VERSION" test --locked --manifest-path app/Cargo.toml hicar::uplink:: -- --nocapture
           python3 scripts/test-runtime-install.py dist/app dist/carplay
       - uses: actions/upload-artifact@v4
         with:
@@ -127,7 +136,14 @@ jobs:
           path: dist/app/
           retention-days: 14
   firmware:
-    if: github.event_name == 'workflow_dispatch' && inputs.firmware
+    if: github.event_name == 'workflow_dispatch' && inputs.firmware && !inputs.kernel_baseline
+    needs: app
+    uses: ./.github/workflows/hicar-auth.yml
+    with:
+      app_run_id: ${{ github.run_id }}
+    secrets: inherit
+  baseline:
+    if: github.event_name == 'workflow_dispatch' && inputs.firmware && inputs.kernel_baseline
     needs: app
     runs-on: ubuntu-24.04
     timeout-minutes: 300
@@ -174,13 +190,13 @@ jobs:
           xz -t dist/firmware/*.img.xz
           compressed=$(find dist/firmware -name '*.img.xz' -print -quit)
           xz -dk "$compressed"
-          bash scripts/verify-image.sh "${compressed%.xz}" | tee dist/firmware/image-validation.txt
+          bash scripts/verify-image.sh "${compressed%.xz}" --baseline | tee dist/firmware/image-validation.txt
           rm "${compressed%.xz}"
           cd dist/firmware
           sha256sum -- *.img.xz > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: carlink-h3-image
+          name: carlink-h3-baseline-image
           path: dist/firmware/
           compression-level: 0
           retention-days: 14

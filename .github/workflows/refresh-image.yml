@@ -1,10 +1,13 @@
-name: Refresh existing firmware
+name: CarLink image assembly (internal)
 on:
   workflow_call:
     inputs:
       base_run_id:
         type: string
         required: true
+      base_artifact_name:
+        type: string
+        default: carlink-h3-image
       app_run_id:
         type: string
         required: true
@@ -13,35 +16,11 @@ on:
         default: ''
       hicar_native:
         type: boolean
-        default: false
+        default: true
       variant:
         type: string
         default: main
       disable_onboard_wifi:
-        type: boolean
-        default: false
-  workflow_dispatch:
-    inputs:
-      base_run_id:
-        description: Successful run containing the original carlink-h3-image
-        type: string
-        required: true
-        default: '39459953269'
-      driver_run_id:
-        description: Optional matched AIC driver build run; empty preserves the baseline driver set
-        type: string
-        required: false
-      app_run_id:
-        description: Successful CarLink app run containing both carlink-armv7 and carplay-armv7
-        type: string
-        required: true
-      variant:
-        description: AIC firmware variant (only used with driver_run_id)
-        type: choice
-        options: [main, mcu1]
-        default: main
-      disable_onboard_wifi:
-        description: Disable XR819 after accepted AIC Wi-Fi/Bluetooth/AP tests; requires driver_run_id
         type: boolean
         default: false
 permissions:
@@ -66,18 +45,20 @@ jobs:
       - name: Validate inputs and successful source runs
         run: |
           [[ "$BASE_RUN_ID" =~ ^[0-9]+$ ]]
-          [[ -z "$DRIVER_RUN_ID" || "$DRIVER_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "${{ inputs.base_artifact_name }}" == carlink-h3-image || "${{ inputs.base_artifact_name }}" == carlink-h3-baseline-image ]]
+          [[ "$DRIVER_RUN_ID" =~ ^[0-9]+$ ]]
           [[ "$APP_RUN_ID" =~ ^[0-9]+$ ]]
           [[ "$DRIVER_VARIANT" == main || "$DRIVER_VARIANT" == mcu1 ]]
           [[ "$DISABLE_ONBOARD_WIFI" == false || "$DISABLE_ONBOARD_WIFI" == true ]]
           [[ "$DISABLE_ONBOARD_WIFI" == false || -n "$DRIVER_RUN_ID" ]]
-          for run in "$BASE_RUN_ID" "$APP_RUN_ID" ${DRIVER_RUN_ID:+"$DRIVER_RUN_ID"}; do
+          test "${{ inputs.hicar_native }}" = true
+          for run in "$BASE_RUN_ID" "$DRIVER_RUN_ID"; do
             test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" --jq .conclusion)" = success
           done
-          echo "APP_COMMIT=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$APP_RUN_ID" --jq .head_sha)" >> "$GITHUB_ENV"
+          python3 scripts/validate-release-source.py "$APP_RUN_ID" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
-          name: carlink-h3-image
+          name: ${{ inputs.base_artifact_name }}
           path: dist/base
           run-id: ${{ inputs.base_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -114,6 +95,8 @@ jobs:
           bash scripts/test-image-validation.sh
           python3 scripts/test-runtime-install.py dist/app dist/carplay ${{ inputs.hicar_native && 'dist/hicar-auth' || '' }}
           python3 scripts/test-boot-profile.py
+          python3 scripts/test-production-runtime.py
+          python3 scripts/test-release-source.py
       - name: Download authenticated Debian armhf mode-switch runtime
         if: inputs.driver_run_id != ''
         run: |

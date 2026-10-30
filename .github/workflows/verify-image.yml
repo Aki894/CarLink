@@ -3,9 +3,14 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: Successful CarLink build run containing carlink-h3-image
+        description: Successful CarLink firmware run
         type: string
         required: true
+      artifact_name:
+        description: Formal firmware or explicitly marked kernel baseline
+        type: choice
+        options: [carlink-h3-refreshed-image, carlink-h3-baseline-image, carlink-h3-image]
+        default: carlink-h3-refreshed-image
 permissions:
   contents: read
   actions: read
@@ -21,10 +26,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Test image validation gates
-        run: bash scripts/test-image-validation.sh
+        run: |
+          test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" --jq .conclusion)" = success
+          bash scripts/test-image-validation.sh
+          python3 scripts/test-production-runtime.py
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/download-artifact@v4
         with:
-          name: carlink-h3-image
+          name: ${{ inputs.artifact_name }}
           path: dist/firmware
           run-id: ${{ inputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -37,7 +47,10 @@ jobs:
           xz -dk -- *.img.xz
           cd ../..
           image=$(find dist/firmware -maxdepth 1 -name '*.img' -print -quit)
-          bash scripts/verify-image.sh "$image" | tee dist/firmware/revalidation.txt
+          mode=current
+          if [[ "${{ inputs.artifact_name }}" != carlink-h3-refreshed-image ]]; then mode=--baseline; fi
+          bash scripts/verify-image.sh "$image" "$mode" | tee dist/firmware/revalidation.txt
+          echo "ValidationProfile=$mode" >> dist/firmware/revalidation.txt
           echo "ValidationCommit=$GITHUB_SHA" >> dist/firmware/revalidation.txt
           echo "SourceRun=$SOURCE_RUN" >> dist/firmware/revalidation.txt
       - uses: actions/upload-artifact@v4

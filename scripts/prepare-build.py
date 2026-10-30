@@ -1,4 +1,4 @@
-"""Stage the pinned Armbian tree and a previously built ARMv7 application."""
+"""Stage the kernel/base image. Formal firmware uses the unified refresh installer."""
 import hashlib
 import json
 import pathlib
@@ -55,7 +55,8 @@ manifest = {
     "app_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
     "app_notices": (binary.parent/'share').is_dir(),
     "carplay_receiver": receiver,
-    "stage": "CarLife MD and separate ARMv7 CarPlay receiver; hardware acceptance in progress",
+    "runtime_profile": "baseline",
+    "stage": "Kernel/base image only; complete CarLink runtime is installed by refresh",
     "reproducibility": "Framework pinned; resolved kernel/bootloader revisions and package versions remain build-time inputs. See Armbian build logs.",
 }
 (overlay / "carlink-build.json").write_text(json.dumps(manifest, indent=2) + "\n")
