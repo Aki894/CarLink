@@ -1,12 +1,17 @@
 {
-  "version": 1,
+  "version": 2,
   "masks": {
     "NetworkManager-wait-online.service": "CarLink creates its own local hotspot and retries device readiness; no remote mounts or boot-time Internet dependency.",
     "serial-getty@ttyGS0.service": "Legacy g_serial was disabled for AOA FunctionFS; ttyGS0 never appears, leaving a stale boot-time device wait. ttyS0 remains available for recovery.",
     "ModemManager.service": "This appliance uses Ethernet and a Wi-Fi/Bluetooth adapter, not a cellular modem.",
     "motd-news.service": "Remote login news is unnecessary for projection.",
     "motd-news.timer": "Remote login news is unnecessary for projection.",
-    "man-db.timer": "Scheduled manual-page indexing is unnecessary; manual indexing remains available."
+    "man-db.timer": "Scheduled manual-page indexing is unnecessary; manual indexing remains available.",
+    "rsyslog.service": "Journald retains persistent application, kernel and syslog records; avoid duplicate text logging on this appliance.",
+    "syslog.socket": "Prevent socket reactivation of the redundant rsyslog service; journald's /dev/log socket remains enabled.",
+    "getty@tty1.service": "Headless projection has no local display login; ttyS0 and Ethernet SSH remain available.",
+    "keyboard-setup.service": "No local console keyboard is used; avoid delaying local-fs-pre for keymap setup.",
+    "console-setup.service": "No local display font or console keymap is needed."
   },
   "preserved": ["NetworkManager.service", "bluetooth.service", "dbus.service", "systemd-udevd.service", "ssh.service", "systemd-journald.service", "systemd-fsck-root.service", "armbian-zram-config.service", "chrony.service"],
   "links": {
