@@ -4,6 +4,7 @@
 
 | 文档 | 内容 |
 | --- | --- |
+| [首次配置与正式固件](provisioning.md) | production/baseline 区分、私有身份初始化与 AIC 自动识别 |
 | [验证与版本](validation.md) | 最新构建、部署、桌面实测、历史里程碑及未完成项目 |
 | [完成情况核对](status-audit.md) | R2/R3 当前范围、尚需实现的功能与待验收项目 |
 | [双向通话与麦克风](calls.md) | 音频角色、USB 采集、CarPlay/HiCar 上行和验证入口 |

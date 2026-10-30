@@ -2,6 +2,8 @@
 
 ## 目标与当前结果
 
+当前状态（2026-10-30）：HiCar 已由 Rust manager 集成、自启并进入完整 refreshed 固件；独立 HU 双向音频及组合通话已验收。首次刷机身份初始化和其他差额见 [status-audit.md](status-audit.md)，最新结果见 [validation.md](validation.md)。以下为早期探索计划与按日期保留的历史记录，其中“尚未集成”等描述对应当时版本。
+
 目标平台为悟空派 H3（ARMv7、512 MiB）、AX900/AIC8800、Linux/BlueZ，手机范围为鸿蒙 4.2。HiCar 接收后复用现有 CarLife 输出，保留有线 SSH。探索程序与现有 CarPlay 接收端隔离，暂不随生产固件安装或自启。
 
 2026-10-23 已实测走通：FDEE 发现 → FE35 控制通道 → FE36 业务 19 → 身份 JSON → 固定六位 PIN → HiChain 认证成功。手机为 HiCar 14.2.0.400；H3 上两次独立进程测试均得到结果 `[2,3,0]`，即处理中、密钥协商完成、认证成功。两次使用同一持久化身份与 PIN。

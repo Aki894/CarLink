@@ -17,11 +17,11 @@
 | 残留 USB 串口 | mask `serial-getty@ttyGS0.service`，删除其唯一已确认的 wants 链接；消除不存在设备的启动等待 |
 | 本地网络 | mask `NetworkManager-wait-online.service`；CarLink 需要本地热点与蓝牙，启动不依赖 Internet 或远程挂载 |
 | CarLink 自启动 | `carlink.service` 在 NetworkManager 和 BlueZ 进程启动后运行 `/usr/local/bin/carlink-run`，不引用 `network-online.target`；动态硬件就绪由启动器处理 |
-| 认证与恢复 | 缺任一 MFi 文件时跳过启动；失败后每 5 秒重试；运行目录权限 0700，子进程统一停止 |
+| 认证与恢复 | MFi 检查限于 CarPlay 后端；HiCar 和菜单可独立启动；服务失败后每 5 秒重试；运行目录权限 0700，子进程统一停止 |
 | 运行目标 | `default.target` 指向 `multi-user.target`，使用现有无桌面基础系统 |
 | 非必需服务 | mask ModemManager、motd-news service/timer、man-db timer；设备不使用蜂窝调制解调器，登录新闻和手册定时索引无需常驻触发 |
 | 安全更新 | 保留 APT、签名验证、更新服务与 timer 启用状态；下载检查改为开机 10 分钟后，升级检查 15 分钟后，各增加最多 5 分钟随机延迟，之后每日重复 |
-| 日志 | journald 保留持久日志，磁盘上限 16 MiB、运行时 8 MiB、单文件 4/2 MiB、保留 7 天；5 秒同步；CarLink 启动前执行 journal flush/sync，处理 ramlog 切回内存的问题 |
+| 日志 | journald 保留持久日志，磁盘上限 16 MiB、运行时 8 MiB、单文件 4/2 MiB、保留 7 天；5 秒同步；已保留持久日志配置；后续性能优化移除了每次服务启动强制 journal flush/sync |
 
 APT timer 由本轮配置改为单调时钟调度，避免离线车辆的旧日历任务在开机瞬间补跑。连续运行短于 10 分钟时不会启动自动下载；维护时仍可通过 `apt update` / `apt upgrade` 主动更新。原来未启用的 timer 保持未启用。
 

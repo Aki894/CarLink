@@ -1,6 +1,6 @@
 # HiCar Rust 迁移与 CarLink 集成
 
-更新：2026-10-26。目标手机范围为鸿蒙 4.2。HiCar 的发现、认证、控制与媒体通路已接入 `carlink hicar run`；Python 实验代码保留为协议参考和差分测试基准，生产 HiCar 后端不再依赖 Python。
+更新：2026-10-30。目标手机范围为鸿蒙 4.2。HiCar 的发现、认证、控制与媒体通路已接入 `carlink hicar run`；Python 实验代码保留为协议参考和差分测试基准，生产 HiCar 后端不再依赖 Python。
 
 ## 当前架构
 
@@ -27,7 +27,7 @@ carlink manager
 | 阶段 | 当前实现 | 验证进度 |
 | --- | --- | --- |
 | R1：协议与认证基础 | 有界分帧、严格 JSON、Nearby/TLV/CRC、DMSDP/HiSight、RTP/ADTS、AES-CTR、时钟、UIBC、HiChain/HUKS FFI | 已完成差分、异常输入、截断、持久化及双向认证测试 |
-| R2：真实连接与媒体 | Rust 拥有 BlueZ、热点、TCP、认证、DMSDP/RTSP、音视频与输入生命周期；新增多源混音、麦克风及 modem 服务 | Rust 迁移及基础台架回归已完成；双向音频协议与 ARM 编解码已纳入自动回归。HiCar 独立 HU 通话及 Lexus 待验收，见[完成情况核对](status-audit.md) |
+| R2：真实连接与媒体 | Rust 拥有 BlueZ、热点、TCP、认证、DMSDP/RTSP、音视频与输入生命周期；新增多源混音、麦克风及 modem 服务 | Rust 迁移及基础台架回归已完成；双向音频协议与 ARM 编解码已纳入自动回归。HiCar 独立 HU 导航＋音乐＋双向通话已验收；异常编码器自动恢复回归已通过，Lexus 实车待验收，见[完成情况核对](status-audit.md) |
 | R3：统一产品管理 | 常驻 CarLife、协议互斥、设备记录、开机重连、菜单切换、断线回菜单、启动恢复 | 已接入并完成台架操作与断线恢复测试；真实触控板和实车场景继续验收 |
 
 源码检查、编译、镜像结构校验、开发板与实车验证分别记录。完整验收清单以 [验证记录](validation.md) 和 [连接管理设计](connection-management.md) 为准。
@@ -41,7 +41,7 @@ carlink manager
 - **启动取消**：等待热点 IP 期间检查私有关闭请求或父进程 EOF。取消后删除临时 NetworkManager 连接、恢复此前网络，完成清理后才回复关闭成功，避免切换协议时遗留热点。
 - **USB 初始握手**：从实际 AOA bulk ENABLE 起，等待首次真正的 `VIDEO_START`，启用时间上限 30 秒；USB suspend 不计时。超时经现有错误、清理和 manager 退避路径重新枚举。握手完成后，静态画面、暂停或源未播放不重新触发该超时。
 - **USB 退避**：连续失败按 1、2、4、8 秒退避，最高 8 秒；成功握手并满足稳定条件后恢复正常重试间隔。USB 与无线重试时钟独立。
-- **启动配置**：新镜像首次运行从随附示例创建私有 manager 配置。MFi 身份检查限于 CarPlay 启动，不阻止 HiCar 或车机菜单启动。认证、配对数据和厂商资料不提交到仓库。
+- **启动配置**：refreshed 镜像首次运行从随附示例创建私有 manager 配置；HiCar 本机身份首次按需原子初始化，私有目录 0700、文件 0600；固定 PIN、既有身份和 HUKS 在重启及升级时保留，详见[首次配置](provisioning.md)。MFi 身份检查限于 CarPlay 启动，不阻止 HiCar 或车机菜单启动。认证、配对数据和厂商资料不提交到仓库。
 
 ## 协议行为与输入
 
@@ -52,6 +52,10 @@ HiSight `left_move` 对应事件 2。确认、返回、主页及方向键保持�
 新增设备使用保存在私有身份中的固定六位 PIN，适合无屏盒子。提交 `a47a9f0` 已加入独立配对页，顶部显示固定配对码、手机操作提示和取消入口。真实 CarLife 画面已验证“添加 → 确认停止旧投屏 → 显示 PIN → 取消”，取消后自动恢复 CarPlay，CarLife PID `968` 与 USB 连接保持不变。PIN 不进入普通日志、公开状态或设备列表；界面只读使用原身份文件。日常已配对重连沿用现有身份和密钥。
 
 ## 当前集成验证
+
+最新运行基线为 `3c1337f`，独立 HU 已完成音乐、导航、双向通话、挂断恢复和原生菜单入口验证；对应构建和镜像校验见 [validation.md](validation.md)。下列 `a47a9f0` 及同机台架描述保留为 10 月 26 日历史记录；首次身份初始化、发布入口一致性和多手机策略修复以 [status-audit.md](status-audit.md) 为准。
+
+### 2026-10-26 集成记录
 
 当前交付提交为 `a47a9f0`：[应用构建 40281149701](https://github.com/Aki894/CarLink/actions/runs/40281149701) 与 [完整构建 40281831497](https://github.com/Aki894/CarLink/actions/runs/40281831497) 均成功。完整构建包含 native、Rust interop 和 firmware，镜像检查、产物上传、下载后 ZIP 与镜像 SHA256 校验均完成。运行时应用 SHA256 为 `c3dd04d3b79149e992333eca928586a24ed470b995af7f3488d9d1dd6816c3e4`。
 
