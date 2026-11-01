@@ -658,6 +658,9 @@ fn touch_row(x:f64,y:f64,focus:usize,count:usize)->Option<usize>{
         let root=std::env::temp_dir().join(format!("carlink-menu-ci-{}",std::process::id()));fs::create_dir(&root).unwrap();
         let source=root.join("source");let live=root.join("live");
         let mux=Mux::start(&source,&live,Path::new(&lib),Path::new(&font)).unwrap();
+        // This contract checks byte-exact passthrough. Audible interaction is
+        // exercised separately with feedback enabled and intentional PCM mixing.
+        mux.set_interaction(false,false);
         mux.set_menu(vec!["\u{8fde}\u{63a5} iPhone".into(),"\u{8fde}\u{63a5}\u{534e}\u{4e3a}".into()],1,true).unwrap();
         // Discovery/input socket exists before HU; the late HU can recover.
         let server=UnixListener::bind(&live).unwrap();let(mut hu,_)=server.accept().unwrap();hu.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
