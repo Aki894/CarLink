@@ -71,6 +71,9 @@ impl Selection{
         if select{self.selected=Some(path.into());}true
     }
 }
+fn business_allowed(reconnect_allowed:bool,slots:&BTreeSet<(String,String)>,selected:&str)->bool{
+    reconnect_allowed||slots.iter().any(|(stream,device)|stream=="control"&&device==selected)
+}
 fn normalized_ip(ip:IpAddr)->IpAddr{match ip{IpAddr::V6(v)=>v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v)),_=>ip}}
 fn proc_ip(raw:&str)->Option<IpAddr>{
     if raw.len()!=8&&raw.len()!=32{return None;}let mut bytes=vec![];
@@ -419,8 +422,10 @@ impl Radio{
         }Ok(())
     }
     fn open_business(&mut self,port:u16)->Result<()>{
-        if !self.reconnect_allowed||self.projection_active||self.business_connect.is_some()||!(1..=30).contains(&port){return Err("outgoing business connection unavailable".into());}
-        let selected=self.state.selection.selected.as_deref().ok_or("selected peer missing")?;if self.state.wake_peer.as_deref()!=Some(selected){return Err("outgoing business peer no longer selected".into());}let peer=self.state.selection.address(selected).ok_or("invalid selected peer")?;
+        if self.projection_active||self.business_connect.is_some()||!(1..=30).contains(&port){return Err("outgoing business connection unavailable".into());}
+        let selected=self.state.selection.selected.as_deref().ok_or("selected peer missing")?;
+        if !business_allowed(self.reconnect_allowed,&self.state.slots,selected){return Err("outgoing business peer is not connected".into());}
+        let peer=self.state.selection.address(selected).ok_or("invalid selected peer")?;
         if self.state.slots.iter().any(|(stream,_)|stream=="business"){return Err("business connection already present".into());}
         self.business_connect=Some((rfcomm_socket(&peer,port)?,Instant::now()));Ok(())
     }
@@ -545,5 +550,12 @@ pub fn run(fd:i32)->Result<()>{#[cfg(unix)]{linux::run(fd)}#[cfg(not(unix))]{let
     }
     #[test]fn selection_is_sticky_and_agent_cannot_claim(){let c:Config=serde_json::from_value(json!({"model":"00040A00","network":false,"manage_controller":false,"pair_seconds":10,"exclude_peers":["02:00:00:00:00:01"]})).unwrap();validate(&c).unwrap();let mut s=Selection::new(&c).unwrap();s.deadline=Some(10000);
         assert!(!s.allows("/org/bluez/hci0/dev_02_00_00_00_00_01",true,0));assert!(s.allows("/org/bluez/hci0/dev_02_00_00_00_00_02",false,0));assert!(s.selected.is_none());assert!(s.allows("/org/bluez/hci0/dev_02_00_00_00_00_03",true,0));assert!(!s.allows("/org/bluez/hci0/dev_02_00_00_00_00_02",true,0));assert!(s.allows("/org/bluez/hci0/dev_02_00_00_00_00_03",false,20000));}
+    #[test]fn pairing_window_allows_business_for_newly_selected_peer(){
+        let selected="/org/bluez/hci0/dev_02_00_00_00_00_02";
+        let mut slots=BTreeSet::new();slots.insert(("control".into(),selected.into()));
+        assert!(business_allowed(true,&slots,selected));
+        assert!(business_allowed(false,&slots,selected));
+        assert!(!business_allowed(false,&BTreeSet::new(),selected));
+    }
     #[test]fn rejects_management_interface_and_bad_addresses(){for value in ["02:00:00:00:00: 1","02:00:00:00:00:0g","02:00:00:00:00:000"]{assert!(mac(value).is_err());}let c:Config=serde_json::from_value(json!({"model":"00040A00","interface":"end0","peer":"02:00:00:00:00:01"})).unwrap();assert!(validate(&c).is_err());assert_eq!(beacon("00040A00",7).unwrap(),vec![1,1,1,3,0,4,10,4,0,16,7]);}
 }
