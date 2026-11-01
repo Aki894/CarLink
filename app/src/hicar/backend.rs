@@ -299,7 +299,10 @@ impl Owner{
                 self.channels.push(channel);event("rfcomm_connected",self.epoch);
             },
             Some("request-disconnection")=>{let stream=v["stream"].as_str();let device=v["device"].as_str();for c in &mut self.channels{if c.radio_stream.as_deref()==stream&&c.device.as_deref()==device{c.closing=true;}}},
-            Some("reconnect-result")=>event(if v["success"]==true{"bluetooth_reconnect_ready"}else{"bluetooth_reconnect_failed"},self.epoch),
+            Some("reconnect-result")=>{
+                let name=if v["success"]==true{"bluetooth_reconnect_ready"}else{"bluetooth_reconnect_failed"};
+                if let Some(reason)=v["reason"].as_str(){println!("{}",json!({"event":name,"session_epoch":self.epoch,"reason":reason}));}else{event(name,self.epoch);}
+            },
             Some("stopped")=>return Err("radio registration ended".into()),
             // ACL disconnect also occurs during normal Wi-Fi handoff.
             Some("disconnected")=>{},_=>if packet.fd.is_some(){return Err("unexpected radio descriptor".into());},

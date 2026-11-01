@@ -408,8 +408,8 @@ impl Radio{
             let peer=query.peer.clone();let allowed=!self.projection_active&&self.state.slots.is_empty()&&self.state.selection.allows(&peer,false,self.state.origin.elapsed().as_millis() as u64);
             if !allowed{self.sdp_query=None;return Ok(());}
             match query.poll(){Ok(None)=>{},Ok(Some(port))=>{self.sdp_query=None;let address=self.state.selection.address(&peer).ok_or("invalid reconnect peer")?;
-                match rfcomm_socket(&address,port){Ok(fd)=>self.control_connect=Some((fd,Instant::now(),peer)),Err(_)=>{let _=self.ipc.send(&json!({"event":"reconnect-result","success":false}),None);}}
-            },Err(_)=>{self.sdp_query=None;let _=self.ipc.send(&json!({"event":"reconnect-result","success":false}),None);}}
+                match rfcomm_socket(&address,port){Ok(fd)=>self.control_connect=Some((fd,Instant::now(),peer)),Err(_)=>{let _=self.ipc.send(&json!({"event":"reconnect-result","success":false,"reason":"rfcomm_connect"}),None);}}
+            },Err(error)=>{self.sdp_query=None;let reason=match error.as_ref(){"SDP discovery timed out"=>"sdp_timeout","SDP discovery failed"=>"sdp_failed","SDP must contain one FE35 RFCOMM service"=>"sdp_service","SDP output failed"=>"sdp_output",_=>"sdp_error"};let _=self.ipc.send(&json!({"event":"reconnect-result","success":false,"reason":reason}),None);}}
         }
         if let Some((fd,started,peer))=self.control_connect.as_ref(){
             if self.projection_active||!self.state.slots.is_empty()||!self.state.selection.allows(peer,false,self.state.origin.elapsed().as_millis() as u64){self.control_connect=None;return Ok(());}
@@ -417,7 +417,7 @@ impl Radio{
                 if ready&&self.state.selection.allows(&peer,true,self.state.origin.elapsed().as_millis() as u64){let address=self.state.selection.address(&peer).ok_or("invalid reconnect peer")?;
                     self.ipc.send(&json!({"event":"rfcomm","stream":"control","device":peer,"address":address,"initiator":true}),Some(fd.as_raw_fd()))?;self.state.slots.insert(("control".into(),peer));
                     let _=self.ipc.send(&json!({"event":"reconnect-result","success":true}),None);
-                }else{let _=self.ipc.send(&json!({"event":"reconnect-result","success":false}),None);}
+                }else{let _=self.ipc.send(&json!({"event":"reconnect-result","success":false,"reason":"rfcomm_timeout"}),None);}
             }
         }Ok(())
     }
