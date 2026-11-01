@@ -19,6 +19,7 @@ pub struct Tone {position:usize,active:bool,last:Option<u64>,click:bool}
 impl Tone {
     pub fn active(&self)->bool{self.active}
     pub fn cancel(&mut self){self.active=false;self.position=0;}
+    pub fn expire(&mut self,now:u64){if self.last.is_some_and(|t|now.saturating_sub(t)>150){self.cancel();}}
     pub fn trigger(&mut self,now:u64,click:bool)->bool{
         if self.last.is_some_and(|t|now.saturating_sub(t)<120){return false;}
         self.last=Some(now);self.position=0;self.click=click;self.active=true;true
@@ -50,5 +51,6 @@ impl Tone {
         assert!(!tone.active());assert!(pcm.iter().any(|b|*b!=0));assert_eq!(&pcm[..4],&[0;4]);assert_eq!(&pcm[4*(TONE_FRAMES-1)..],&[0;44]);
         for frame in pcm.chunks_exact(4){assert_eq!(&frame[..2],&frame[2..]);}
         assert!(tone.trigger(200,true));tone.cancel();let mut silence=[0u8;40];tone.mix(&mut silence);assert_eq!(silence,[0;40]);
+        assert!(tone.trigger(400,false));tone.expire(600);assert!(!tone.active());
     }
 }

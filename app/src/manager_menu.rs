@@ -295,7 +295,7 @@ impl Worker {
             }
             self.waiting_key=false;self.output(f);
         }},
-        3=>{if f.flags==0{self.last_pcm=Some(Instant::now());self.tone.mix(&mut f.payload);}self.gains[f.flags as usize].apply(self.volume.load(Ordering::Acquire).min(150)as u8,&mut f.payload);if let Some(h)=self.hu.as_mut(){h.trim_audio();}self.output(f);},
+        3=>{if f.flags==0{self.last_pcm=Some(Instant::now());self.tone.expire(self.interaction_start.elapsed().as_millis()as u64);self.tone.mix(&mut f.payload);}self.gains[f.flags as usize].apply(self.volume.load(Ordering::Acquire).min(150)as u8,&mut f.payload);if let Some(h)=self.hu.as_mut(){h.trim_audio();}self.output(f);},
         8=>{self.emit_source(json!({"type":"open-menu"}));},
         _=>self.output(f),
     }}
@@ -345,8 +345,11 @@ impl Worker {
     }
     fn cue(&mut self,click:bool){if self.feedback_sound.load(Ordering::Acquire)&&!self.audio_roles[3]&&self.microphone.is_none(){self.tone.trigger(self.interaction_start.elapsed().as_millis()as u64,click);}}
     fn tone_step(&mut self){
+        self.tone.expire(self.interaction_start.elapsed().as_millis()as u64);
         if !self.feedback_sound.load(Ordering::Acquire)||self.audio_roles[3]||self.microphone.is_some(){self.tone.cancel();}
-        if self.tone.active()&&self.last_pcm.is_none_or(|t|t.elapsed()>=Duration::from_millis(60)){
+        // A live media lane owns its clock. Mix into its next packet, or expire
+        // quietly; never inject a second timeline into an active music stream.
+        if self.tone.active()&&!self.audio_roles[0]&&self.last_pcm.is_none_or(|t|t.elapsed()>=Duration::from_millis(60)){
             if !self.audio_roles[0]&&!self.tone_owns_lane{self.tone_owns_lane=true;self.output(Frame::new(5,0,vec![1]));}
             let mut f=menu_frame(vec![0;3528]);f.kind=3;f.flags=0;self.tone.mix(&mut f.payload);self.gains[0].apply(self.volume.load(Ordering::Acquire).min(150)as u8,&mut f.payload);self.output(f);if self.tone_owns_lane{self.tone_stop_at=Some(Instant::now()+Duration::from_millis(100));}
         }
@@ -441,7 +444,8 @@ fn touch_row(x:f64,y:f64,focus:usize,count:usize)->Option<usize>{
         w.input(pad());assert!(w.source.as_ref().unwrap().output.is_empty());w.input(pad());
         assert_eq!(w.source.as_ref().unwrap().output.len(),1);
         let forwarded:Value=serde_json::from_slice(&w.source.as_ref().unwrap().output[0].data[16..]).unwrap();assert_eq!(forwarded,json!({"type":"key-press","code":4}));
-        w.audio_roles[0]=true;w.tone_step();assert!(!w.tone.active());assert!(!w.tone_owns_lane);
+        w.audio_roles[0]=true;w.tone_step();assert!(w.tone.active());assert!(w.hu.as_ref().unwrap().output.is_empty());
+        w.incoming(Frame::new(3,0,vec![0;3528]));assert!(!w.tone.active());assert!(!w.tone_owns_lane);
         assert!(w.hu.as_ref().unwrap().output.iter().all(|f|f.kind!=5));
         w.tone.cancel();w.audio_roles[3]=true;w.cue(true);assert!(!w.tone.active());
         w.audio_roles[3]=false;w.feedback_sound.store(false,Ordering::Release);w.cue(true);assert!(!w.tone.active());
