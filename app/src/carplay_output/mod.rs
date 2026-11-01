@@ -192,7 +192,9 @@ impl Adapter{
         self.poll_audio()?;
         let retry=self.microphone.retry();if !retry.is_empty(){println!("{}",json!({"event":"microphone_recovered"}));self.request_microphone(retry)?;}
         for feedback in self.link.step(){match feedback{
-            link::Feedback::Control(value)=>{
+            link::Feedback::Control(mut value)=>{
+                if value["type"]=="pad-reset"{continue;}
+                if value["type"]=="key-press"&&value["origin"]=="touchpad"&&value["code"].as_u64().is_some_and(|c|(3..=6).contains(&c)){value.as_object_mut().unwrap().remove("origin");}
                 // The source remains active behind the local menu. Returning is
                 // a source-mux operation; the existing keyframe request resumes
                 // display without a speculative AirPlay mode/audio reset.

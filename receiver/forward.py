@@ -434,6 +434,11 @@ def run(args):
 
             def feedback(value):
                 try:
+                    if value.get('type') == 'pad-reset':
+                        return
+                    if (value.get('type') == 'key-press' and value.get('origin') == 'touchpad'
+                            and type(value.get('code')) is int and 3 <= value['code'] <= 6):
+                        value = {key: item for key, item in value.items() if key != 'origin'}
                     if value.get('type') == 'microphone-pcm':
                         microphone.feed(value['generation'], value['pcm'])
                         return
