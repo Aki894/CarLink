@@ -104,8 +104,9 @@ impl Endpoint {
                 live.microphone(&message);
                 if !live.accepts_input(){self.input=crate::input::Input::default();}
                 if let Some(config)=self.session.video_config().filter(|_|live.accepts_input()) {
+                    if matches!(message.id,0x1005a|0x1005c|0x1005e){live.feedback("{\"type\":\"pad-reset\"}");}
                     match self.input.handle(&message,self.clock.elapsed().as_millis() as u64) {
-                        Ok(keys)=>for code in keys {live.feedback(&format!("{{\"type\":\"key-press\",\"code\":{code}}}"));},
+                        Ok(keys)=>for code in keys {let origin=if message.id==0x1005b{",\"origin\":\"touchpad\""}else{""};live.feedback(&format!("{{\"type\":\"key-press\",\"code\":{code}{origin}}}"));},
                         Err(error)=>log("input_ignored",&error),
                     }
                     match crate::live::touch(&message,config) {

@@ -71,6 +71,16 @@ impl Selection{
         if select{self.selected=Some(path.into());}true
     }
 }
+/// A negotiated business endpoint belongs to the live selected control peer.
+/// A saved reconnect hint is not authorization for a newly accepted phone.
+fn business_allowed(slots:&BTreeSet<(String,String)>,selected:&str)->bool{
+    slots.contains(&("control".into(),selected.into()))
+}
+fn reconnect_failure(error:&str)->&'static str{match error{
+    "SDP discovery timed out"=>"sdp_timeout","SDP discovery failed"=>"sdp_failed",
+    "SDP must contain one FE35 RFCOMM service"=>"sdp_service","SDP output failed"=>"sdp_output",
+    _=>"sdp_error",
+}}
 fn normalized_ip(ip:IpAddr)->IpAddr{match ip{IpAddr::V6(v)=>v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v)),_=>ip}}
 fn proc_ip(raw:&str)->Option<IpAddr>{
     if raw.len()!=8&&raw.len()!=32{return None;}let mut bytes=vec![];
@@ -405,8 +415,8 @@ impl Radio{
             let peer=query.peer.clone();let allowed=!self.projection_active&&self.state.slots.is_empty()&&self.state.selection.allows(&peer,false,self.state.origin.elapsed().as_millis() as u64);
             if !allowed{self.sdp_query=None;return Ok(());}
             match query.poll(){Ok(None)=>{},Ok(Some(port))=>{self.sdp_query=None;let address=self.state.selection.address(&peer).ok_or("invalid reconnect peer")?;
-                match rfcomm_socket(&address,port){Ok(fd)=>self.control_connect=Some((fd,Instant::now(),peer)),Err(_)=>{let _=self.ipc.send(&json!({"event":"reconnect-result","success":false}),None);}}
-            },Err(_)=>{self.sdp_query=None;let _=self.ipc.send(&json!({"event":"reconnect-result","success":false}),None);}}
+                match rfcomm_socket(&address,port){Ok(fd)=>self.control_connect=Some((fd,Instant::now(),peer)),Err(_)=>{let _=self.ipc.send(&json!({"event":"reconnect-result","success":false,"reason":"rfcomm_connect"}),None);}}
+            },Err(error)=>{self.sdp_query=None;let _=self.ipc.send(&json!({"event":"reconnect-result","success":false,"reason":reconnect_failure(&error)}),None);}}
         }
         if let Some((fd,started,peer))=self.control_connect.as_ref(){
             if self.projection_active||!self.state.slots.is_empty()||!self.state.selection.allows(peer,false,self.state.origin.elapsed().as_millis() as u64){self.control_connect=None;return Ok(());}
@@ -414,19 +424,21 @@ impl Radio{
                 if ready&&self.state.selection.allows(&peer,true,self.state.origin.elapsed().as_millis() as u64){let address=self.state.selection.address(&peer).ok_or("invalid reconnect peer")?;
                     self.ipc.send(&json!({"event":"rfcomm","stream":"control","device":peer,"address":address,"initiator":true}),Some(fd.as_raw_fd()))?;self.state.slots.insert(("control".into(),peer));
                     let _=self.ipc.send(&json!({"event":"reconnect-result","success":true}),None);
-                }else{let _=self.ipc.send(&json!({"event":"reconnect-result","success":false}),None);}
+                }else{let _=self.ipc.send(&json!({"event":"reconnect-result","success":false,"reason":"rfcomm_timeout"}),None);}
             }
         }Ok(())
     }
     fn open_business(&mut self,port:u16)->Result<()>{
-        if !self.reconnect_allowed||self.projection_active||self.business_connect.is_some()||!(1..=30).contains(&port){return Err("outgoing business connection unavailable".into());}
-        let selected=self.state.selection.selected.as_deref().ok_or("selected peer missing")?;if self.state.wake_peer.as_deref()!=Some(selected){return Err("outgoing business peer no longer selected".into());}let peer=self.state.selection.address(selected).ok_or("invalid selected peer")?;
+        if self.projection_active||self.business_connect.is_some()||!(1..=30).contains(&port){return Err("outgoing business connection unavailable".into());}
+        let selected=self.state.selection.selected.as_deref().ok_or("selected peer missing")?;
+        if !business_allowed(&self.state.slots,selected){return Err("outgoing business peer is not connected".into());}
+        let peer=self.state.selection.address(selected).ok_or("invalid selected peer")?;
         if self.state.slots.iter().any(|(stream,_)|stream=="business"){return Err("business connection already present".into());}
         self.business_connect=Some((rfcomm_socket(&peer,port)?,Instant::now()));Ok(())
     }
     fn poll_business(&mut self)->Result<()>{
         let Some((fd,started))=self.business_connect.as_ref()else{return Ok(());};let Some(ready)=rfcomm_ready(fd,*started)else{return Ok(());};
-        let (fd,_)=self.business_connect.take().unwrap();if !ready{let _=self.ipc.send(&json!({"event":"reconnect-result","success":false}),None);return Ok(());}
+        let (fd,_)=self.business_connect.take().unwrap();if !ready{let _=self.ipc.send(&json!({"event":"reconnect-result","success":false,"reason":"business_connect"}),None);return Ok(());}
         let device=self.state.selection.selected.clone().ok_or("selected peer missing")?;let address=self.state.selection.address(&device).ok_or("invalid selected peer")?;
         self.ipc.send(&json!({"event":"rfcomm","stream":"business","device":device,"address":address,"initiator":true}),Some(fd.as_raw_fd()))?;
         self.state.slots.insert(("business".into(),device));Ok(())
@@ -545,5 +557,17 @@ pub fn run(fd:i32)->Result<()>{#[cfg(unix)]{linux::run(fd)}#[cfg(not(unix))]{let
     }
     #[test]fn selection_is_sticky_and_agent_cannot_claim(){let c:Config=serde_json::from_value(json!({"model":"00040A00","network":false,"manage_controller":false,"pair_seconds":10,"exclude_peers":["02:00:00:00:00:01"]})).unwrap();validate(&c).unwrap();let mut s=Selection::new(&c).unwrap();s.deadline=Some(10000);
         assert!(!s.allows("/org/bluez/hci0/dev_02_00_00_00_00_01",true,0));assert!(s.allows("/org/bluez/hci0/dev_02_00_00_00_00_02",false,0));assert!(s.selected.is_none());assert!(s.allows("/org/bluez/hci0/dev_02_00_00_00_00_03",true,0));assert!(!s.allows("/org/bluez/hci0/dev_02_00_00_00_00_02",true,0));assert!(s.allows("/org/bluez/hci0/dev_02_00_00_00_00_03",false,20000));}
+    #[test]fn business_endpoint_follows_live_control_not_saved_reconnect_hint(){
+        let old="/org/bluez/hci0/dev_02_00_00_00_00_01";
+        let new="/org/bluez/hci0/dev_02_00_00_00_00_02";
+        let mut slots=BTreeSet::new();
+        assert!(!business_allowed(&slots,new));
+        slots.insert(("control".into(),new.into()));
+        assert!(business_allowed(&slots,new));assert!(!business_allowed(&slots,old));
+        slots.clear();slots.insert(("business".into(),new.into()));
+        assert!(!business_allowed(&slots,new));
+        slots.clear();slots.insert(("control".into(),old.into()));
+        assert!(business_allowed(&slots,old));assert!(!business_allowed(&slots,new));
+    }
     #[test]fn rejects_management_interface_and_bad_addresses(){for value in ["02:00:00:00:00: 1","02:00:00:00:00:0g","02:00:00:00:00:000"]{assert!(mac(value).is_err());}let c:Config=serde_json::from_value(json!({"model":"00040A00","interface":"end0","peer":"02:00:00:00:00:01"})).unwrap();assert!(validate(&c).is_err());assert_eq!(beacon("00040A00",7).unwrap(),vec![1,1,1,3,0,4,10,4,0,16,7]);}
 }

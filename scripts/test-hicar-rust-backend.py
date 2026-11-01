@@ -17,6 +17,9 @@ import sys
 import threading
 import time
 
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'experiments/hicar'))
+from nearby_wire import pack_frame as nearby_frame
+
 
 def exact(sock, count):
     data = bytearray()
@@ -52,7 +55,7 @@ class Harness:
     address = '02:00:00:00:00:01'
     peer = '02:00:00:00:00:02'
 
-    def __init__(self, binary, base=None, pair_seconds=None, fail_ports=False, stall_prepare=False, managed_handoff=False):
+    def __init__(self, binary, base=None, pair_seconds=None, fail_ports=False, stall_prepare=False, managed_handoff=False, fail_auth=False, reconnect_peer=None):
         self.binary = str(Path(binary).resolve())
         self.base = free_ports() if base is None else base
         self.pair_seconds = pair_seconds
@@ -60,6 +63,7 @@ class Harness:
         self.stall_prepare = stall_prepare
         self.managed_handoff=managed_handoff
         self.radio_handoff=False
+        self.fail_auth=fail_auth
         self.return_projection = 0
         self.sight_connection = None
         self.control_open = False
@@ -90,6 +94,7 @@ class Harness:
         if managed_handoff:args.append('--managed-handoff')
         args.extend(('--peer', self.peer) if pair_seconds is None else
                     ('--pair', str(pair_seconds)))
+        if reconnect_peer:args.extend(('--reconnect-peer',reconnect_peer))
         for name, fd in zip(('radio', 'session', 'media'), fds):
             args.extend((f'--test-{name}-fd', str(fd)))
         self.process = subprocess.Popen(args, pass_fds=fds, stdout=subprocess.PIPE,
@@ -193,8 +198,14 @@ class Harness:
             return {'ready': True, 'wire_identity_sha256': hashlib.sha256(own).hexdigest()}
         if operation == 'auth-open':
             return {'generation': 1}
+        if operation == 'open':
+            return {'channel':7}
+        if operation == 'nearby':
+            assert value['channel']==7 and bytes.fromhex(value['payload'])==b'NEGOTIATE'
+            return {'business_endpoint':18}
         if operation == 'auth':
             assert json.loads(value['envelope']) == {'synthetic': True}
+            if self.fail_auth:return {'ok':False,'failure':'auth_failed','error':'private packet PIN=123456'}
             return {'metadata': {'key_ready': True}, 'key': bytes(range(16)).hex()}
         if operation == 'dmsdp-open':
             assert value['generation'] == 1
@@ -313,6 +324,37 @@ class Harness:
 
 
 def run(binary):
+    # A newly selected phone must drive the negotiated business-channel request
+    # even when an unrelated saved phone supplied the optional reconnect hint.
+    pairing=Harness(binary,pair_seconds=120,reconnect_peer='02:00:00:00:00:03')
+    remote=None
+    try:
+        pairing.wait(lambda:bool(pairing.event('ready')))
+        remote,handed=socket.socketpair()
+        pairing.send_radio({'event':'rfcomm','stream':'control','device':'/mock/new-phone','address':pairing.peer,'initiator':False},handed.fileno())
+        handed.close();remote.sendall(nearby_frame(0,b'NEGOTIATE'))
+        pairing.wait(lambda:('radio','open-business') in pairing.trace)
+        assert pairing.event('target_selected')[-1]['address']==pairing.peer
+    finally:
+        if remote:remote.close()
+        pairing.close()
+    pairing.check()
+    rejected=Harness(binary,pair_seconds=120,fail_auth=True)
+    remote=None
+    try:
+        rejected.wait(lambda:bool(rejected.event('ready')))
+        remote,handed=socket.socketpair()
+        rejected.send_radio({'event':'rfcomm','stream':'business','device':'/mock/new-phone','address':rejected.peer},handed.fileno())
+        handed.close();remote.sendall(b'{"synthetic":true}')
+        rejected.wait(lambda:bool(rejected.event('auth_parse_stopped')))
+        assert rejected.event('auth_parse_stopped')[-1]['reason']=='auth_failed'
+        assert '123456' not in json.dumps(rejected.events)
+        assert rejected.process.poll() is None
+        rejected.wait(lambda:('session','auth-close') in rejected.trace)
+    finally:
+        if remote:remote.close()
+        rejected.close()
+    rejected.check()
     # The manager's private signal reaches only an already-ready owner; its
     # radio worker receives explicit handoff intent after graceful teardown.
     for managed,handoff in ((False,False),(True,False),(True,True)):

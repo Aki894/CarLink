@@ -6,6 +6,18 @@ use std::collections::BTreeMap;
 
 fn text<'a>(v:&'a Value,k:&str)->Result<&'a str>{v.get(k).and_then(Value::as_str).ok_or_else(||format!("missing {k}"))}
 fn number(v:&Value,k:&str)->Result<u32>{v.get(k).and_then(Value::as_u64).and_then(|v|v.try_into().ok()).ok_or_else(||format!("invalid {k}"))}
+/// Static diagnostic tags may cross the owner log boundary; packet text cannot.
+pub(super) fn failure_code(op:&str,error:&str)->&'static str{
+    match error{
+        "HiChain authentication failed"=>"auth_failed",
+        "HiChain instance initialization failed"=>"auth_identity",
+        "stale authentication session"|"business authentication already active"=>"auth_generation",
+        "native parameter length outside limit"|"invalid PIN or auth role"|"invalid STS key length"|"invalid native callback"=>"auth_parameters",
+        _ if op=="auth"=>"auth_envelope",
+        _ if op=="nearby"=>"nearby_negotiation",
+        _=>"private_worker_rejected",
+    }
+}
 fn uint(data:&[u8],p:&mut usize)->Result<u32>{wire::read_uint(data,p)?.ok_or("truncated resource integer".into())}
 fn append(out:&mut Vec<u8>,tag:u32,data:&[u8])->Result<()>{out.extend(wire::tlv(tag,data)?);Ok(())}
 
@@ -257,7 +269,7 @@ pub fn differential(v:&Value)->Result<Value>{
                 if op=="auth"&&auth_open&&command["generation"].as_u64()==Some(business.generation as u64){sight=None;control=None;business.close(&mut resource);auth_open=false;peer_seen=false;}
                 if op.starts_with("hisight-")&&sight.as_ref().is_some_and(|(n,_)|command["session"].as_u64()==Some(*n as u64)){sight=None;}
                 if op.starts_with("dmsdp-")&&control.as_ref().is_some_and(|(n,_)|command["session"].as_u64()==Some(*n as u64)){control=None;sight=None;}
-                send(&mut socket,&value!({"ok":false,"error":error}))?;
+                send(&mut socket,&value!({"ok":false,"error":error,"failure":failure_code(op,&error)}))?;
             }}
         }
         business.close(&mut resource);Ok(())
@@ -266,6 +278,13 @@ pub fn differential(v:&Value)->Result<Value>{
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn authentication_failure_codes_are_static_and_do_not_echo_packets(){
+        assert_eq!(failure_code("auth","HiChain authentication failed"),"auth_failed");
+        assert_eq!(failure_code("auth","native parameter length outside limit"),"auth_parameters");
+        assert_eq!(failure_code("auth","private packet 123456"),"auth_envelope");
+        assert_eq!(failure_code("nearby","private packet 123456"),"nearby_negotiation");
+        assert_eq!(failure_code("unknown","private packet 123456"),"private_worker_rejected");
+    }
     fn offer()->Offer{Offer::parse(&value!({"ssid":"CarLink","bssid":"02:00:00:00:00:01","password":"12345678","owner_ip":"192.168.49.1","client_ip":"192.168.49.2","frequency":5745,"port":4005})).unwrap()}
     #[test]fn authentication_gates_credentials_and_generation_reset(){
         let mut r=Resource::new(offer());let f=Frame{kind:33,flags:0,options:vec![],payload:wire::tlv(2,b"02:11:22:33:44:55").unwrap()};

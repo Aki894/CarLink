@@ -32,9 +32,10 @@ fn connect_seconds()->u64{30}fn stable_seconds()->u64{10}fn pair_seconds()->u64{
 #[derive(Default,Clone,Copy,PartialEq,Deserialize,Serialize)]
 #[serde(rename_all="lowercase")]enum BootProtocol{#[default]Last,Carplay,Hicar}
 #[derive(Deserialize,Serialize)]
-struct Store{#[serde(default)]selected_protocol:Option<Protocol>,#[serde(default)]boot_protocol:BootProtocol,#[serde(default)]devices:Vec<Device>,#[serde(default)]last:Option<Device>,#[serde(default)]paused:bool,#[serde(default)]policy:Policy,#[serde(default)]favorite:Option<Device>,#[serde(default)]preferred:Option<Device>,#[serde(default)]boot_id:Option<String>,#[serde(default="default_volume")]volume_percent:u8}
+struct Store{#[serde(default)]selected_protocol:Option<Protocol>,#[serde(default)]boot_protocol:BootProtocol,#[serde(default)]devices:Vec<Device>,#[serde(default)]last:Option<Device>,#[serde(default)]paused:bool,#[serde(default)]policy:Policy,#[serde(default)]favorite:Option<Device>,#[serde(default)]preferred:Option<Device>,#[serde(default)]boot_id:Option<String>,#[serde(default="default_volume")]volume_percent:u8,#[serde(default="default_feedback")]feedback_sound:bool}
 fn default_volume()->u8{100}
-impl Default for Store{fn default()->Self{Self{selected_protocol:None,boot_protocol:BootProtocol::Last,devices:vec![],last:None,paused:false,policy:Policy::Last,favorite:None,preferred:None,boot_id:None,volume_percent:100}}}
+fn default_feedback()->bool{true}
+impl Default for Store{fn default()->Self{Self{selected_protocol:None,boot_protocol:BootProtocol::Last,devices:vec![],last:None,paused:false,policy:Policy::Last,favorite:None,preferred:None,boot_id:None,volume_percent:100,feedback_sound:true}}}
 impl Store{
     fn reconcile_favorite(&mut self,choice:Option<&Choice>){
         if self.policy!=Policy::Favorite{return;}
@@ -91,19 +92,28 @@ fn save(path:&Path,store:&Store)->Result<()>{
 }
 #[derive(Clone,Serialize)]
 struct Status{schema:u32,generation:u64,default_protocol:BootProtocol,protocol:Option<Protocol>,target:Option<Device>,active:bool,pairing:bool,paused:bool,call_active:bool,
-    carlife_pid:Option<u32>,backend_pid:Option<u32>,usb_connected:bool,menu_visible:bool,volume_percent:u8,last_error:Option<String>,last_stage:Option<String>}
+    carlife_pid:Option<u32>,backend_pid:Option<u32>,usb_connected:bool,menu_visible:bool,volume_percent:u8,feedback_sound:bool,last_error:Option<String>,last_stage:Option<String>}
 fn event(name:&str){println!("{}",json!({"event":name}));}
-fn diagnostic_stage(name:&str)->bool{matches!(name,"bluetooth_reconnect_ready"|"bluetooth_reconnect_failed"|"ready"|"controller_setting"|"rfcomm_connected"|"rust_connection_worker_ready"|"rust_hisight_ready"|"rust_dmsdp_ready"|"rust_media_ready"|"rust_radio_ready"|"tcp_connected"|"hisight_connected"|"auth_parse_stopped"|"control_parse_stopped"|"control_peer_timeout"|"hisight_parse_stopped"|"parse_stopped"|"stream_error"|"tcp_stream_error"|"hisight_error"|"stopped")}
+fn diagnostic_stage(name:&str)->bool{matches!(name,"bluetooth_reconnect_ready"|"bluetooth_reconnect_failed"|"ready"|"controller_setting"|"rfcomm_connected"|"rust_connection_worker_ready"|"rust_hisight_ready"|"rust_dmsdp_ready"|"rust_media_ready"|"rust_radio_ready"|"tcp_connected"|"hisight_connected"|"auth_parse_stopped"|"control_parse_stopped"|"control_peer_timeout"|"hisight_parse_stopped"|"parse_stopped"|"stream_error"|"tcp_stream_error"|"hisight_error"|"stopped"|"authentication_progress")}
+fn stage_details(source:&Value,target:&mut Value){
+    if let Some(reason)=source["reason"].as_str().filter(|s|matches!(*s,"auth_failed"|"auth_identity"|"auth_generation"|"auth_parameters"|"auth_envelope"|"nearby_negotiation"|"business_no_control"|"business_unavailable"|"authentication_timeout"|"protocol_error"|"sdp_timeout"|"sdp_failed"|"sdp_service"|"sdp_output"|"sdp_error"|"rfcomm_connect"|"rfcomm_timeout"|"business_connect")){target["reason"]=reason.into();}
+    if source["event"]=="authentication_progress"||source["stage"]=="authentication_progress"{
+        if let Some(operation)=source["operation"].as_u64().filter(|n|matches!(n,1|3)){target["operation"]=operation.into();}
+        if let Some(message)=source["message"].as_u64().filter(|n|matches!(n,1|2|3|17|18|32769|32770|32771|32785|32786)){target["message"]=message.into();}
+        if let Some(code)=source["native_code"].as_i64().filter(|n|i32::try_from(*n).is_ok()){target["native_code"]=code.into();}
+        if let Some(authenticated)=source["authenticated"].as_bool(){target["authenticated"]=authenticated.into();}
+    }
+}
 fn stage_summary(v:&Value)->Option<Value>{
     let stage=v["event"].as_str().filter(|s|diagnostic_stage(s))?;
     // Reconstruct, never forward the source object or its dynamic fields.
-    let mut summary=json!({"event":"manager_backend_stage","stage":stage});
+    let mut summary=json!({"event":"manager_backend_stage","stage":stage});stage_details(v,&mut summary);
     if let Some(epoch)=v["session_epoch"].as_u64(){summary["session_epoch"]=epoch.into();}Some(summary)
 }
 fn stage_report(generation:u64,current:u64,v:&Value)->Option<Value>{
     if generation!=current||v["event"]!="manager_backend_stage"{return None;}
     let stage=v["stage"].as_str().filter(|s|diagnostic_stage(s))?;
-    Some(json!({"event":"manager_backend_stage","generation":generation,"stage":stage}))
+    let mut report=json!({"event":"manager_backend_stage","generation":generation,"stage":stage});stage_details(v,&mut report);Some(report)
 }
 struct Process{child:Child,pgid:i32,events:Receiver<Value>,generation:u64,managed_handoff:bool}
 fn spawn(args:&[String],generation:u64,source:Option<&Path>)->Result<Process>{
@@ -163,7 +173,7 @@ impl Owner{
         for args in [&config.carlife,&config.carplay,&config.hicar]{if args.len()>64||args.iter().any(|v|v.contains('\0')||v.len()>4096){return Err("invalid backend command".into());}}
         for d in &config.devices{d.validate()?;}
         let mut store=if config.state.exists(){serde_json::from_slice::<Store>(&private_read(&config.state)?).map_err(|_|"invalid device store")?}else{Store::default()};
-        if store.volume_percent>100{return Err("stored volume must be between 0 and 100".into());}
+        if store.volume_percent>150{return Err("stored volume must be between 0 and 150".into());}
         if store.devices.len()>8{return Err("too many stored devices".into());}for d in &store.devices{d.validate()?;}
         if let Some(last)=&store.last{last.validate()?;if !store.devices.iter().any(|d|d.protocol==last.protocol&&d.address.eq_ignore_ascii_case(&last.address)){store.last=None;}}
         for d in config.devices.iter().filter(|_|!config.state.exists()){if !store.devices.iter().any(|v|v.protocol==d.protocol&&v.address.eq_ignore_ascii_case(&d.address)){store.devices.push(d.clone());}}
@@ -175,8 +185,8 @@ impl Owner{
         }
         store.reconcile_favorite(None);
         let paused=store.paused;let protocol=store.selected_protocol.or(store.preferred.as_ref().or(store.last.as_ref()).map(|d|d.protocol)).or(config.initial).unwrap_or(Protocol::Carplay);let default_protocol=store.boot_protocol;
-        let volume_percent=store.volume_percent;
-        Ok(Self{config,store,status:Status{schema:1,generation:0,default_protocol,protocol:Some(protocol),target:None,active:false,pairing:false,paused,call_active:false,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,volume_percent,last_error:None,last_stage:None},
+        let volume_percent=store.volume_percent;let feedback_sound=store.feedback_sound;
+        Ok(Self{config,store,status:Status{schema:1,generation:0,default_protocol,protocol:Some(protocol),target:None,active:false,pairing:false,paused,call_active:false,carlife_pid:None,backend_pid:None,usb_connected:false,menu_visible:false,volume_percent,feedback_sound,last_error:None,last_stage:None},
             life:None,backend:None,choice:None,life_started:Instant::now(),life_retry_at:Instant::now(),life_failures:0,life_ready:false,last_media_report:None,started:Instant::now(),recovery_deadline:None,ready:None,seen_media:false,committed:false,pair_deadline:None,repair_used:false,retry_at:Instant::now(),tried:VecDeque::new(),last_auth:None,refusals:0,mux:None,menu_focus:0,menu_pending:None,menu_idle:true,sound_page:false,wireless_ready:false,source_ready:false,session_epoch:0,closed_hicar_epoch:None,source_floor:0,bound_source_id:0,pair_pin:None})
     }
     fn selected_protocol(&self)->Protocol{self.store.selected_protocol.or(self.status.protocol).or(self.store.preferred.as_ref().or(self.store.last.as_ref()).map(|d|d.protocol)).or(self.config.initial).unwrap_or(Protocol::Carplay)}
@@ -391,8 +401,9 @@ impl Owner{
             "return_projection"=>{if !self.status.active{return Err("no active projection".into());}self.return_projection();},
             "sound"=>{self.sound_page=true;self.menu_focus=0;self.status.menu_visible=true;self.menu_idle=false;},
             "menu_root"=>{self.sound_page=false;self.menu_focus=0;},
+            "feedback"=>{let enabled=v["enabled"].as_bool().ok_or("feedback requires enabled boolean")?;self.store.feedback_sound=enabled;self.status.feedback_sound=enabled;save(&self.config.state,&self.store)?;},
             "volume"=>{
-                let level=v["percent"].as_u64().filter(|n|*n<=100).ok_or("volume must be between 0 and 100")? as u8;
+                let level=v["percent"].as_u64().filter(|n|*n<=150).ok_or("volume must be between 0 and 150")? as u8;
                 if let Some(mux)=&self.mux{mux.set_volume(level)?;}
                 self.store.volume_percent=level;self.status.volume_percent=level;save(&self.config.state,&self.store)?;
             },
@@ -457,8 +468,8 @@ impl Owner{
         if self.sound_page{
             let mut rows=vec![];let mut actions=vec![];
             if self.status.active{rows.push("返回投屏".into());actions.push(json!({"op":"return_projection"}));}
-            rows.extend([format!("减小音量 −5% · 当前 {}%",self.store.volume_percent),format!("增大音量 +5% · 当前 {}%",self.store.volume_percent),"返回主菜单".into()]);
-            actions.extend([json!({"op":"volume","percent":self.store.volume_percent.saturating_sub(5)}),json!({"op":"volume","percent":self.store.volume_percent.saturating_add(5).min(100)}),json!({"op":"menu_root"})]);
+            rows.extend([format!("减小音量 −5% · 当前 {}%",self.store.volume_percent),format!("增大音量 +5% · 当前 {}%",self.store.volume_percent),format!("操作提示音：{} · 点击切换",if self.store.feedback_sound{"开"}else{"关"}),"返回主菜单".into()]);
+            actions.extend([json!({"op":"volume","percent":self.store.volume_percent.saturating_sub(5)}),json!({"op":"volume","percent":self.store.volume_percent.saturating_add(5).min(150)}),json!({"op":"feedback","enabled":!self.store.feedback_sound}),json!({"op":"menu_root"})]);
             return (rows,actions);
         }
         // A future favorite may select another protocol without replacing the
@@ -533,7 +544,7 @@ impl Owner{
         }Ok(())
     }
     fn tick(&mut self)->Result<()>{
-        if let Some(mux)=&self.mux{mux.set_volume(self.store.volume_percent)?;}
+        if let Some(mux)=&self.mux{mux.set_volume(self.store.volume_percent)?;mux.set_interaction(self.status.protocol==Some(Protocol::Hicar),self.store.feedback_sound&&!self.status.call_active);}
         let mut inputs=vec![];if let Some(mux)=&self.mux{for _ in 0..16{if let Some(v)=mux.try_input(){inputs.push(v);}else{break;}}}
         for v in inputs{self.menu_input(v)?;}
         if self.menu_idle&&self.status.active{self.status.menu_visible=false;self.menu_idle=false;}
@@ -703,12 +714,14 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         let (rows,actions)=owner.menu_model();assert_eq!(rows[0],"返回投屏");assert_eq!(actions[0]["op"],"return_projection");
         assert_eq!(rows.len(),5);assert_eq!(owner.menu_focus,0);
         owner.command(json!({"op":"sound"})).unwrap();assert!(owner.sound_page);
-        for level in [0,35,100]{owner.command(json!({"op":"volume","percent":level})).unwrap();assert_eq!(owner.status.volume_percent,level);}
+        for level in [0,35,100,125,150]{owner.command(json!({"op":"volume","percent":level})).unwrap();assert_eq!(owner.status.volume_percent,level);}
         owner.command(json!({"op":"volume","percent":65})).unwrap();
-        for invalid in [json!(101),json!(-1),json!(true),json!(1.5),Value::Null]{assert!(owner.command(json!({"op":"volume","percent":invalid})).is_err());}
+        for invalid in [json!(151),json!(-1),json!(true),json!(1.5),Value::Null]{assert!(owner.command(json!({"op":"volume","percent":invalid})).is_err());}
         let stored:Store=serde_json::from_slice(&private_read(&owner.config.state).unwrap()).unwrap();assert_eq!(stored.volume_percent,65);
         let reloaded=test_owner(&root);assert_eq!(reloaded.store.volume_percent,65);assert_eq!(reloaded.status.volume_percent,65);
         let legacy:Store=serde_json::from_value(json!({})).unwrap();assert_eq!(legacy.volume_percent,100);
+        assert!(legacy.feedback_sound);owner.command(json!({"op":"feedback","enabled":false})).unwrap();assert!(!owner.status.feedback_sound);
+        assert!(!test_owner(&root).store.feedback_sound);assert!(owner.command(json!({"op":"feedback","enabled":1})).is_err());
         let (rows,_)=owner.menu_model();assert!(rows.iter().all(|row|!row.contains("静音")));
         owner.menu_input(json!({"type":"key-press","code":1,"menu_rows":rows})).unwrap();
         assert!(!owner.status.menu_visible&&!owner.sound_page);assert!(owner.status.active);
@@ -801,6 +814,9 @@ pub fn run(args:&[String])->Result<()>{match args.first().map(String::as_str){
         let report=stage_report(7,7,&summary).unwrap();assert_eq!(report,json!({"event":"manager_backend_stage","generation":7,"stage":"rfcomm_connected"}));
         assert!(stage_summary(&json!({"event":"private_identity","stage":"ready"})).is_none());
         assert!(stage_report(7,7,&json!({"event":"manager_backend_stage","stage":"ready\nprivate"})).is_none());
+        let auth=stage_summary(&json!({"event":"authentication_progress","operation":1,"message":32769,"native_code":0,"authenticated":false,"pin":"123456","payload":"private"})).unwrap();
+        let clean=stage_report(7,7,&auth).unwrap();assert_eq!(clean["message"],32769);assert_eq!(clean["native_code"],0);assert!(clean.get("pin").is_none());
+        assert!(stage_summary(&json!({"event":"stream_error","reason":"123456"})).unwrap().get("reason").is_none());
     }
     #[test]fn stale_backend_stage_cannot_log_or_change_diagnostics(){
         let root=test_root("stage-generation");let mut owner=test_owner(&root);owner.status.generation=3;owner.status.last_stage=Some("ready".into());

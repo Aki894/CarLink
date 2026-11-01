@@ -17,6 +17,26 @@ static HANDOFF:AtomicBool=AtomicBool::new(false);
 extern "C" fn stop(_:i32){STOP.store(true,Ordering::Relaxed);}
 extern "C" fn handoff(_:i32){HANDOFF.store(true,Ordering::Relaxed);STOP.store(true,Ordering::Relaxed);}
 fn event(name:&str,epoch:u64){println!("{}",json!({"event":name,"session_epoch":epoch}));}
+fn safe_failure(value:&str)->&'static str{
+    match value{
+        "auth_failed"=>"auth_failed","auth_identity"=>"auth_identity","auth_generation"=>"auth_generation",
+        "auth_parameters"=>"auth_parameters","auth_envelope"=>"auth_envelope","nearby_negotiation"=>"nearby_negotiation",
+        "business_no_control"=>"business_no_control","business_unavailable"=>"business_unavailable",
+        "sdp_timeout"=>"sdp_timeout","sdp_failed"=>"sdp_failed","sdp_service"=>"sdp_service","sdp_output"=>"sdp_output",
+        "sdp_error"=>"sdp_error","rfcomm_connect"=>"rfcomm_connect","rfcomm_timeout"=>"rfcomm_timeout","business_connect"=>"business_connect",
+        "authentication_timeout"=>"authentication_timeout",_=>"protocol_error",
+    }
+}
+fn authentication_timeout(pairing:bool,pair_seconds:u64)->Duration{
+    Duration::from_secs(if pairing{pair_seconds.clamp(5,120)}else{30})
+}
+fn authentication_progress(epoch:u64,metadata:&Value)->Value{
+    let mut progress=json!({"event":"authentication_progress","session_epoch":epoch,"authenticated":metadata["key_ready"]==true});
+    if let Some(operation)=metadata["operation"].as_u64().filter(|n|matches!(*n,1|3)){progress["operation"]=operation.into();}
+    if let Some(message)=metadata["message"].as_u64().filter(|n|matches!(*n,1|2|3|17|18|32769|32770|32771|32785|32786)){progress["message"]=message.into();}
+    if let Some(code)=metadata["native_code"].as_i64().filter(|n|i32::try_from(*n).is_ok()){progress["native_code"]=code.into();}
+    progress
+}
 fn now_us()->u64{let mut t=libc::timespec{tv_sec:0,tv_nsec:0};unsafe{libc::clock_gettime(libc::CLOCK_MONOTONIC,&mut t);}t.tv_sec as u64*1_000_000+t.tv_nsec as u64/1000}
 fn num(v:&Value,k:&str)->Result<u64>{v[k].as_u64().ok_or_else(||format!("missing private field {k}"))}
 fn text<'a>(v:&'a Value,k:&str)->Result<&'a str>{v[k].as_str().ok_or_else(||format!("missing private field {k}"))}
@@ -175,7 +195,7 @@ impl Rpc{
         let mut data=serde_json::to_vec(v).map_err(|_|"private request serialization failed")?;if data.is_empty()||data.len()>self.limit{return Err("private request exceeds limit".into());}
         let sent=self.socket.write_all(&(data.len() as u32).to_be_bytes()).and_then(|_|self.socket.write_all(&data));wipe(&mut data);sent.map_err(|_|"private worker send failed")?;
         let mut length=[0;4];self.socket.read_exact(&mut length).map_err(|_|"private worker reply unavailable")?;let n=u32::from_be_bytes(length) as usize;if n==0||n>self.limit{return Err("private response exceeds limit".into());}
-        let mut data=vec![0;n];self.socket.read_exact(&mut data).map_err(|_|"private worker reply truncated")?;let result:Result<Value>=serde_json::from_slice(&data).map_err(|_|"invalid private response".into());wipe(&mut data);let v=result?;if v["ok"]!=true{return Err("private worker rejected operation".into());}Ok(v)}
+        let mut data=vec![0;n];self.socket.read_exact(&mut data).map_err(|_|"private worker reply truncated")?;let result:Result<Value>=serde_json::from_slice(&data).map_err(|_|"invalid private response".into());wipe(&mut data);let v=result?;if v["ok"]!=true{return Err(safe_failure(v["failure"].as_str().unwrap_or("")).into());}Ok(v)}
     fn close(&mut self){let _=self.call(&json!({"op":"close"}));let _=self.socket.shutdown(std::net::Shutdown::Both);finish(&mut self.child,Duration::from_millis(250));}
 }
 impl Drop for Rpc{fn drop(&mut self){let _=self.socket.shutdown(std::net::Shutdown::Both);finish(&mut self.child,Duration::from_millis(250));}}
@@ -194,7 +214,7 @@ impl Radio{
     }
     fn call(&mut self,mut v:Value,timeout:Duration)->Result<Value>{self.next=self.next.checked_add(1).ok_or("radio request generation exhausted")?;v["id"]=self.next.into();self.send(&v)?;let until=Instant::now()+timeout;
         loop{if STOP.load(Ordering::Relaxed)&&!self.closed{return Err("radio preparation interrupted".into());}
-            if let Some(packet)=self.receive()?{if packet.value["id"].as_u64()==Some(self.next){if packet.fd.is_some()||packet.value["ok"]!=true{return Err("radio operation rejected".into());}return Ok(packet.value);}if self.pending.len()>=8{return Err("radio event backlog exceeds limit".into());}self.pending.push_back(packet);}if Instant::now()>=until{return Err("radio operation timeout".into());}std::thread::sleep(Duration::from_millis(5));}}
+            if let Some(packet)=self.receive()?{if packet.value["id"].as_u64()==Some(self.next){if packet.fd.is_some(){return Err("radio operation rejected".into());}if packet.value["ok"]!=true{return Err(match packet.value["error"].as_str(){Some("outgoing business peer is not connected")=>"business_no_control",Some("outgoing business connection unavailable")=>"business_unavailable",_=>"radio operation rejected"}.into());}return Ok(packet.value);}if self.pending.len()>=8{return Err("radio event backlog exceeds limit".into());}self.pending.push_back(packet);}if Instant::now()>=until{return Err("radio operation timeout".into());}std::thread::sleep(Duration::from_millis(5));}}
     fn poll(&mut self)->Result<Option<Packet>>{if let Some(v)=self.pending.pop_front(){Ok(Some(v))}else{self.receive()}}
     fn close(&mut self){self.close_for_handoff(false);}
     fn close_for_handoff(&mut self,handoff:bool){if !self.closed{self.closed=true;let _=self.call(json!({"op":"close","handoff":handoff}),Duration::from_secs(7));finish(&mut self.child,Duration::from_millis(250));}}
@@ -281,7 +301,10 @@ impl Owner{
                 self.channels.push(channel);event("rfcomm_connected",self.epoch);
             },
             Some("request-disconnection")=>{let stream=v["stream"].as_str();let device=v["device"].as_str();for c in &mut self.channels{if c.radio_stream.as_deref()==stream&&c.device.as_deref()==device{c.closing=true;}}},
-            Some("reconnect-result")=>event(if v["success"]==true{"bluetooth_reconnect_ready"}else{"bluetooth_reconnect_failed"},self.epoch),
+            Some("reconnect-result")=>{
+                let name=if v["success"]==true{"bluetooth_reconnect_ready"}else{"bluetooth_reconnect_failed"};
+                if let Some(reason)=v["reason"].as_str(){println!("{}",json!({"event":name,"session_epoch":self.epoch,"reason":safe_failure(reason)}));}else{event(name,self.epoch);}
+            },
             Some("stopped")=>return Err("radio registration ended".into()),
             // ACL disconnect also occurs during normal Wi-Fi handoff.
             Some("disconnected")=>{},_=>if packet.fd.is_some(){return Err("unexpected radio descriptor".into());},
@@ -313,6 +336,7 @@ impl Owner{
     }Ok(())}
     fn receive_business(&mut self,c:&mut Channel,bytes:&[u8])->Result<()>{for envelope in c.json.feed(bytes)?{
         let mut result=self.worker.call(&json!({"op":"auth","generation":c.token,"envelope":envelope.to_string()}))?;
+        println!("{}",authentication_progress(c.epoch,&result["metadata"]));
         if let Some(reply)=result["reply"].as_str(){c.enqueue(unhex(reply)?)?;}
         if result["metadata"]["key_ready"]==true{let decoded=unhex(text(&result,"key")?)?;if !matches!(decoded.len(),16|32){return Err("invalid authenticated key size".into());}wipe(&mut self.key);self.key=decoded;self.authenticated=true;}
         wipe_field(&mut result,"key");
@@ -355,15 +379,15 @@ impl Owner{
         for _ in 0..count{
             if self.channels.is_empty(){break;}let mut c=self.channels.remove(0);
             if c.epoch!=self.epoch&&(c.kind==Kind::Control||c.kind==Kind::Sight){continue;}
-            let mut failed=false;let mut eof=false;
-            if !c.closing{for _ in 0..8{match c.read(){Ok(Some(mut bytes))=>{let handled=self.handle(&mut c,&bytes);wipe(&mut bytes);if handled.is_err(){failed=true;break;}},Ok(None)=>break,Err(_)=>{eof=true;break;}}}}
+            let mut failed=false;let mut eof=false;let mut reason="protocol_error";
+            if !c.closing{for _ in 0..8{match c.read(){Ok(Some(mut bytes))=>{let handled=self.handle(&mut c,&bytes);wipe(&mut bytes);if let Err(error)=handled{reason=safe_failure(&error);failed=true;break;}},Ok(None)=>break,Err(_)=>{eof=true;break;}}}}
             if c.kind==Kind::Control&&!failed&&!eof{
                 if c.last_valid.elapsed()>=Duration::from_secs(8){failed=true;event("control_peer_timeout",c.epoch);}
                 else if c.negotiated&&c.last_heartbeat.elapsed()>=Duration::from_secs(1){match self.worker.call(&json!({"op":"dmsdp-heartbeat","session":c.token})){Ok(v)=>{if let Some(h)=v["heartbeat"].as_str(){if c.enqueue(unhex(h)?).is_err(){failed=true;}}c.last_heartbeat=Instant::now();},Err(_)=>{failed=true;}}}
             }
-            if matches!(c.kind,Kind::Nearby|Kind::Business|Kind::Data)&&!self.authenticated&&c.created.elapsed()>Duration::from_secs(30){failed=true;}
+            if matches!(c.kind,Kind::Nearby|Kind::Business|Kind::Data)&&!self.authenticated&&c.created.elapsed()>authentication_timeout(self.config.pair,self.config.pair_seconds){failed=true;reason="authentication_timeout";}
             if !failed&&c.flush().is_err(){eof=true;}
-            if failed||eof||c.closing{if failed{event(if c.kind==Kind::Control{"control_parse_stopped"}else if c.kind==Kind::Sight{"hisight_parse_stopped"}else if c.kind==Kind::Business{"auth_parse_stopped"}else{"parse_stopped"},c.epoch);}
+            if failed||eof||c.closing{if failed{println!("{}",json!({"event":if c.kind==Kind::Control{"control_parse_stopped"}else if c.kind==Kind::Sight{"hisight_parse_stopped"}else if c.kind==Kind::Business{"auth_parse_stopped"}else{"parse_stopped"},"session_epoch":c.epoch,"reason":reason}));}
                 if matches!(c.kind,Kind::Control|Kind::Sight){self.channels.push(c);self.stop_projection();self.channels.retain(|c|!c.closing);}else{self.release_channel(&mut c,failed);}}
             else{self.channels.push(c);}
         }
@@ -397,6 +421,25 @@ impl Owner{
     fn shutdown(&mut self){self.stop_projection();self.channels.clear();self.auth_close();self.worker.close();self.radio.close_for_handoff(self.config.managed_handoff&&HANDOFF.load(Ordering::Relaxed));event("stopped",self.epoch);}
 }
 impl Drop for Owner{fn drop(&mut self){self.shutdown();}}
+#[cfg(test)]mod pairing_tests{
+    use super::*;
+    #[test]fn fixed_pin_entry_can_use_the_explicit_pairing_window(){
+        assert_eq!(authentication_timeout(true,120),Duration::from_secs(120));
+        assert_eq!(authentication_timeout(true,5),Duration::from_secs(5));
+        assert_eq!(authentication_timeout(false,120),Duration::from_secs(30));
+        assert_eq!(authentication_timeout(true,u64::MAX),Duration::from_secs(120));
+    }
+    #[test]fn pairing_diagnostics_never_export_unrecognized_private_errors(){
+        for secret in ["123456","my private envelope", "auth_failed\nPIN=123456"]{assert_eq!(safe_failure(secret),"protocol_error");}
+        for code in ["auth_failed","auth_identity","auth_parameters","sdp_service","rfcomm_timeout"]{assert_eq!(safe_failure(code),code);}
+    }
+    #[test]fn authentication_progress_exports_only_known_numeric_metadata(){
+        let result=authentication_progress(7,&json!({"operation":3,"message":17,"native_code":-4,"key_ready":true,"pin":"123456","envelope":"private"}));
+        assert_eq!(result,json!({"event":"authentication_progress","session_epoch":7,"operation":3,"message":17,"native_code":-4,"authenticated":true}));
+        let result=authentication_progress(8,&json!({"operation":123456,"message":123456,"native_code":u64::MAX,"key_ready":"private"}));
+        assert_eq!(result,json!({"event":"authentication_progress","session_epoch":8,"authenticated":false}));
+    }
+}
 pub fn run(args:&[String])->Result<()>{let mut config=Config::parse(args)?;if !config.test{super::super::identity::Identity::ensure(&config.identity,"CarLink")?;if config.interface=="auto"{config.interface=crate::network::discover(std::path::Path::new("/sys/class/net"))?;}}STOP.store(false,Ordering::Relaxed);HANDOFF.store(false,Ordering::Relaxed);unsafe{libc::signal(libc::SIGTERM,stop as *const () as libc::sighandler_t);libc::signal(libc::SIGINT,stop as *const () as libc::sighandler_t);if config.managed_handoff{libc::signal(libc::SIGUSR1,handoff as *const () as libc::sighandler_t);}}match Owner::start(config){Ok(mut owner)=>owner.run(),Err(_) if STOP.load(Ordering::Relaxed)=>Ok(()),Err(e)=>Err(e)}}
 }
 pub fn run(args:&[String])->Result<()>{#[cfg(unix)]{unix::run(args)}#[cfg(not(unix))]{let _=args;Err("HiCar backend requires Linux/Unix".into())}}

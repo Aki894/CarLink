@@ -8,6 +8,7 @@ mod voice;
 #[cfg(unix)]
 mod carplay_output;
 mod input;
+mod interaction;
 mod auth;
 mod network;
 mod hicar;

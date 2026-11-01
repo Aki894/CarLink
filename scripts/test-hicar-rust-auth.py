@@ -81,6 +81,39 @@ def check(binary,library,rust_library=None):
                         try:p.call(dict(op='close'))
                         except (BrokenPipeError,AssertionError):pass
                         p.close()
+    # A second fresh phone must bind to the same car identity/store without
+    # replacing the first phone's keys. Reconnect both, then the first again.
+    with tempfile.TemporaryDirectory(prefix='carlink-rust-multipeer-') as directory:
+        root=Path(directory)
+        car='AB'*32
+        for phase,phone_index in [('bind',0),('bind',1),('auth',0),('auth',1),('auth',0)]:
+            phone=('CD' if phone_index==0 else 'EF')*32
+            processes=[]
+            try:
+                for index,(own,peer,store) in enumerate([(phone,car,root/('phone-'+str(phone_index))),
+                                                       (car,phone,root/'car')]):
+                    process=Process(rust_command);processes.append(process)
+                    assert process.call(dict(library=rust_library,store=str(store),hardwareSeed=own,
+                        own=own,peer=peer,pin='012345',role=index+1),timeout=30)['ready']
+                states=[None,processes[1].call(dict(op='begin',phase=phase),timeout=30)]
+                states[0]=processes[0].call(dict(op='begin',phase=phase),timeout=30)
+                pending=[(1,packet) for packet in states[0]['packets']]
+                for _ in range(32):
+                    if not pending:break
+                    target,packet=pending.pop(0)
+                    states[target]=processes[target].call(dict(op='receive',data=packet),timeout=30)
+                    assert 'error' not in states[target] and 1 not in states[target]['results'], 'shared-car-store authentication failed'
+                    pending.extend((1-target,packet) for packet in states[target]['packets'])
+                assert not pending and all(0 in state['results'] for state in states)
+                assert states[0]['key_hash']==states[1]['key_hash']
+                assert all(state['key_length']==(32 if phase=='bind' else 16) for state in states)
+                cases.append(dict(phase=phase,implementations='RR',shared_car_store=True,
+                                  phone_index=phone_index,keys_match=True))
+            finally:
+                for process in processes:
+                    try:process.call(dict(op='close'))
+                    except (BrokenPipeError,AssertionError):pass
+                    process.close()
     # Wrong PIN must fail without a service key; no packet bodies are printed.
     with tempfile.TemporaryDirectory(prefix='carlink-rust-badpin-') as directory:
         peers=[]

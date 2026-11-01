@@ -1,0 +1,24 @@
+diff --git a/rust/carplay-airplay/src/air_play_session.rs b/rust/carplay-airplay/src/air_play_session.rs
+--- a/rust/carplay-airplay/src/air_play_session.rs
++++ b/rust/carplay-airplay/src/air_play_session.rs
+@@ -428,10 +428,8 @@ impl AirPlaySession {
+             0 => knob.home = true,
+             1 => knob.back = true,
+             2 => knob.select = true,
+-            3 => knob.x = -1,
+-            4 => knob.x = 1,
+-            5 => knob.y = -1,
+-            6 => knob.y = 1,
++            3 | 5 => knob.wheel = -1,
++            4 | 6 => knob.wheel = 1,
+             7..=9 => { self.send_media(match key { 7 => 3, 8 => 4, _ => 5 })?; return Ok(true); }
+             10 => { self.invoke_siri()?; return Ok(true); }
+             _ => return Ok(false),
+@@ -1239,6 +1237,6 @@ mod tests {
+         let cmds = commands(&socket);
+         assert_eq!(cmds.len(), 22);
+-        let knob = [[2,0,0,0], [4,0,0,0], [1,0,0,0], [0,255,0,0], [0,1,0,0], [0,0,255,0], [0,0,1,0]];
++        let knob = [[2,0,0,0], [4,0,0,0], [1,0,0,0], [0,0,0,255], [0,0,0,1], [0,0,0,255], [0,0,0,1]];
+         for (index, report) in knob.iter().enumerate() {
+             assert_eq!(cmds[index*2].get("hidReport").unwrap().as_data().unwrap(), report);
+             assert_eq!(cmds[index*2+1].get("hidReport").unwrap().as_data().unwrap(), &[0,0,0,0]);

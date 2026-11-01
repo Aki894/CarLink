@@ -16,7 +16,7 @@ struct View {rows:Vec<String>,focus:usize,visible:bool,revision:u64}
 impl Default for View {fn default()->Self{Self{rows:vec!["CarLink".into()],focus:0,visible:false,revision:0}}}
 /// One producer socket and one output socket. Native rendering is confined
 /// to its own thread; latest-view/result slots keep native work off media IO.
-pub struct Mux {view:Arc<Mutex<View>>,wake:Arc<Condvar>,events:Receiver<Value>,stop:Arc<AtomicBool>,source_ids:Arc<AtomicU64>,retire:Arc<AtomicU64>,retired:Arc<AtomicU64>,volume:Arc<AtomicU64>,resume:Arc<AtomicU64>,thread:Option<JoinHandle<()>>,renderer:Option<JoinHandle<()>>}
+pub struct Mux {view:Arc<Mutex<View>>,wake:Arc<Condvar>,events:Receiver<Value>,stop:Arc<AtomicBool>,source_ids:Arc<AtomicU64>,retire:Arc<AtomicU64>,retired:Arc<AtomicU64>,volume:Arc<AtomicU64>,resume:Arc<AtomicU64>,hicar:Arc<AtomicBool>,feedback_sound:Arc<AtomicBool>,thread:Option<JoinHandle<()>>,renderer:Option<JoinHandle<()>>}
 type RenderSlot=Arc<Mutex<Option<(u64,Result<Vec<u8>>)>>>;
 fn request_stop(view:&Mutex<View>,wake:&Condvar,stop:&AtomicBool){
     // Share the waiter's mutex so stopping cannot race between its predicate
@@ -43,7 +43,7 @@ impl Mux {
         let listener=UnixListener::bind(source_socket).map_err(|_|"cannot bind menu source socket")?;
         if fs::set_permissions(source_socket,fs::Permissions::from_mode(0o600)).is_err() || listener.set_nonblocking(true).is_err(){let _=fs::remove_file(source_socket);return Err("cannot secure menu source socket".into());}
         let view=Arc::new(Mutex::new(View::default()));let stop=Arc::new(AtomicBool::new(false));let wake=Arc::new(Condvar::new());let rendered=Arc::new(Mutex::new(None));
-        let source_ids=Arc::new(AtomicU64::new(0));let retire=Arc::new(AtomicU64::new(0));let retired=Arc::new(AtomicU64::new(0));let volume=Arc::new(AtomicU64::new(100));let resume=Arc::new(AtomicU64::new(0));
+        let source_ids=Arc::new(AtomicU64::new(0));let retire=Arc::new(AtomicU64::new(0));let retired=Arc::new(AtomicU64::new(0));let volume=Arc::new(AtomicU64::new(100));let hicar=Arc::new(AtomicBool::new(false));let feedback_sound=Arc::new(AtomicBool::new(true));let resume=Arc::new(AtomicU64::new(0));
         let (send,events)=mpsc::sync_channel(32);let (ready_tx,ready_rx)=mpsc::sync_channel(1);
         let rv=view.clone();let rs=stop.clone();let rw=wake.clone();let result=rendered.clone();let library=library.to_path_buf();let font=font.to_path_buf();
         let renderer=thread::spawn(move||render_loop(library,font,rv,rw,rs,result,ready_tx,delay));
@@ -53,22 +53,23 @@ impl Mux {
                 return Err(match result{Ok(Err(e))=>e,_=>"menu renderer initialization timed out".into()});}
         }
         let tv=view.clone();let ts=stop.clone();let tw=wake.clone();let input=source_socket.to_path_buf();let output=live_socket.to_path_buf();
-        let ids=source_ids.clone();let retirement=retire.clone();let completed=retired.clone();let gain=volume.clone();let return_source=resume.clone();
+        let ids=source_ids.clone();let retirement=retire.clone();let completed=retired.clone();let gain=volume.clone();let return_source=resume.clone();let input_profile=hicar.clone();let feedback_enabled=feedback_sound.clone();
         let handle=thread::spawn(move||{
             let exit_view=tv.clone();let mut worker=Worker::new(listener,output,tv,ts.clone(),send,rendered);
-            worker.source_ids=ids;worker.retire=retirement;worker.retired=completed;worker.volume=gain;worker.resume=return_source;worker.run();
+            worker.source_ids=ids;worker.retire=retirement;worker.retired=completed;worker.volume=gain;worker.resume=return_source;worker.hicar=input_profile;worker.feedback_sound=feedback_enabled;worker.run();
             request_stop(&exit_view,&tw,&ts);let _=fs::remove_file(input);
         });
-        Ok(Self{view,wake,events,stop,source_ids,retire,retired,volume,resume,thread:Some(handle),renderer:Some(renderer)})
+        Ok(Self{view,wake,events,stop,source_ids,retire,retired,volume,resume,hicar,feedback_sound,thread:Some(handle),renderer:Some(renderer)})
     }
     pub fn set_menu(&self,rows:Vec<String>,focus:usize,visible:bool)->Result<()>{
         if rows.is_empty() || rows.len()>24 || focus>=rows.len() || rows.iter().any(|s|s.chars().count()>128 || s.chars().any(char::is_control)){return Err("invalid menu model".into());}
         let mut view=self.view.lock().map_err(|_|"menu state unavailable")?;
         if view.rows!=rows || view.focus!=focus || view.visible!=visible {view.revision=view.revision.wrapping_add(1);view.rows=rows;view.focus=focus;view.visible=visible;self.wake.notify_one();}Ok(())
     }
+    pub fn set_interaction(&self,hicar:bool,sound:bool){self.hicar.store(hicar,Ordering::Release);self.feedback_sound.store(sound,Ordering::Release);}
     pub fn try_input(&self)->Option<Value>{self.events.try_recv().ok()}
-    /// Master output attenuation; capture/microphone data is never scaled.
-    pub fn set_volume(&self,level:u8)->Result<()>{if level>100{return Err("volume must be within 0..100".into());}self.volume.store(level as u64,Ordering::Release);Ok(())}
+    /// Master output gain; capture/microphone data is never scaled.
+    pub fn set_volume(&self,level:u8)->Result<()>{if level>150{return Err("volume must be within 0..150".into());}self.volume.store(level as u64,Ordering::Release);Ok(())}
     /// Fence the return request to the source that was current at this call.
     pub fn resume_projection(&self){self.resume.store(self.source_ids.load(Ordering::Acquire),Ordering::Release);}
     pub fn retire_sources(&self)->Result<u64>{
@@ -213,7 +214,7 @@ struct Gain {current:i64,start:i64,target:i64,position:u32}
 impl Default for Gain{fn default()->Self{Self{current:UNITY,start:UNITY,target:UNITY,position:GAIN_FRAMES}}}
 impl Gain {
     fn apply(&mut self,level:u8,pcm:&mut [u8]){
-        let target=level.min(100)as i64*UNITY/100;
+        let target=level.min(150)as i64*UNITY/100;
         if target!=self.target{self.start=self.current;self.target=target;self.position=0;}
         // Unity output keeps the already-owned payload untouched, with no copy.
         if self.current==UNITY&&self.target==UNITY{return;}
@@ -243,16 +244,16 @@ fn connect_output(path:&Path)->std::io::Result<UnixStream>{
 }
 struct Worker {listener:UnixListener,output:PathBuf,view:Arc<Mutex<View>>,stop:Arc<AtomicBool>,events:SyncSender<Value>,rendered:RenderSlot,cached:Option<(u64,Vec<u8>)>,
     microphone:Option<Frame>,audio_roles:[bool;4],source_ids:Arc<AtomicU64>,source_id:u64,retire:Arc<AtomicU64>,retired:Arc<AtomicU64>,
-    volume:Arc<AtomicU64>,gains:[Gain;4],resume:Arc<AtomicU64>,
+    volume:Arc<AtomicU64>,gains:[Gain;4],resume:Arc<AtomicU64>,hicar:Arc<AtomicBool>,feedback_sound:Arc<AtomicBool>,pad:crate::interaction::PadFilter,tone:crate::interaction::Tone,tone_owns_lane:bool,tone_stop_at:Option<Instant>,last_pcm:Option<Instant>,interaction_start:Instant,
     source:Option<Pipe>,hu:Option<Pipe>,snapshot:View,source_active:bool,source_key:Option<Frame>,waiting_key:bool,retry:Instant,painted:Option<Instant>,presented:Option<View>,touch:Option<Value>,menu_touch:Option<(usize,f64,f64,bool)>,last_key:Option<Instant>,back_frames:Vec<Frame>,back_last:Option<Instant>,back_first:Option<Instant>}
 impl Worker {
     fn new(listener:UnixListener,output:PathBuf,view:Arc<Mutex<View>>,stop:Arc<AtomicBool>,events:SyncSender<Value>,rendered:RenderSlot)->Self{
-        Self{listener,output,view,stop,events,rendered,cached:None,microphone:None,audio_roles:[false;4],source_ids:Arc::new(AtomicU64::new(0)),source_id:0,retire:Arc::new(AtomicU64::new(0)),retired:Arc::new(AtomicU64::new(0)),volume:Arc::new(AtomicU64::new(100)),gains:[Gain::default();4],resume:Arc::new(AtomicU64::new(0)),source:None,hu:None,snapshot:View::default(),source_active:false,source_key:None,waiting_key:true,retry:Instant::now(),painted:None,presented:None,touch:None,menu_touch:None,last_key:None,back_frames:vec![],back_last:None,back_first:None}
+        Self{listener,output,view,stop,events,rendered,cached:None,microphone:None,audio_roles:[false;4],source_ids:Arc::new(AtomicU64::new(0)),source_id:0,retire:Arc::new(AtomicU64::new(0)),retired:Arc::new(AtomicU64::new(0)),volume:Arc::new(AtomicU64::new(100)),gains:[Gain::default();4],resume:Arc::new(AtomicU64::new(0)),hicar:Arc::new(AtomicBool::new(false)),feedback_sound:Arc::new(AtomicBool::new(true)),pad:crate::interaction::PadFilter::default(),tone:crate::interaction::Tone::default(),tone_owns_lane:false,tone_stop_at:None,last_pcm:None,interaction_start:Instant::now(),source:None,hu:None,snapshot:View::default(),source_active:false,source_key:None,waiting_key:true,retry:Instant::now(),painted:None,presented:None,touch:None,menu_touch:None,last_key:None,back_frames:vec![],back_last:None,back_first:None}
     }
     fn output(&mut self,f:Frame){if self.hu.as_mut().is_some_and(|p|p.push(f).is_err()){self.hu=None;self.painted=None;self.presented=None;self.waiting_key=true;}}
     fn source(&mut self,f:Frame){if self.source.as_mut().is_some_and(|p|p.push(f).is_err()){self.lose_source();}}
     fn lose_source(&mut self){self.back_frames.clear();self.back_last=None;self.back_first=None;self.emit_source(json!({"type":"source-state","active":false}));self.source=None;self.source_active=false;self.source_key=None;self.waiting_key=true;self.touch=None;self.last_key=None;self.stop_source_media();}
-    fn stop_source_media(&mut self){
+    fn stop_source_media(&mut self){self.pad.reset();self.tone.cancel();self.tone_owns_lane=false;self.tone_stop_at=None;
         if let Some(h)=self.hu.as_mut(){h.discard_media();}self.painted=None;
         if let Some(f)=self.microphone.take(){if let Ok(mut v)=serde_json::from_slice::<Value>(&f.payload){v["active"]=Value::Bool(false);self.output(Frame::new(7,0,serde_json::to_vec(&v).unwrap()));}}
         self.audio_roles=[false;4];
@@ -269,7 +270,7 @@ impl Worker {
         if self.source_active{for role in 0..4{if self.audio_roles[role]{self.output(Frame::new(5,role as u8,vec![1]));}}if let Some(mic)=self.microphone.clone(){self.output(mic);}}
         self.waiting_key=true;self.request_key();self.replay_source_key();self.painted=None;}
     fn incoming(&mut self,mut f:Frame){
-        if f.kind==5{self.audio_roles[f.flags as usize]=f.payload[0]==1;}
+        if f.kind==5{self.audio_roles[f.flags as usize]=f.payload[0]==1;if f.flags==0&&f.payload[0]==1{self.tone_owns_lane=false;}if f.flags==3&&f.payload[0]==1{self.tone.cancel();}}
         if f.kind==7{if let Ok(v)=serde_json::from_slice::<Value>(&f.payload){
             if v["active"]==true{self.microphone=Some(f.clone());}
             else if v["active"]==false&&self.microphone.as_ref().and_then(|m|serde_json::from_slice::<Value>(&m.payload).ok()).is_some_and(|m|m["generation"]==v["generation"]){self.microphone=None;}
@@ -294,7 +295,7 @@ impl Worker {
             }
             self.waiting_key=false;self.output(f);
         }},
-        3=>{self.gains[f.flags as usize].apply(self.volume.load(Ordering::Acquire).min(100)as u8,&mut f.payload);if let Some(h)=self.hu.as_mut(){h.trim_audio();}self.output(f);},
+        3=>{if f.flags==0{self.last_pcm=Some(Instant::now());self.tone.mix(&mut f.payload);}self.gains[f.flags as usize].apply(self.volume.load(Ordering::Acquire).min(150)as u8,&mut f.payload);if let Some(h)=self.hu.as_mut(){h.trim_audio();}self.output(f);},
         8=>{self.emit_source(json!({"type":"open-menu"}));},
         _=>self.output(f),
     }}
@@ -319,9 +320,12 @@ impl Worker {
     }
     fn flush_backs(&mut self){let pending=std::mem::take(&mut self.back_frames);self.back_last=None;self.back_first=None;for f in pending{self.source(f);}}
     fn back_expired(&self,now:Instant)->bool{self.back_last.is_some_and(|t|now.duration_since(t)>=Duration::from_millis(350))||self.back_first.is_some_and(|t|now.duration_since(t)>=Duration::from_millis(900))}
-    fn input(&mut self,f:Frame){
+    fn input(&mut self,mut f:Frame){
         if f.kind==130{self.source(f);return;}
-        let Ok(v)=serde_json::from_slice::<Value>(&f.payload)else{return;};
+        let Ok(mut v)=serde_json::from_slice::<Value>(&f.payload)else{return;};
+        if v["type"]=="pad-reset"{self.pad.reset();return;}
+        if v["origin"]=="touchpad"{let Some(code)=v["code"].as_u64().filter(|c|(3..=6).contains(c))else{return;};if !self.pad.accept(code,self.interaction_start.elapsed().as_millis()as u64,self.hicar.load(Ordering::Acquire)&&!self.snapshot.visible){return;}v.as_object_mut().unwrap().remove("origin");f=feedback(v.clone());}
+        if v["type"]=="key-press"&&v["code"].as_u64().is_some_and(|c|c<=6){self.cue(v["code"].as_u64()==Some(2));}
         if matches!(v["type"].as_str(),Some("key-press"|"key"))&&v["code"].as_u64().is_some_and(|code|(7..=12).contains(&code)){
             self.flush_backs();self.source(f);return;
         }
@@ -339,6 +343,15 @@ impl Worker {
             }
         }else{if v["type"]=="touch"{self.touch=Some(v);}self.source(f);}
     }
+    fn cue(&mut self,click:bool){if self.feedback_sound.load(Ordering::Acquire)&&!self.audio_roles[3]&&self.microphone.is_none(){self.tone.trigger(self.interaction_start.elapsed().as_millis()as u64,click);}}
+    fn tone_step(&mut self){
+        if !self.feedback_sound.load(Ordering::Acquire)||self.audio_roles[3]||self.microphone.is_some(){self.tone.cancel();}
+        if self.tone.active()&&self.last_pcm.is_none_or(|t|t.elapsed()>=Duration::from_millis(60)){
+            if !self.audio_roles[0]&&!self.tone_owns_lane{self.tone_owns_lane=true;self.output(Frame::new(5,0,vec![1]));}
+            let mut f=menu_frame(vec![0;3528]);f.kind=3;f.flags=0;self.tone.mix(&mut f.payload);self.gains[0].apply(self.volume.load(Ordering::Acquire).min(150)as u8,&mut f.payload);self.output(f);if self.tone_owns_lane{self.tone_stop_at=Some(Instant::now()+Duration::from_millis(100));}
+        }
+        if !self.tone.active()&&self.tone_owns_lane&&self.tone_stop_at.is_none_or(|t|Instant::now()>=t){self.tone_owns_lane=false;if !self.audio_roles[0]{self.output(Frame::new(5,0,vec![0]));}}
+    }
     fn menu_touch(&mut self,v:Value){
         let Some(c)=v["contacts"].as_array().and_then(|c|c.first())else{self.menu_touch=None;return};
         let (Some(x),Some(y),Some(down))=(c["x"].as_f64(),c["y"].as_f64(),c["down"].as_bool())else{self.menu_touch=None;return};
@@ -349,7 +362,7 @@ impl Worker {
             if let Some((_,px,py,moved))=self.menu_touch.as_mut(){if (x-*px).abs()*800.0>12.0 || (y-*py).abs()*480.0>12.0{*moved=true;}}
             else if let Some(row)=row {self.menu_touch=Some((row,x,y,false));}
         }else if let Some((pressed,_,_,moved))=self.menu_touch.take(){
-            if let Some(row)=row {let op=if moved{"menu-focus"}else{"menu-select"};if moved || row==pressed {self.emit_menu(json!({"type":op,"index":row}));}}
+            if let Some(row)=row {let op=if moved{"menu-focus"}else{"menu-select"};if moved || row==pressed {self.cue(!moved);self.emit_menu(json!({"type":op,"index":row}));}}
         }
     }
     fn update(&mut self){
@@ -394,7 +407,7 @@ impl Worker {
             if self.hu.is_none() && Instant::now()>=self.retry {self.retry=Instant::now()+Duration::from_millis(200);if let Ok(s)=connect_output(&self.output){self.hu=Pipe::new(s).ok();if self.hu.is_some(){self.state();}}}
             if let Some(p)=self.source.as_mut(){match p.pump(false){Ok(frames)=>{for f in frames{self.incoming(f);}},Err(_)=>self.lose_source()}}
             if let Some(p)=self.hu.as_mut(){match p.pump(true){Ok(frames)=>{for f in frames{self.input(f);}},Err(_)=>{self.hu=None;self.painted=None;self.presented=None;self.waiting_key=true;}}}
-            self.take_rendered();
+            self.tone_step();self.take_rendered();
             // A static view reuses its independent IDR. Only its monotonic PTS
             // changes; no native call can block audio/control IO here.
             if self.hu.is_some() && self.snapshot.visible && self.painted.is_none_or(|t|t.elapsed()>=Duration::from_secs(1)) {
@@ -412,6 +425,38 @@ fn touch_row(x:f64,y:f64,focus:usize,count:usize)->Option<usize>{
 }
 #[cfg(test)]mod tests {
     use super::*;
+    #[test]fn boosted_output_is_exact_for_quiet_pcm_and_saturates_without_wrapping(){
+        let mut gain=Gain::default();let mut pcm=stereo(12000,-12000,GAIN_FRAMES as usize+2);gain.apply(150,&mut pcm);
+        assert_eq!(&pcm[pcm.len()-4..],stereo(18000,-18000,1));
+        let mut loud=stereo(i16::MAX,i16::MIN,4);gain.apply(150,&mut loud);assert_eq!(loud,stereo(i16::MAX,i16::MIN,4));
+    }
+    #[test]fn touchpad_profile_preserves_menu_and_keys_and_feedback_never_stops_source_music(){
+        let root=std::env::temp_dir().join(format!("carlink-pad-feedback-{}",std::process::id()));fs::create_dir(&root).unwrap();
+        let listener=UnixListener::bind(root.join("source")).unwrap();let(tx,_rx)=mpsc::sync_channel(32);
+        let mut w=Worker::new(listener,root.join("live"),Arc::new(Mutex::new(View::default())),Arc::new(AtomicBool::new(false)),tx,Arc::new(Mutex::new(None)));
+        let(socket,_peer)=UnixStream::pair().unwrap();w.source=Some(Pipe::new(socket).unwrap());
+        let(socket,_hu_peer)=UnixStream::pair().unwrap();w.hu=Some(Pipe::new(socket).unwrap());
+        w.hicar.store(true,Ordering::Release);
+        let pad=||feedback(json!({"type":"key-press","code":4,"origin":"touchpad"}));
+        w.input(pad());assert!(w.source.as_ref().unwrap().output.is_empty());w.input(pad());
+        assert_eq!(w.source.as_ref().unwrap().output.len(),1);
+        let forwarded:Value=serde_json::from_slice(&w.source.as_ref().unwrap().output[0].data[16..]).unwrap();assert_eq!(forwarded,json!({"type":"key-press","code":4}));
+        w.audio_roles[0]=true;w.tone_step();assert!(!w.tone.active());assert!(!w.tone_owns_lane);
+        assert!(w.hu.as_ref().unwrap().output.iter().all(|f|f.kind!=5));
+        w.tone.cancel();w.audio_roles[3]=true;w.cue(true);assert!(!w.tone.active());
+        w.audio_roles[3]=false;w.feedback_sound.store(false,Ordering::Release);w.cue(true);assert!(!w.tone.active());
+        drop(w);fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn quiet_feedback_stop_is_delayed_and_cannot_cancel_new_source_audio(){
+        let root=std::env::temp_dir().join(format!("carlink-tone-idle-{}",std::process::id()));fs::create_dir(&root).unwrap();
+        let listener=UnixListener::bind(root.join("source")).unwrap();let(tx,_rx)=mpsc::sync_channel(32);
+        let mut w=Worker::new(listener,root.join("live"),Arc::new(Mutex::new(View::default())),Arc::new(AtomicBool::new(false)),tx,Arc::new(Mutex::new(None)));
+        let(socket,_peer)=UnixStream::pair().unwrap();w.hu=Some(Pipe::new(socket).unwrap());w.cue(true);w.tone_step();
+        assert!(w.tone_owns_lane);assert_eq!(w.hu.as_ref().unwrap().output.iter().map(|p|p.kind).collect::<Vec<_>>(),vec![5,3]);
+        w.incoming(Frame::new(5,0,vec![1]));assert!(!w.tone_owns_lane);w.tone_stop_at=Some(Instant::now());w.tone_step();
+        assert_eq!(w.hu.as_ref().unwrap().output.len(),3);assert!(w.audio_roles[0]);
+        drop(w);fs::remove_dir_all(root).unwrap();
+    }
     fn stereo(left:i16,right:i16,frames:usize)->Vec<u8>{[left.to_le_bytes(),right.to_le_bytes()].concat().repeat(frames)}
     #[test]fn output_gain_preserves_unity_and_reaches_exact_attenuation_without_clipping(){
         let mut gain=Gain::default();let original=stereo(i16::MIN,i16::MAX,GAIN_FRAMES as usize);let mut pcm=original.clone();
