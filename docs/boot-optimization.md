@@ -1,5 +1,23 @@
 # Linux 启动配置与实测
 
+## 2026-10-30：headless 服务精简
+
+完整 [工作流 41047761788](https://github.com/Aki894/CarLink/actions/runs/41047761788)、镜像校验和上传通过；下载后摘要记录于 [验证文档](validation.md)。
+
+启动配置源码 `6210b2f`。停用重复文本日志 `rsyslog.service` 及其 `syslog.socket`；保留 journald 持久记录和 `/dev/log` 接收。停用本地屏幕 `getty@tty1`、键盘布局和控制台字体初始化，保留 `ttyS0` 串口救援、Ethernet SSH、NetworkManager、BlueZ、DNS、时钟同步、zram 和 ramlog。
+
+日志轮转改为开机 20 分钟后执行，之后每日运行，随机延后最多 5 分钟；清空日历触发及补跑，避免无 RTC 设备校时后立即抢占启动资源。更新任务保持原有延后设置。
+
+板端本轮基线为内核 8.067 秒＋用户空间 16.145 秒＝24.213 秒；首轮优化后软件重启为 7.240＋15.242＝22.482 秒。CarLink 管理器在 22.613 秒启动，HiCar 在 31.839 秒自动连通，CarLife USB 已连接，失败单元为零。此处计时从内核开始，不含 bootloader。
+
+重新通电后的另一轮为 7.514＋15.579＝23.093 秒，管理器在 23.097 秒启动，HiCar 在 29.346 秒自动连通。两次成功样本比本轮基线缩短约 1.1–1.7 秒，分别覆盖一次软件重启和一次断电通电；批量冷启动列入后续验收。CarPlay → HiCar 往返等待约 8.23 / 5.18 秒，CarLife PID `1637` 与 USB 会话保持。
+
+两轮成功样本之间发生过一次软件重启后未恢复网络，需用户重新通电。对应 boot `f73d02691dc04092af4dc4c20d46abb5` 的最后持久记录约在 18.87 秒、AIC 无线驱动初始化及 BlueZ 启动附近，CarLink 尚未启动，未留下异常栈。暖重启可靠性单独跟踪，根因等待 UART 现场及供电数据确认。
+
+这次精简减少两个常驻进程（rsyslog、tty1 getty）及本地控制台启动工作。Avahi 保留局域网主机发现；`user@0`、SSH 会话、hostnamed/dispatcher 属于管理连接或按需激活，不按一次进程列表归类为开机常驻负担。当前主要启动链仍经过 zram/ramlog、journald 和 NetworkManager。
+
+安装器支持已确认的 v1 13/14 路径清单增量升级到 v2，保留最初安装前配置，新增路径单独保存原状。19 项测试覆盖升级、回退、既有 journal drop-in、写入故障和管理员改动拒绝。板端升级备份与重启测量保存在 `/var/lib/carlink/maintenance/boot-profile-v2-20261030`。
+
 适用：悟空派 H3 / Orange Pi Zero、Debian 13 Armbian minimal、512 MiB RAM、AX900/AIC8800，内核 `6.18.57-current-sunxi`。配置已进入完整镜像并部署到开发板；原始计时及实现依据如下。
 
 ## 已定位的启动等待

@@ -1,5 +1,17 @@
 # 验证与部署记录
 
+## 2026-10-30：headless 启动服务精简
+
+启动配置源码 `6210b2fcfdcaa7da334683f09b15d51369eef440`；[完整工作流 41047761788](https://github.com/Aki894/CarLink/actions/runs/41047761788) 的 app、native、ARM interop、firmware、镜像结构校验和上传全部成功。镜像已完整下载，artifact digest、内部 SHA256SUMS 与检查报告核对通过。
+
+- 停用 rsyslog 及其激活 socket、本地 tty1 登录和键盘/字体初始化；保留持久 journald、串口、SSH、无线、DNS、时钟同步、zram 与 ramlog。日志轮转延至开机 20 分钟后，避免日历补跑占用启动资源。
+- 19 项启动配置测试、215 项 Rust 主测试、28 项原生输出测试与 2 项原生上行编码测试通过。v1 的 13/14 路径安装记录可安全升级，初始原状可恢复，拒绝管理员改动并覆盖升级写入失败回滚。
+- 板端启动配置已更新并验证 20 项路径无漂移。基线 24.213 秒；两次成功启动为 22.482 / 23.093 秒，管理器分别在 22.613 / 23.097 秒启动，HiCar 分别在 31.839 / 29.346 秒自动连接。
+- CarPlay → HiCar 切换约 8.23 / 5.18 秒，CarLife PID `1637` 和 USB 会话保持；随后 45 秒观察中 HiCar 后端 PID `2051` 与 CarLife PID 均不变。原生 syslog 入口已通过 logger → journald 持久写入验证，失败单元为零。
+- 出现过一次暖重启未恢复响应，需重新通电。最后持久日志位于 CarLink 启动前的 AIC 初始化/BlueZ 阶段，尚待串口确认根因，详见 [启动记录](boot-optimization.md)。
+
+镜像 `CarLink-refresh-39459953269-6210b2fc.img.xz` SHA256：`3405ee9847c31eb627dcd17da45ef2d12bdd52961c7ebb9709894e1ab4433c89`；ZIP SHA256：`39a944b4197e6526ee5057a120b4d386bc96af13a740ef21d02bd59d2e119b14`。此次仅部署启动配置，板端 Rust 应用仍使用已验证的 `3c1337f` 版本。升级前原状、归档及启动测量位于 `/var/lib/carlink/maintenance/boot-profile-v2-20261030`。
+
 ## 2026-10-30：五项工程缺口修复
 
 修复源码 `3c1337fe445ba8904a4384a17c606ec798344ba0`，完整 [工作流 41001502499](https://github.com/Aki894/CarLink/actions/runs/41001502499) 的 app、native、ARM rust-interop、firmware、镜像验证与产物上传全部成功。该工作流直接消费同次已成功的 app 产物，正式发布入口已实际走通。
