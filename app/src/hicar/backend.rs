@@ -17,6 +17,24 @@ static HANDOFF:AtomicBool=AtomicBool::new(false);
 extern "C" fn stop(_:i32){STOP.store(true,Ordering::Relaxed);}
 extern "C" fn handoff(_:i32){HANDOFF.store(true,Ordering::Relaxed);STOP.store(true,Ordering::Relaxed);}
 fn event(name:&str,epoch:u64){println!("{}",json!({"event":name,"session_epoch":epoch}));}
+fn diagnostic(name:&str,epoch:u64,reason:&str){println!("{}",json!({"event":name,"session_epoch":epoch,"reason":reason}));}
+fn failure_code(error:&str)->&'static str{
+    match error{
+        "invalid Nearby marker"|"invalid control frame"|"invalid control marker"|"invalid HiSight record"=> "invalid_frame",
+        "CRC mismatch"=>"crc_mismatch",
+        "unsupported CCMP version"|"unsupported CCMP version response"=>"ccmp_version",
+        "encrypted Nearby channel is unsupported"|"invalid encryption preference"|"invalid framing encryption preference"=>"encryption_preference",
+        "unsupported capability"|"capability exceeds limit"|"duplicate/excess capability"=>"capability",
+        "invalid channel identity"|"invalid remote summary"|"invalid summary length"|"invalid peer summary length"=>"summary",
+        "unsupported business request"|"invalid business tag length"|"invalid business tag"|"unsupported business transport"=>"business_request",
+        "network not negotiated"|"invalid network selection"|"unsupported client role"|"unsupported resource channel"=>"resource_negotiation",
+        "backend transport read failed"|"backend transport EOF"=>"transport_read",
+        "backend transport write failed"|"backend transport write EOF"=>"transport_write",
+        _ if error.starts_with("private")||error.contains("IPC")=>"session_worker",
+        _ if error.contains("authentication")||error.contains("HiChain")=>"authentication",
+        _=>"protocol_error",
+    }
+}
 fn now_us()->u64{let mut t=libc::timespec{tv_sec:0,tv_nsec:0};unsafe{libc::clock_gettime(libc::CLOCK_MONOTONIC,&mut t);}t.tv_sec as u64*1_000_000+t.tv_nsec as u64/1000}
 fn num(v:&Value,k:&str)->Result<u64>{v[k].as_u64().ok_or_else(||format!("missing private field {k}"))}
 fn text<'a>(v:&'a Value,k:&str)->Result<&'a str>{v[k].as_str().ok_or_else(||format!("missing private field {k}"))}
@@ -355,15 +373,17 @@ impl Owner{
         for _ in 0..count{
             if self.channels.is_empty(){break;}let mut c=self.channels.remove(0);
             if c.epoch!=self.epoch&&(c.kind==Kind::Control||c.kind==Kind::Sight){continue;}
-            let mut failed=false;let mut eof=false;
-            if !c.closing{for _ in 0..8{match c.read(){Ok(Some(mut bytes))=>{let handled=self.handle(&mut c,&bytes);wipe(&mut bytes);if handled.is_err(){failed=true;break;}},Ok(None)=>break,Err(_)=>{eof=true;break;}}}}
+            let mut failed=false;let mut eof=false;let mut reason=None;
+            if !c.closing{for _ in 0..8{match c.read(){Ok(Some(mut bytes))=>{let handled=self.handle(&mut c,&bytes);wipe(&mut bytes);if let Err(error)=handled{reason=Some(failure_code(&error));failed=true;break;}},Ok(None)=>break,Err(error)=>{reason=Some(failure_code(&error));eof=true;break;}}}}
             if c.kind==Kind::Control&&!failed&&!eof{
-                if c.last_valid.elapsed()>=Duration::from_secs(8){failed=true;event("control_peer_timeout",c.epoch);}
-                else if c.negotiated&&c.last_heartbeat.elapsed()>=Duration::from_secs(1){match self.worker.call(&json!({"op":"dmsdp-heartbeat","session":c.token})){Ok(v)=>{if let Some(h)=v["heartbeat"].as_str(){if c.enqueue(unhex(h)?).is_err(){failed=true;}}c.last_heartbeat=Instant::now();},Err(_)=>{failed=true;}}}
+                if c.last_valid.elapsed()>=Duration::from_secs(8){failed=true;reason=Some("control_peer_timeout");event("control_peer_timeout",c.epoch);}
+                else if c.negotiated&&c.last_heartbeat.elapsed()>=Duration::from_secs(1){match self.worker.call(&json!({"op":"dmsdp-heartbeat","session":c.token})){Ok(v)=>{if let Some(h)=v["heartbeat"].as_str(){if c.enqueue(unhex(h)?).is_err(){reason=Some("transport_write");failed=true;}}c.last_heartbeat=Instant::now();},Err(_)=>{reason=Some("session_worker");failed=true;}}}
             }
-            if matches!(c.kind,Kind::Nearby|Kind::Business|Kind::Data)&&!self.authenticated&&c.created.elapsed()>Duration::from_secs(30){failed=true;}
-            if !failed&&c.flush().is_err(){eof=true;}
-            if failed||eof||c.closing{if failed{event(if c.kind==Kind::Control{"control_parse_stopped"}else if c.kind==Kind::Sight{"hisight_parse_stopped"}else if c.kind==Kind::Business{"auth_parse_stopped"}else{"parse_stopped"},c.epoch);}
+            if matches!(c.kind,Kind::Nearby|Kind::Business|Kind::Data)&&!self.authenticated&&c.created.elapsed()>Duration::from_secs(30){
+                failed=true;reason=Some("authentication_timeout");
+            }
+            if !failed{if let Err(error)=c.flush(){reason=Some(failure_code(&error));eof=true;}}
+            if failed||eof||c.closing{if failed{let name=if c.kind==Kind::Control{"control_parse_stopped"}else if c.kind==Kind::Sight{"hisight_parse_stopped"}else if c.kind==Kind::Business{"auth_parse_stopped"}else{"parse_stopped"};diagnostic(name,c.epoch,reason.unwrap_or("protocol_error"));}
                 if matches!(c.kind,Kind::Control|Kind::Sight){self.channels.push(c);self.stop_projection();self.channels.retain(|c|!c.closing);}else{self.release_channel(&mut c,failed);}}
             else{self.channels.push(c);}
         }

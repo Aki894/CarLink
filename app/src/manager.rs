@@ -98,12 +98,18 @@ fn stage_summary(v:&Value)->Option<Value>{
     let stage=v["event"].as_str().filter(|s|diagnostic_stage(s))?;
     // Reconstruct, never forward the source object or its dynamic fields.
     let mut summary=json!({"event":"manager_backend_stage","stage":stage});
-    if let Some(epoch)=v["session_epoch"].as_u64(){summary["session_epoch"]=epoch.into();}Some(summary)
+    if let Some(epoch)=v["session_epoch"].as_u64(){summary["session_epoch"]=epoch.into();}
+    if let Some(reason)=v["reason"].as_str().filter(|s|s.len()<=64&&s.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_'||b==b'-')){
+        summary["reason"]=reason.into();
+    }Some(summary)
 }
 fn stage_report(generation:u64,current:u64,v:&Value)->Option<Value>{
     if generation!=current||v["event"]!="manager_backend_stage"{return None;}
     let stage=v["stage"].as_str().filter(|s|diagnostic_stage(s))?;
-    Some(json!({"event":"manager_backend_stage","generation":generation,"stage":stage}))
+    let mut report=json!({"event":"manager_backend_stage","generation":generation,"stage":stage});
+    if let Some(reason)=v["reason"].as_str().filter(|s|s.len()<=64&&s.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_'||b==b'-')){
+        report["reason"]=reason.into();
+    }Some(report)
 }
 struct Process{child:Child,pgid:i32,events:Receiver<Value>,generation:u64,managed_handoff:bool}
 fn spawn(args:&[String],generation:u64,source:Option<&Path>)->Result<Process>{
