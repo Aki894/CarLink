@@ -60,15 +60,38 @@ fn hotspot_ipv4_ready(addresses:&Value,interface:&str)->bool{
         &&link["addr_info"].as_array().is_some_and(|addresses|addresses.iter().any(|address|
             address["family"]=="inet"&&address["local"]=="192.168.49.1"&&address["prefixlen"]==24))))
 }
-struct Selection{prefix:String,selected:Option<String>,excluded:BTreeSet<String>,deadline:Option<u64>}
+struct Selection{prefix:String,selected:Option<String>,excluded:BTreeSet<String>,deadline:Option<u64>,ble_until:Option<u64>,ble_candidate:Option<String>}
 impl Selection{
-    fn new(c:&Config)->Result<Self>{Ok(Self{prefix:format!("{}/dev_",c.adapter),selected:c.peer.as_ref().map(|p|mac(p).map(|p|format!("{}/dev_{}",c.adapter,p.replace(':',"_")))).transpose()?,excluded:c.exclude_peers.iter().map(|p|mac(p)).collect::<Result<_>>()?,deadline:None})}
+    fn new(c:&Config)->Result<Self>{Ok(Self{prefix:format!("{}/dev_",c.adapter),selected:c.peer.as_ref().map(|p|mac(p).map(|p|format!("{}/dev_{}",c.adapter,p.replace(':',"_")))).transpose()?,excluded:c.exclude_peers.iter().map(|p|mac(p)).collect::<Result<_>>()?,deadline:None,ble_until:None,ble_candidate:None})}
     fn address(&self,path:&str)->Option<String>{let p=path.strip_prefix(&self.prefix)?;if !p.bytes().all(|b|b.is_ascii_digit()||(b'A'..=b'F').contains(&b)||b==b'_'){return None;}mac(&p.replace('_',":")).ok()}
     fn allows(&mut self,path:&str,select:bool,now:u64)->bool{
         let Some(address)=self.address(path)else{return false;};
         if let Some(selected)=&self.selected{return selected==path;}
         if self.excluded.contains(&address)||self.deadline.is_none_or(|d|now>=d){return false;}
         if select{self.selected=Some(path.into());}true
+    }
+    // HiCar can pair its LE transport under an RPA unrelated to its BR/EDR
+    // address. Allow one transient LE Agent1 candidate during the first 120 s
+    // of authenticated projection; never change RFCOMM selection or save an
+    // unverified BR/EDR-to-LE identity association.
+    fn ble_window(&mut self,active:bool,now:u64){
+        self.ble_until=if active&&self.selected.is_some(){Some(now.saturating_add(120_000))}else{None};
+        self.ble_candidate=None;
+    }
+    fn pending_ble_rpa(&self,path:&str,now:u64)->bool{
+        let Some(address)=self.address(path)else{return false;};
+        let Some(first)=address.get(..2).and_then(|v|u8::from_str_radix(v,16).ok())else{return false;};
+        self.selected.as_deref().is_some_and(|selected|selected!=path)
+            &&self.ble_until.is_some_and(|until|now<until)
+            &&self.ble_candidate.as_deref().is_none_or(|candidate|candidate==path)
+            &&!self.excluded.contains(&address)
+            // BLE random-address most-significant bits 01 identify an RPA.
+            &&(first&0xc0)==0x40
+    }
+    fn accept_ble_rpa(&mut self,path:&str,now:u64)->bool{
+        if !self.pending_ble_rpa(path,now){return false;}
+        if self.ble_candidate.is_none(){self.ble_candidate=Some(path.into());}
+        true
     }
 }
 /// A negotiated business endpoint belongs to the live selected control peer.
@@ -179,6 +202,25 @@ fn read_arg(api:&Api,iter:&mut Iter,depth:usize)->Result<Arg>{unsafe{
     }
 }}
 fn args(api:&Api,m:Msg)->Result<Vec<Arg>>{let mut iter=Iter::new();if unsafe{(api.iter_init)(m,&mut iter)}==0{return Ok(vec![]);}let mut out=vec![];loop{if out.len()>=32{return Err("too many D-Bus arguments".into());}out.push(read_arg(api,&mut iter,0)?);if unsafe{(api.next)(&mut iter)}==0{break;}}Ok(out)}
+// Agent1 may see the LE privacy address before BlueZ has learned the peer's
+// IRK. Check the real Device1 transport and connection properties, not just
+// a syntactically random MAC. This is an admission gate, not identity proof.
+fn connected_ble_rpa_properties(values:&[Arg],address:&str)->bool{
+    let Some(Arg::Array(_,rows))=values.first()else{return false;};
+    let (mut address_ok,mut random,mut connected,mut blocked)=(false,false,false,false);
+    for row in rows{
+        if let Arg::Entry(v)=row{
+            match v.first().and_then(Arg::text){
+                Some("Address")=>address_ok=v.get(1).and_then(Arg::text).is_some_and(|a|a.eq_ignore_ascii_case(address)),
+                Some("AddressType")=>random=v.get(1).and_then(Arg::text)==Some("random"),
+                Some("Connected")=>connected=v.get(1).and_then(Arg::boolean)==Some(true),
+                Some("Blocked")=>blocked=v.get(1).and_then(Arg::boolean)==Some(true),
+                _=>{},
+            }
+        }
+    }
+    address_ok&&random&&connected&&!blocked
+}
 struct Message<'a>{api:&'a Api,raw:Msg}impl Drop for Message<'_>{fn drop(&mut self){unsafe{(self.api.unref)(self.raw);}}}
 struct Bus{api:Api,connection:Conn,bluez:String,nm:String}
 impl Drop for Bus{fn drop(&mut self){unsafe{(self.api.connection_close)(self.connection);(self.api.connection_unref)(self.connection);}}}
@@ -255,10 +297,22 @@ impl State{
         }
         if interface=="org.bluez.Agent1"&&object==format!("{ROOT}/agent"){
             if member=="Release"||member=="Cancel"{return bus.reply(m,vec![]);}
-            let allowed=a.first().and_then(Arg::text).is_some_and(|p|self.selection.allows(p,false,self.origin.elapsed().as_millis() as u64));
-            if !allowed||self.closing{return bus.reject(m,"org.bluez.Error.Rejected");}
-            if member=="RequestConfirmation"||member=="RequestAuthorization"{return bus.reply(m,vec![]);}
-            if member=="AuthorizeService"&&a.get(1).and_then(Arg::text).is_some_and(|s|[FE35,FE36].contains(&s.to_ascii_lowercase().as_str())){return bus.reply(m,vec![]);}
+            if self.closing{return bus.reject(m,"org.bluez.Error.Rejected");}
+            let device=a.first().and_then(Arg::text);
+            let now=self.origin.elapsed().as_millis() as u64;
+            let selected=device.is_some_and(|p|self.selection.allows(p,false,now));
+            if member=="RequestConfirmation"||member=="RequestAuthorization"{
+                if selected{return bus.reply(m,vec![]);}
+                if let Some(path)=device.filter(|p|self.selection.pending_ble_rpa(p,now)){
+                    let address=self.selection.address(path).ok_or("invalid BLE pairing address")?;
+                    // Only BlueZ's actual connected LE-random Device1 is eligible.
+                    // Its RPA is never granted RFCOMM/profile access as a peer.
+                    let props=bus.call(self,ipc,"org.bluez",path,PROPERTIES,"GetAll",vec![text("org.bluez.Device1")],Duration::from_secs(1)).ok();
+                    if props.as_ref().is_some_and(|v|connected_ble_rpa_properties(v,&address))
+                        &&self.selection.accept_ble_rpa(path,now){return bus.reply(m,vec![]);}
+                }
+            }
+            if selected&&member=="AuthorizeService"&&a.get(1).and_then(Arg::text).is_some_and(|s|[FE35,FE36].contains(&s.to_ascii_lowercase().as_str())){return bus.reply(m,vec![]);}
             return bus.reject(m,"org.bluez.Error.Rejected");
         }
         if interface=="org.bluez.LEAdvertisement1"&&member=="Release"{self.stopped=true;return bus.reply(m,vec![]);}
@@ -506,7 +560,9 @@ pub fn run(fd:i32)->Result<()>{
                     "activate"=>radio.activate().map(|_|json!({"active":true})),
                     "release"=>{let stream=v["stream"].as_str().ok_or("missing stream")?;let device=v["device"].as_str().ok_or("missing device")?;radio.state.slots.remove(&(stream.into(),device.into()));Ok(json!({}))},
                     "open-business"=>{let port=v["port"].as_u64().and_then(|v|u16::try_from(v).ok()).ok_or("invalid business port")?;radio.open_business(port).map(|_|json!({"pending":true}))},
-                    "projection"=>{radio.projection_active=v["active"].as_bool().ok_or("projection active flag required")?;if !radio.projection_active{radio.reconnect_at=Instant::now();radio.reconnect_attempts=0;}Ok(json!({}))},
+                    "projection"=>{radio.projection_active=v["active"].as_bool().ok_or("projection active flag required")?;
+                        radio.state.selection.ble_window(radio.projection_active,radio.state.origin.elapsed().as_millis() as u64);
+                        if !radio.projection_active{radio.reconnect_at=Instant::now();radio.reconnect_attempts=0;}Ok(json!({}))},
                     "status"=>Ok(json!({"active":radio.activated,"streams":radio.state.slots.len()})),
                     "close"=>{radio.cleanup(radio.c.managed_handoff&&v["handoff"]==true);let _=radio.ipc.send(&json!({"id":v.get("id"),"ok":true,"closed":true}),None);break;},
                     _=>Err("unknown radio operation".into()),
@@ -554,6 +610,26 @@ pub fn run(fd:i32)->Result<()>{#[cfg(unix)]{linux::run(fd)}#[cfg(not(unix))]{let
         let mut s=Selection::new(&c).unwrap();s.deadline=Some(120000);assert!(s.selected.is_none());
         let old="/org/bluez/hci0/dev_02_00_00_00_00_01";let new="/org/bluez/hci0/dev_02_00_00_00_00_02";
         assert!(s.allows(old,false,0));assert!(s.selected.is_none());assert!(s.allows(new,true,100));assert!(!s.allows(old,true,101));assert!(s.allows(new,true,102));
+    }
+    #[test]fn transient_ble_rpa_does_not_steal_the_selected_classic_peer(){
+        let c:Config=serde_json::from_value(json!({"model":"00040A00","network":false,"manage_controller":false,"peer":"30:8A:F7:39:FD:05","exclude_peers":["69:00:00:00:00:03"]})).unwrap();
+        let mut s=Selection::new(&c).unwrap();
+        let classic="/org/bluez/hci0/dev_30_8A_F7_39_FD_05";
+        let rpa="/org/bluez/hci0/dev_69_00_00_00_00_01";
+        let other="/org/bluez/hci0/dev_69_00_00_00_00_02";
+        assert!(!s.accept_ble_rpa(rpa,0));
+        s.ble_window(true,100);
+        assert!(s.accept_ble_rpa(rpa,101));
+        assert!(s.accept_ble_rpa(rpa,102));
+        assert!(!s.accept_ble_rpa(other,103));
+        assert!(!s.accept_ble_rpa("/org/bluez/hci0/dev_69_00_00_00_00_03",104));
+        assert!(!s.accept_ble_rpa("/org/bluez/hci0/dev_C9_00_00_00_00_01",105)); // static random, not RPA
+        assert!(!s.accept_ble_rpa("/org/bluez/hci1/dev_69_00_00_00_00_01",106));
+        assert!(s.allows(classic,false,121_000));
+        assert!(!s.allows(rpa,false,102)); // never grants an RFCOMM session
+        assert!(!s.accept_ble_rpa(rpa,120_100)); // expired
+        s.ble_window(false,120_101);
+        assert!(!s.accept_ble_rpa(rpa,120_102));
     }
     #[test]fn selection_is_sticky_and_agent_cannot_claim(){let c:Config=serde_json::from_value(json!({"model":"00040A00","network":false,"manage_controller":false,"pair_seconds":10,"exclude_peers":["02:00:00:00:00:01"]})).unwrap();validate(&c).unwrap();let mut s=Selection::new(&c).unwrap();s.deadline=Some(10000);
         assert!(!s.allows("/org/bluez/hci0/dev_02_00_00_00_00_01",true,0));assert!(s.allows("/org/bluez/hci0/dev_02_00_00_00_00_02",false,0));assert!(s.selected.is_none());assert!(s.allows("/org/bluez/hci0/dev_02_00_00_00_00_03",true,0));assert!(!s.allows("/org/bluez/hci0/dev_02_00_00_00_00_02",true,0));assert!(s.allows("/org/bluez/hci0/dev_02_00_00_00_00_03",false,20000));}
