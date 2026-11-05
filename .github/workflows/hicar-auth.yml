@@ -166,10 +166,6 @@ jobs:
       base_run_id: ${{ inputs.base_run_id }}
       base_artifact_name: ${{ inputs.base_artifact_name }}
       app_run_id: ${{ inputs.app_run_id }}
-      driver_artifact_name:
-        description: Optional driver artifact name override
-        type: string
-        default: ''
       driver_run_id: ${{ inputs.driver_run_id }}
       driver_artifact_name: ${{ inputs.driver_artifact_name }}
       variant: main

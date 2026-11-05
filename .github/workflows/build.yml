@@ -13,6 +13,10 @@ on:
         description: Rebuild the kernel/base image only (not a complete CarLink release)
         type: boolean
         default: false
+      refreshed_base_run_id:
+        description: Optional successful run containing a verified refreshed image and matched driver
+        type: string
+        default: ''
 permissions:
   contents: read
   actions: read
@@ -141,6 +145,10 @@ jobs:
     uses: ./.github/workflows/hicar-auth.yml
     with:
       app_run_id: ${{ github.run_id }}
+      base_run_id: ${{ inputs.refreshed_base_run_id || '39459953269' }}
+      base_artifact_name: ${{ inputs.refreshed_base_run_id && 'carlink-h3-refreshed-image' || 'carlink-h3-image' }}
+      driver_run_id: ${{ inputs.refreshed_base_run_id || '39670639717' }}
+      driver_artifact_name: ${{ inputs.refreshed_base_run_id && 'carlink-aic8800-hot-deploy-main' || '' }}
     secrets: inherit
   baseline:
     if: github.event_name == 'workflow_dispatch' && inputs.firmware && inputs.kernel_baseline
