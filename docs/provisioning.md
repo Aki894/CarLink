@@ -1,41 +1,13 @@
-# 正式固件与首次初始化
+# 安装与初始化
 
-## 构建入口
+1. 核对[硬件要求](../firmware/HARDWARE.md)，确认镜像适合你的设备，并备份目标存储介质。
+2. 从 [CarLink builds](https://github.com/Aki894/CarLink/actions/workflows/build.yml) 的成功运行下载 `carlink-h3-refreshed-image`。自行触发时选择 `firmware=true`、`kernel_baseline=false`。仅有应用包或 baseline 镜像时，尚未得到完整固件。
+3. 解开 artifact 外层 ZIP，用 `sha256sum -c SHA256SUMS` 验证压缩镜像。使用支持 `.img.xz` 的写盘工具写入目标介质，或先解压为 `.img`。核对写入目标，写盘会覆盖该介质。
+4. 启动盒子并保留有线管理连接。检查 `systemctl status carlink` 和 `carlink doctor --json`，再连接车机的 CarLife 数据口。
 
-日常使用 GitHub Actions 的 **CarLink builds**，选择 `firmware=true`、`kernel_baseline=false`。该入口在应用测试、交叉编译和上传完成后，依次构建原生 HiCar 认证库、执行 ARM 互通测试，并组装完整双协议镜像。
+## 本地身份和配置
 
-正式产物为 `carlink-h3-refreshed-image`，必须同时具备 Rust manager 及示例配置、HiCar 原生认证依赖、匹配内核的 AIC 模块/固件，以及菜单与媒体运行包。镜像内记录 AIC 来源和文件摘要；检查缺项、摘要、ABI、vermagic 或来源不一致即失败。
-
-同一次 workflow 的固件任务可以读取已成功结束的 `app` job 产物，但须匹配本次 run、提交、仓库及两个已上传 artifact 的 digest。引用其他 run 时，仍要求该 run 整体成功。
-
-需要重编内核时才选择 `firmware=true`、`kernel_baseline=true`，输出明确标记的 `carlink-h3-baseline-image`。更换内核后先构建匹配的 AIC 驱动，再通过 **CarLink complete firmware** 指定对应 `base_run_id`、`base_artifact_name`、`driver_run_id` 与成功应用 run。baseline 不是完整双协议发布镜像。
-
-独立 **Verify built image** 默认复验正式 refreshed 产物；验证 baseline 须显式选择其 artifact。
-
-## HiCar 本机身份
-
-首次切换到 HiCar 时，manager 在显示配对码、交接旧会话之前初始化缺失身份；直接运行 HiCar 后端也执行相同检查。身份在本机生成随机设备种子和六位固定 PIN，文件以 0600 原子发布，新建私有目录为 0700。
-
-也可在设备上显式初始化：
-
-```sh
-carlink hicar identity-init
-# 自定义存储位置；名称仅在新建时使用
-carlink hicar identity-init --identity /var/lib/carlink/hicar/production/identity.json --name CarLink
-```
-
-命令只报告是否创建成功，不输出 PIN、种子或密钥。并发调用只会有一个创建者。已有身份、固定 PIN、名称及 HUKS 数据原样保留；损坏、权限过宽或符号链接身份文件会报错，等待维护修复，不自动轮换身份。
-
-CarPlay MFi 身份继续按本机配置提供，不进入仓库、构建产物或固件；它的检查限于 CarPlay 后端，菜单与 HiCar 可独立启动。
-
-## 外置无线网卡
-
-新示例的 HiCar `--network-interface` 与 CarPlay 默认网卡均使用 `auto`，通过同一 Rust 识别器选择已验证的 AIC 外置无线设备，兼容 USB 父设备和接口驱动两种 sysfs 布局。不会选择有线管理接口或板载 XR819。
-
-```sh
-carlink wifi-interface
-```
-
-网卡尚未就绪时报告错误，由服务重试；有两块候选 AIC 无线网卡时要求显式选择。已有自定义 HiCar `--network-interface` 和 CarPlay `CARLINK_CARPLAY_WIFI` 设置继续生效。
-
-代码、纯安装测试、ARM 测试和镜像校验结果见 [验证记录](validation.md)，剩余实车及长稳项目见 [完成情况核对](status-audit.md)。
+- CarPlay 将合法取得且兼容的 `identity.pk8` 和 `certificate.p7b` 放在 `/var/lib/carlink/carplay/mfi/`。目录权限为 0700，文件为 0600。参见[接收端说明](../receiver/README.md)。
+- HiCar 首次使用会生成本地身份及固定 PIN，也可通过 `carlink hicar identity-init` 初始化。升级时保留身份及配对状态。
+- 管理器配置位于 `/etc/carlink/manager.json`，参见[配置示例](examples/manager.json)。使用 `carlink wifi-interface` 检查自动选中的无线接口。
+- 更新时使用同一次构建的管理器、协议子进程及配套库，保留旧版和本地状态以便回滚。身份、凭据和配对记录应留在设备本地。

@@ -33,8 +33,8 @@ reports video/audio metadata and drains media without decoding or displaying it.
 The optional environment variables `CARLINK_CARPLAY_ROOT`,
 `CARLINK_CARPLAY_STATE`, and `CARLINK_CARPLAY_WIFI` override install/state/interface
 paths. `CARLINK_CARPLAY_COUNTRY` defaults to `CN` and
-`CARLINK_CARPLAY_CHANNEL` to the previously tested non-DFS channel 149. The
-default interface is the tested AX900 adapter `wlx002e2d91fc8e`.
+`CARLINK_CARPLAY_CHANNEL` to channel 149. Select a country and channel appropriate for the installation.
+The default Wi-Fi interface is selected automatically.
 
 Probe status is `/run/carlink/carplay-probe.json`. The producer connects to
 `/run/carlink-carplay/media.sock`, and the local control socket appends `.control`.
@@ -59,7 +59,7 @@ may contain personal screen content; keep them local. Without this variable, no
 media is saved. Audio is counted and its format reported in probe mode.
 `carlink-carplay forward` uses the new live consumer; the combined
 `carlink-run` supervisor starts it alongside the CarLife USB sender. See
-[live forwarding](../docs/live-forwarding.md) for runtime and acceptance details.
+[development guide](../docs/development.md) for runtime and acceptance details.
 
 ## Wire boundary and checks
 

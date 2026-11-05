@@ -1,6 +1,6 @@
 # Linux 无线 HiCar 实验
 
-目标：悟空派 H3 + AX900/AIC8800 接收鸿蒙 4.2 手机的无线 HiCar，后续复用现有 CarLife 输出。详细阶段和证据见 [实施计划](../../docs/hicar.md)。本目录是手动运行的诊断程序，不随固件安装，不设置开机启动。
+Independent HiCar diagnostic utilities for Linux. These tools are run manually and are outside the installed firmware runtime. See [development](../../docs/development.md).
 
 `probe.py` 默认使用 BlueZ D-Bus 注册 FDEE 发现广播和 FE35 RFCOMM 服务，只观察收到的字节流。可选启用控制回复、FE36 业务通道和限定手机的蓝牙 SSP 代理，可通过 `--reply-identity` 和 `--auth-library` 接入固定 PIN 身份握手及 HiChain 认证。运行时间默认 60 秒，上限 900 秒；退出时注销自己注册的服务。需要 Linux、BlueZ、Python 3 和 requirements.txt 中的依赖，以及系统 D-Bus/蓝牙管理通道的访问权限（开发板当前使用 root）。
 
@@ -10,7 +10,7 @@
 PYTHONPATH=/var/tmp/hicar-python python3 probe.py --model "$HICAR_MODEL" --duration 60
 ```
 
-`HICAR_MODEL` 为从本地参考资料选取的八位十六进制型号值，通过参数提供。探针默认请求本广播使用 0 dBm 发射功率，可通过 `--tx-power 11` 使用 AX900 已确认支持的 11 dBm；用 `--sequence` 设置发现序号。不修改适配器名称、供电状态、Wi-Fi 或现有 CarLink 服务。同一时间只允许一份本探针。运行前应结束旧版发现探针，避免重复广播。
+`HICAR_MODEL` 为从本地参考资料选取的八位十六进制型号值，通过参数提供。探针默认请求本广播使用 0 dBm 发射功率，可通过 `--tx-power 11` 请求 11 dBm（取决于适配器及当地规则）；用 `--sequence` 设置发现序号。不修改适配器名称、供电状态、Wi-Fi 或现有 CarLink 服务。同一时间只允许一份本探针。运行前应结束旧版发现探针，避免重复广播。
 
 需要手机主动连接时，使用本地手机地址参数：
 
@@ -67,7 +67,7 @@ PYTHONPATH=/var/tmp/hicar-python python3 probe.py --model "$HICAR_MODEL" \
 在上面的认证命令后增加：
 
 ```sh
---network-interface "$AX900_INTERFACE"
+--network-interface "$WIFI_INTERFACE"
 ```
 
 此选项要求真实认证后端。程序在有线管理通道存在时临时停用 CarLink、保存原无线连接，建立中国大陆区域的 channel 149 / 5745 MHz 热点，并监听 192.168.49.1 的 4005/4006/4007 端口。临时 WPA2 密码随机生成，不打印。手机通过认证和资源协商后自动加入热点，再建立 DMSDP 通道。退出时自动恢复原网络和服务；默认 60 秒，最长 900 秒。

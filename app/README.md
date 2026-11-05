@@ -1,39 +1,13 @@
 # CarLink native application
 
 Rust binary: **`carlink`**, targeting ARMv7 H3 boards, built with the pinned 1.90 toolchain.
-The CarLife MD process is connected to the independent CarPlay receiver; see the [runtime guide](../docs/live-forwarding.md).
+The CarLife MD process is connected to the independent CarPlay receiver; see the [runtime guide](../docs/development.md).
 
-## HiCar Rust foundation (R1)
+## HiCar runtime
 
-The native application now includes bounded Nearby/DMSDP/HiSight framing,
-strict business JSON, RTP/ADTS and reorder tracking, clock conversion, UIBC,
-system OpenSSL loading, and a thread-confined HiChain/HUKS FFI adapter.
-The diagnostic modes below do not acquire Bluetooth, Wi-Fi, or USB:
+The Rust backend owns Bluetooth discovery and session setup, Wi-Fi transport, media and input. It loads the native HiChain/HUKS library on demand for authentication. The Python utilities under `experiments/hicar/` are independent diagnostics.
 
-```sh
-printf '%s\n' '{"op":"uint","value":128}' | carlink hicar codec
-python3 scripts/test-hicar-rust.py /path/to/carlink
-python3 scripts/test-hicar-rust-auth.py /path/to/carlink /path/to/libcarlink_hichain.so
-```
-
-`hicar auth-worker` reads private configuration and protocol messages from
-stdin and returns replies over stdout. It is for isolated synthetic tests;
-the harness uses temporary stores, logs metadata only, tests both correct and
-wrong PINs, and restarts processes to check persisted Rust/Python STS trust.
-The C library is loaded on demand; normal CarLife startup does not initialize HUKS.
-The production wireless HiCar session remains in Python until R2/R3 acceptance.
-See the [migration plan](../docs/hicar-rust.md).
-
-R2 adds `hicar session-worker FD`, an experimental connection backend used by
-`experiments/hicar/probe.py --rust-session-binary /path/to/carlink`. FD must be an
-inherited connected Unix socket above stderr. The worker reads the existing
-private identity itself and owns Nearby/resource negotiation and native HiChain
-authentication. Secret replies and the temporary Python media adapter's session
-key travel only through that socket. BlueZ registration and media still run in
-the adapter during this migration step; production startup is unchanged.
-
-`scripts/test-hicar-rust-session.py` compares connection transcripts, malformed
-IPC, first binding and persisted trusted authentication against Python.
+To exercise framing or authentication in isolation, use the repository's `scripts/test-hicar-rust.py` and `scripts/test-hicar-rust-auth.py` harnesses. The authentication harness uses temporary identities and checks first binding and persistent trust.
 
 Dependencies are pinned in Cargo.lock. CI packages their source archives and
 license notices under `share/source/rust` and `share/licenses/rust`, and includes
@@ -94,7 +68,7 @@ python scripts/test-carlife-lab.py --address 127.0.0.1:17240
 
 Update the Actions-built ARMv7 application on the board for app iterations;
 no SD reflash is needed. Rust is the main implementation language, Python is
-used for independent HU fixtures. Sources and next steps: [roadmap](../docs/roadmap.md).
+used for independent HU fixtures. Runtime and validation: [development guide](../docs/development.md).
 
 ## Read-only inventory
 
