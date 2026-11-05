@@ -12,6 +12,10 @@ on:
       base_artifact_name:
         type: string
         default: carlink-h3-image
+      driver_artifact_name:
+        description: Optional driver artifact name override
+        type: string
+        default: ''
       driver_run_id:
         type: string
         default: '39670639717'
@@ -28,8 +32,12 @@ on:
       base_artifact_name:
         description: Explicit baseline artifact name
         type: choice
-        options: [carlink-h3-image, carlink-h3-baseline-image]
+        options: [carlink-h3-image, carlink-h3-baseline-image, carlink-h3-refreshed-image]
         default: carlink-h3-image
+      driver_artifact_name:
+        description: Optional driver artifact name override
+        type: string
+        default: ''
       driver_run_id:
         description: Successful AIC driver build matching the selected kernel
         type: string
@@ -158,7 +166,12 @@ jobs:
       base_run_id: ${{ inputs.base_run_id }}
       base_artifact_name: ${{ inputs.base_artifact_name }}
       app_run_id: ${{ inputs.app_run_id }}
+      driver_artifact_name:
+        description: Optional driver artifact name override
+        type: string
+        default: ''
       driver_run_id: ${{ inputs.driver_run_id }}
+      driver_artifact_name: ${{ inputs.driver_artifact_name }}
       variant: main
       disable_onboard_wifi: true
       hicar_native: true

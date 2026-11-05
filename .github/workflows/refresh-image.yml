@@ -14,6 +14,9 @@ on:
       driver_run_id:
         type: string
         default: ''
+      driver_artifact_name:
+        type: string
+        default: ''
       hicar_native:
         type: boolean
         default: true
@@ -34,6 +37,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
+      BASE_ARTIFACT_NAME: ${{ inputs.base_artifact_name }}
+      DRIVER_ARTIFACT_NAME: ${{ inputs.driver_artifact_name || format('aic8800-usb-{0}', inputs.variant) }}
       BASE_RUN_ID: ${{ inputs.base_run_id }}
       DRIVER_RUN_ID: ${{ inputs.driver_run_id }}
       APP_RUN_ID: ${{ inputs.app_run_id }}
@@ -45,7 +50,8 @@ jobs:
       - name: Validate inputs and successful source runs
         run: |
           [[ "$BASE_RUN_ID" =~ ^[0-9]+$ ]]
-          [[ "${{ inputs.base_artifact_name }}" == carlink-h3-image || "${{ inputs.base_artifact_name }}" == carlink-h3-baseline-image ]]
+          case "$BASE_ARTIFACT_NAME" in carlink-h3-image|carlink-h3-baseline-image|carlink-h3-refreshed-image) ;; *) exit 1 ;; esac
+          [[ "$DRIVER_ARTIFACT_NAME" == "aic8800-usb-$DRIVER_VARIANT" || "$DRIVER_ARTIFACT_NAME" == "carlink-aic8800-hot-deploy-$DRIVER_VARIANT" ]]
           [[ "$DRIVER_RUN_ID" =~ ^[0-9]+$ ]]
           [[ "$APP_RUN_ID" =~ ^[0-9]+$ ]]
           [[ "$DRIVER_VARIANT" == main || "$DRIVER_VARIANT" == mcu1 ]]
@@ -77,7 +83,7 @@ jobs:
       - uses: actions/download-artifact@v4
         if: inputs.driver_run_id != ''
         with:
-          name: aic8800-usb-${{ inputs.variant }}
+          name: ${{ env.DRIVER_ARTIFACT_NAME }}
           path: dist/driver
           run-id: ${{ inputs.driver_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -110,7 +116,7 @@ jobs:
           '
       - name: Build and validate complete image with CI applications and matched driver
         run: |
-          sudo env BASE_RUN_ID="$BASE_RUN_ID" DRIVER_RUN_ID="$DRIVER_RUN_ID" \
+          sudo env BASE_ARTIFACT_NAME="$BASE_ARTIFACT_NAME" BASE_RUN_ID="$BASE_RUN_ID" DRIVER_RUN_ID="$DRIVER_RUN_ID" \
             DRIVER_VARIANT="$DRIVER_VARIANT" DISABLE_ONBOARD_WIFI="$DISABLE_ONBOARD_WIFI" REFRESH_COMMIT="$GITHUB_SHA" \
             APP_RUN_ID="$APP_RUN_ID" APP_COMMIT="$APP_COMMIT" \
             APPLICATION_DIR="$GITHUB_WORKSPACE/dist/app" CARPLAY_DIR="$GITHUB_WORKSPACE/dist/carplay" \

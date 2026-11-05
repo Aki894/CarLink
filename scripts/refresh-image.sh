@@ -162,7 +162,11 @@ image="$output/image/CarLink-refresh-${BASE_RUN_ID}-${REFRESH_COMMIT:0:8}.img"
 [[ ! -e "$image" && ! -e "$image.xz" ]]
 xz -t -- "${images[0]}"
 xz -dc -- "${images[0]}" > "$image"
-bash "$project/scripts/verify-image.sh" "$image" --baseline | tee "$output/evidence/base-validation.txt"
+base_mode=--baseline
+if [[ ${BASE_ARTIFACT_NAME:-} == carlink-h3-refreshed-image ]]; then
+    base_mode=current
+fi
+bash "$project/scripts/verify-image.sh" "$image" "$base_mode" | tee "$output/evidence/base-validation.txt"
 loop=$(losetup --find --show --partscan "$image")
 udevadm settle
 mkdir "$work/root"
