@@ -121,7 +121,7 @@ import hashlib,pathlib,sys
 out=pathlib.Path(sys.argv[1])
 with (out/'SHA256SUMS').open('w') as sums:
     for p in sorted(out.rglob('*')):
-        if p.is_file() and p.name!='SHA256SUMS': sums.write(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.relative_to(out).as_posix()+'\n')
+        if p.is_file() and p != out/'SHA256SUMS': sums.write(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.relative_to(out).as_posix()+'\n')
 PY
 python3 "$root/scripts/verify-corresponding-source.py" "$out"
 (cd "$out" && sha256sum -c SHA256SUMS)
