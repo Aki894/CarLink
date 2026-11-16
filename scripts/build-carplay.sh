@@ -103,6 +103,7 @@ for name in LICENSE NOTICE THIRD-PARTY-LICENSES.md; do cp "$stream/$name" "$out/
 git -C "$relay" archive --format=tar.gz HEAD > "$out/share/source/relay.tar.gz"
 git -C "$stream" archive --format=tar.gz HEAD > "$out/share/source/stream.tar.gz"
 cp "$root/scripts/build-carplay.sh" "$root/sources.lock.json" "$out/share/source/"
+cp "$root/receiver/patches/README.md" "$root/receiver/patches/MODIFICATIONS.md" "$out/share/source/patches/"
 python3 - "$root" "$out" <<'PY'
 import hashlib,json,pathlib,subprocess,sys
 root,out=map(pathlib.Path,sys.argv[1:]); lock=json.loads((root/'sources.lock.json').read_text())['carplay']
@@ -113,8 +114,14 @@ manifest=dict(lock, project_commit=subprocess.check_output(['git','-C',str(root)
     runtime_identity='Supplied locally; excluded from build and firmware.',
     license_notice='Powered by OpenXPlay. https://github.com/OpenXPlay/OpenXPlay-Relay')
 (out/'SOURCE.json').write_text(json.dumps(manifest,indent=2)+'\n')
+PY
+python3 "$root/scripts/package-corresponding-source.py" "$root" "$out"
+python3 - "$out" <<'PY'
+import hashlib,pathlib,sys
+out=pathlib.Path(sys.argv[1])
 with (out/'SHA256SUMS').open('w') as sums:
     for p in sorted(out.rglob('*')):
         if p.is_file() and p.name!='SHA256SUMS': sums.write(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.relative_to(out).as_posix()+'\n')
 PY
+python3 "$root/scripts/verify-corresponding-source.py" "$out"
 (cd "$out" && sha256sum -c SHA256SUMS)

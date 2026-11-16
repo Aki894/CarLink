@@ -1,7 +1,7 @@
 name: CarLink builds
 on:
   push:
-    paths: ['app/**', 'receiver/**', 'firmware/**', 'scripts/**', 'sources.lock.json', '.github/workflows/**']
+    paths: ['LICENSE', 'LICENSES/**', 'LICENSING.md', 'app/**', 'receiver/**', 'firmware/**', 'scripts/**', 'sources.lock.json', '.github/workflows/**']
   pull_request:
   workflow_dispatch:
     inputs:
@@ -128,6 +128,12 @@ jobs:
           CARLINK_AUDIO_TEST_BINARY="$PWD/.build/carplay-output-test-audio" cargo +"$RUST_VERSION" test --locked --manifest-path app/Cargo.toml carplay_output:: -- --nocapture
           CARLINK_AUDIO_TEST_BINARY="$PWD/.build/carplay-output-test-audio" cargo +"$RUST_VERSION" test --locked --manifest-path app/Cargo.toml hicar::uplink:: -- --nocapture
           python3 scripts/test-runtime-install.py dist/app dist/carplay
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carlink-corresponding-source
+          path: dist/carplay/share/compliance/
+          if-no-files-found: error
+          retention-days: 90
       - uses: actions/upload-artifact@v4
         with:
           name: carplay-armv7

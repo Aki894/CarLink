@@ -1,0 +1,13 @@
+diff --git a/rust/web-receiver/receiver/index.html b/rust/web-receiver/receiver/index.html
+index 13976a0..4db3577 100644
+--- a/rust/web-receiver/receiver/index.html
++++ b/rust/web-receiver/receiver/index.html
+@@ -62,6 +62,7 @@ Created by riko chen on 2026-10-14 -->
+ <option value="SPEED" data-text="speed"></option>
+ </select><p id="playback-hint" class="secondary" data-text="smartHint"></p></div>
+ <label class="row"><span data-text="developer"></span><input id="developer" type="checkbox" role="switch"></label>
+-<section id="about"><h2 data-text="about"></h2><p><span data-text="version"></span> <span id="version"></span></p><p id="relay-version-row" hidden><span id="relay-name"></span> <span id="relay-version"></span></p><p><a href="https://github.com/OpenXPlay/OpenXPlay-Stream" target="_blank" rel="noopener noreferrer" data-text="powered">Powered by OpenXPlay.</a></p><a id="source" href="https://github.com/OpenXPlay/OpenXPlay-Stream" target="_blank" rel="noopener noreferrer" data-text="source"></a></section>
++<!-- CarLink modification, 2026-11-16: exact build source and retained upstream links. -->
++<section id="about"><p><a href="/receiver/carlink-source/index.html">Open-source licenses and Corresponding Source / 开源许可与对应源码</a></p><p><a href="https://github.com/OpenXPlay/OpenXPlay-Relay">OpenXPlay-Relay</a> · <a href="https://openxplay.org/">OpenXPlay.org</a></p><h2 data-text="about"></h2><p><span data-text="version"></span> <span id="version"></span></p><p id="relay-version-row" hidden><span id="relay-name"></span> <span id="relay-version"></span></p><p><a href="https://github.com/OpenXPlay/OpenXPlay-Stream" target="_blank" rel="noopener noreferrer" data-text="powered">Powered by OpenXPlay.</a></p><a id="source" href="https://github.com/OpenXPlay/OpenXPlay-Stream" target="_blank" rel="noopener noreferrer" data-text="source"></a></section>
+ </dialog>
+ <script type="module" src="./main.ts"></script></body></html>

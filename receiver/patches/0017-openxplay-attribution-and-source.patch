@@ -1,0 +1,168 @@
+diff --git a/admin-web/src/main.ts b/admin-web/src/main.ts
+index 0bfb414..8351362 100644
+--- a/admin-web/src/main.ts
++++ b/admin-web/src/main.ts
+@@ -85,7 +85,7 @@ async function fetchStatus(): Promise<Status> { return anchorPairing(await api.s
+ function errorKey(error: unknown): string { return error instanceof ApiError ? error.key : error instanceof NetworkError ? 'error.network' : 'error.request'; }
+ function shell() {
+   document.documentElement.lang = language;
+-  root.innerHTML = `<header><div class="brand">${icon('router')}<div><strong id="relay-name">${esc(status?.name ?? 'OpenXPlay Relay')}</strong><span id="relay-host" class="muted">${esc(status?.host ?? location.host)}</span></div></div><div class="header-actions">${session === 'ready' ? `<nav class="view-tabs" aria-label="${t('home.navigation')}"><a href="#home" ${currentView === 'home' ? 'aria-current="page"' : ''}>${t('home.title')}</a><a href="#settings" ${currentView === 'settings' ? 'aria-current="page"' : ''}>${t('ui.settings')}</a></nav>` : ''}<details class="more-menu"><summary aria-label="${t('home.more')}">⋯</summary><div class="menu-items"><label class="sr-only" for="language">${t('ui.language')}</label><select id="language"><option value="en" ${language === 'en' ? 'selected' : ''}>${t('ui.english')}</option><option value="zh-CN" ${language === 'zh-CN' ? 'selected' : ''}>${t('ui.chinese')}</option></select>${session === 'ready' ? `<button id="logout" class="quiet">${icon('log-out')}<span>${t('ui.logout')}</span></button>` : ''}${session === 'ready' ? `<button id="menu-password">${t('ui.changePassword')}${defaultPassword ? `<small class="muted">${t('home.passwordNote')}</small>` : ''}</button>${status?.platform === 'linux' ? `<button id="menu-car">${t('carlink.forget')}</button>` : ''}${developer && currentView === 'settings' ? `<button id="menu-restart">${t('home.restart')}</button>` : ''}` : ''}</div></details></div></header><div id="connection" role="status" class="banner" ${offline ? '' : 'hidden'}>${t('ui.reconnecting')}</div><div id="restart-required" class="card" hidden></div><main id="main"></main>`;
++  root.innerHTML = `<header><div class="brand">${icon('router')}<div><strong id="relay-name">${esc(status?.name ?? 'OpenXPlay Relay')}</strong><span id="relay-host" class="muted">${esc(status?.host ?? location.host)}</span></div></div><div class="header-actions">${session === 'ready' ? `<nav class="view-tabs" aria-label="${t('home.navigation')}"><a href="#home" ${currentView === 'home' ? 'aria-current="page"' : ''}>${t('home.title')}</a><a href="#settings" ${currentView === 'settings' ? 'aria-current="page"' : ''}>${t('ui.settings')}</a></nav>` : ''}<details class="more-menu"><summary aria-label="${t('home.more')}">⋯</summary><div class="menu-items"><label class="sr-only" for="language">${t('ui.language')}</label><select id="language"><option value="en" ${language === 'en' ? 'selected' : ''}>${t('ui.english')}</option><option value="zh-CN" ${language === 'zh-CN' ? 'selected' : ''}>${t('ui.chinese')}</option></select>${session === 'ready' ? `<button id="logout" class="quiet">${icon('log-out')}<span>${t('ui.logout')}</span></button>` : ''}${session === 'ready' ? `<button id="menu-password">${t('ui.changePassword')}${defaultPassword ? `<small class="muted">${t('home.passwordNote')}</small>` : ''}</button>${status?.platform === 'linux' ? `<button id="menu-car">${t('carlink.forget')}</button>` : ''}${developer && currentView === 'settings' ? `<button id="menu-restart">${t('home.restart')}</button>` : ''}` : ''}</div></details></div></header><div id="connection" role="status" class="banner" ${offline ? '' : 'hidden'}>${t('ui.reconnecting')}</div><div id="restart-required" class="card" hidden></div><main id="main"></main><footer class="carlink-legal"><p>Powered by OpenXPlay.</p><nav aria-label="Open-source projects"><a href="https://github.com/OpenXPlay/OpenXPlay-Relay">OpenXPlay-Relay</a><a href="https://github.com/OpenXPlay/OpenXPlay-Stream">OpenXPlay-Stream</a><a href="https://openxplay.org/">OpenXPlay.org</a><a href="/carlink-source/index.html">${language === 'zh-CN' ? '开源许可与对应源码' : 'Open-source licenses and Corresponding Source'}</a></nav><p>${language === 'zh-CN' ? '由 CarLink 修改；保留上游许可与署名。' : 'Modified by CarLink; upstream licenses and notices retained.'}</p></footer>`;
+   document.querySelectorAll('.menu-items button').forEach(button => button.addEventListener('click', () => { document.querySelector<HTMLDetailsElement>('.more-menu')!.open = false; }));
+   document.getElementById('menu-password')?.addEventListener('click', () => showSettings('current-password'));
+   document.getElementById('menu-car')?.addEventListener('click', confirmForgetCarlink);
+diff --git a/admin-web/src/style.css b/admin-web/src/style.css
+index dd3fa70..9d3b607 100644
+--- a/admin-web/src/style.css
++++ b/admin-web/src/style.css
+@@ -253,3 +253,8 @@ a.copy-text { color: var(--text); text-decoration-color: var(--border); text-und
+ .plugin-meta { display: block; overflow-wrap: anywhere; margin-block: 4px; }
+ .plugin-icon { width: 48px; height: 48px; flex: 0 0 48px; object-fit: contain; }
+ .public-name-actions { display: flex; flex-wrap: wrap; gap: 8px; }
++
++/* CarLink modification, 2026-11-16: persistent upstream attribution and source offer. */
++.carlink-legal { max-width: 1280px; margin: auto; padding: 1.25rem; border-top: 1px solid #2c2c2c; color: var(--muted); }
++.carlink-legal nav { display: flex; flex-wrap: wrap; gap: .75rem 1.5rem; }
++.carlink-legal a { color: var(--accent); text-underline-offset: .2em; }
+diff --git a/rust/direlay-linux/src/admin/server.rs b/rust/direlay-linux/src/admin/server.rs
+index f82a848..112cccf 100644
+--- a/rust/direlay-linux/src/admin/server.rs
++++ b/rust/direlay-linux/src/admin/server.rs
+@@ -51,6 +51,8 @@ pub struct Response {
+     pub status: u16,
+     pub headers: BTreeMap<String, String>,
+     pub body: Vec<u8>,
++    // CarLink modification, 2026-11-16: stream the fixed Corresponding Source asset.
++    source_file: Option<(fs::File, u64)>,
+ }
+ impl Response {
+     fn json(status: u16, value: Value) -> Self {
+@@ -61,6 +63,7 @@ impl Response {
+                 ("Cache-Control".into(), "no-store".into()),
+             ]),
+             body: serde_json::to_vec(&value).unwrap(),
++            source_file: None,
+         }
+     }
+     fn error(status: u16, key: &str) -> Self {
+@@ -86,12 +89,19 @@ impl Response {
+             429 => "Too Many Requests",
+             _ => "Internal Server Error",
+         };
+-        write!(out, "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n", self.status, reason, self.body.len())?;
++        write!(out, "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n", self.status, reason, self.source_file.as_ref().map_or(self.body.len() as u64, |(_, size)| *size))?;
+         for (key, value) in &self.headers {
+             write!(out, "{key}: {value}\r\n")?;
+         }
+         out.write_all(b"\r\n")?;
+-        out.write_all(&self.body)?;
++        if let Some((file, size)) = &self.source_file {
++            let copied = io::copy(&mut file.take(*size), out)?;
++            if copied != *size {
++                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Source archive truncated"));
++            }
++        } else {
++            out.write_all(&self.body)?;
++        }
+         out.flush()
+     }
+ }
+@@ -347,6 +357,27 @@ impl AdminServer {
+         let Ok(file) = checked else {
+             return Response::error(404, "error.request");
+         };
++        // Only this exact, canonicalized asset bypasses the normal 4 MiB limit.
++        // Keep the opened descriptor so the checked source is the file sent.
++        if path == "/carlink-source/corresponding-source.tar.gz" {
++            let source = fs::File::open(&file).and_then(|file| {
++                let size = file.metadata()?.len();
++                Ok((file, size))
++            });
++            return match source {
++                Ok(source_file) => Response {
++                    status: 200,
++                    headers: BTreeMap::from([
++                        ("Content-Type".into(), "application/gzip".into()),
++                        ("Content-Disposition".into(), "attachment; filename=corresponding-source.tar.gz".into()),
++                        ("Cache-Control".into(), "no-cache".into()),
++                    ]),
++                    body: Vec::new(),
++                    source_file: Some(source_file),
++                },
++                Err(_) => Response::error(404, "error.request"),
++            };
++        }
+         let data = (|| {
+             let mut b = Vec::new();
+             fs::File::open(&file)?
+@@ -373,6 +404,7 @@ impl AdminServer {
+                 Response {
+                     status: 200,
+                     body,
++                    source_file: None,
+                     headers: BTreeMap::from([
+                         ("Content-Type".into(), mime.into()),
+                         ("Cache-Control".into(), "no-cache".into()),
+@@ -809,3 +841,31 @@ mod sni_tests {
+         fs::remove_dir_all(state).unwrap();
+     }
+ }
++
++#[cfg(test)]
++mod carlink_source_tests {
++    use super::*;
++
++    #[test]
++    fn carlink_source_response_streams_exact_length() {
++        let path = std::env::temp_dir().join(format!("carlink-source-{}", auth::random_hex(8).unwrap()));
++        let file = fs::File::create(&path).unwrap();
++        file.set_len(5 * 1024 * 1024).unwrap();
++        drop(file);
++        let size = 5 * 1024 * 1024;
++        let response = Response {
++            status: 200,
++            headers: BTreeMap::new(),
++            body: Vec::new(),
++            source_file: Some((fs::File::open(&path).unwrap(), size)),
++        };
++        let mut output = Vec::new();
++        response.write(&mut output).unwrap();
++        let split = output.windows(4).position(|p| p == b"\r\n\r\n").unwrap() + 4;
++        assert_eq!(output.len() - split, size as usize);
++        assert!(String::from_utf8_lossy(&output[..split]).contains("Content-Length: 5242880"));
++        assert!(output[split..].iter().all(|b| *b == 0));
++        drop(response);
++        fs::remove_file(path).unwrap();
++    }
++}
+diff --git a/rust/direlay-linux/tests/wp4b_services.rs b/rust/direlay-linux/tests/wp4b_services.rs
+index a6f775d..26c6d61 100644
+--- a/rust/direlay-linux/tests/wp4b_services.rs
++++ b/rust/direlay-linux/tests/wp4b_services.rs
+@@ -1862,3 +1862,26 @@ fn plugin_arguments_off_golden_and_on_filtered_in_order() {
+     settings.plugins = None;
+     assert_eq!(settings.arguments(), expected);
+ }
++
++// CarLink modification, 2026-11-16: source offers stay public and bounded to one asset.
++#[test]
++fn carlink_source_offer_is_public_and_only_the_archive_bypasses_asset_limit() {
++    let dir = Temp::new();
++    let s = server(&dir.0);
++    fs::create_dir(dir.0.join("carlink-source")).unwrap();
++    let archive = dir.0.join("carlink-source/corresponding-source.tar.gz");
++    fs::File::create(&archive).unwrap().set_len(5 * 1024 * 1024).unwrap();
++    fs::copy(&archive, dir.0.join("large.js")).unwrap();
++    let get = |path| s.route(&req("GET", path, json!({}), ""), 1);
++    let reply = get("/carlink-source/corresponding-source.tar.gz");
++    assert_eq!(reply.status, 200);
++    assert!(reply.body.is_empty(), "archive must not be buffered in response memory");
++    assert_eq!(reply.headers["Content-Type"], "application/gzip");
++    assert!(reply.headers["Content-Disposition"].contains("attachment"));
++    assert_eq!(get("/large.js").status, 404);
++    assert_eq!(get("/carlink-source/../large.js").status, 403);
++    assert_eq!(get("/carlink-source/%2e%2e/large.js").status, 403);
++    let mut remote = req("GET", "/carlink-source/corresponding-source.tar.gz", json!({}), "");
++    remote.peer = "8.8.8.8".parse().unwrap();
++    assert_eq!(s.route(&remote, 1).status, 403);
++}

@@ -85,6 +85,7 @@ python3 "$(dirname "$0")/verify-production-runtime.py" "$mountdir"
 python3 "$(dirname "$0")/install-boot-profile.py" --root "$mountdir" --verify
 for payload in lib/libcarlink_menu.so share/fonts/NotoSansCJKsc-Regular.otf share/source/menu/SOURCE.json share/licenses/menu/OFL.txt forward.py supervisor.py share/source/audio/SOURCE.json share/source/audio/ffmpeg.tar.gz share/licenses/audio/COPYING.LGPLv2.1 SOURCE.json SHA256SUMS share/source/relay.tar.gz share/source/stream.tar.gz \
     share/licenses/relay/LICENSE share/licenses/relay/LICENSE-GPL-3.0 share/licenses/relay/NOTICE \
+    share/compliance/index.html share/compliance/corresponding-source.tar.gz share/admin/carlink-source/index.html share/admin/carlink-source/corresponding-source.tar.gz \
     share/licenses/stream/LICENSE share/admin/index.html share/web/receiver/index.html; do
     test -s "$receiver/$payload"
 done

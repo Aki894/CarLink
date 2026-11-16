@@ -11,3 +11,7 @@
 - HiCar 首次使用会生成本地身份及固定 PIN，也可通过 `carlink hicar identity-init` 初始化。升级时保留身份及配对状态。
 - 管理器配置位于 `/etc/carlink/manager.json`，参见[配置示例](examples/manager.json)。使用 `carlink wifi-interface` 检查自动选中的无线接口。
 - 更新时使用同一次构建的管理器、协议子进程及配套库，保留旧版和本地状态以便回滚。身份、凭据和配对记录应留在设备本地。
+
+## 开源许可与对应源码
+
+维护页（8088）的“关于 / 开源许可”和 Relay 管理页（HTTPS 6975）的页脚提供当前构建的许可、署名及对应源码下载。设备文件位于 `/usr/local/lib/carlink/carplay/share/compliance/`。GitHub Actions 同一构建的 `carlink-corresponding-source` artifact 保存相同源码包和 SHA256SUMS；正式 Release 应永久附上该包与校验文件。源码包包含锁定上游归档、修改补丁、构建脚本、锁文件和 CarLink 源码，具体许可见 [许可总览](../LICENSING.md)。

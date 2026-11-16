@@ -36,6 +36,17 @@ fn response(s:&mut TcpStream,code:u16,kind:&str,body:&[u8]){let _=s.set_write_ti
  let deadline=std::time::Instant::now()+Duration::from_millis(150);let mut bytes=[0;1024];let mut total=0;
  while total<16384&&std::time::Instant::now()<deadline{match s.read(&mut bytes){Ok(0)=>break,Ok(n)=>total+=n,Err(_)=>break,}}
 }
+// Only fixed public build products are served; runtime identity/state paths are never used.
+fn license_file(s:&mut TcpStream,name:&str,kind:&str){
+ let path=Path::new("/usr/local/lib/carlink/carplay/share/compliance").join(name);
+ let mut file=match std::fs::File::open(path){Ok(f)=>f,Err(_)=>{response(s,404,"text/plain",b"License/source package unavailable");return;}};
+ let length=match file.metadata(){Ok(m) if m.is_file()=>m.len(),_=>{response(s,404,"text/plain",b"Not found");return;}};
+ let _=s.set_write_timeout(Some(Duration::from_secs(2)));
+ if write!(s,"HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {length}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'none'; frame-ancestors 'none'; base-uri 'none'\r\n\r\n").is_err(){return;}
+ let mut buffer=[0u8;32768];
+ loop{match file.read(&mut buffer){Ok(0)=>break,Ok(n)=>{if s.write_all(&buffer[..n]).is_err(){break;}},Err(_)=>break,}}
+ let _=s.shutdown(std::net::Shutdown::Write);
+}
 fn connect_control(path:&Path)->Result<UnixStream,String>{
  let bytes=path.as_os_str().as_bytes();let mut address:libc::sockaddr_un=unsafe{std::mem::zeroed()};
  if bytes.len()>=address.sun_path.len(){return Err("control path too long".into());}
@@ -74,6 +85,8 @@ pub fn start(listen:SocketAddr,socket:PathBuf)->Result<Web,String>{
  let result=request(&mut s,port);match result{
  Ok((m,p,body))=>match (m.as_str(),p.as_str()){
  ("GET","/")=>response(&mut s,200,"text/html; charset=utf-8",include_bytes!("../ui/manager.html")),
+ ("GET","/licenses/")=>license_file(&mut s,"index.html","text/html; charset=utf-8"),
+ ("GET","/licenses/corresponding-source.tar.gz")=>license_file(&mut s,"corresponding-source.tar.gz","application/gzip"),
  ("GET","/app.js")=>response(&mut s,200,"application/javascript; charset=utf-8",include_bytes!("../ui/manager.js")),
  ("GET","/style.css")=>response(&mut s,200,"text/css; charset=utf-8",include_bytes!("../ui/manager.css")),
  ("GET","/api/status")|("GET","/api/devices")|("POST","/api/control")=>{
