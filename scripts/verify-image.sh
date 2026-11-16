@@ -39,7 +39,7 @@ fi
 
 image=$1
 mode=${2:-current}
-[[ "$mode" == current || "$mode" == --baseline ]] || { echo 'Unknown image validation mode' >&2; exit 2; }
+[[ "$mode" == current || "$mode" == --baseline || "$mode" == --upgrade-base ]] || { echo 'Unknown image validation mode' >&2; exit 2; }
 python3 - "$image" <<'PY'
 import sys
 with open(sys.argv[1], 'rb') as image:
@@ -67,7 +67,7 @@ if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("
     cmp "$mountdir/usr/local/bin/carlink" "$mountdir/usr/local/lib/carlink/app/carlink"
 fi
 test -x "$mountdir/usr/local/bin/carlink"
-if [[ "$mode" == current ]]; then
+if [[ "$mode" != --baseline ]]; then
 # HiCar resolves FE35 RFCOMM separately from same-UUID ATT records.
 test -x "$mountdir/usr/bin/sdptool"
 readelf -h "$mountdir/usr/bin/sdptool" | grep -q 'Machine:.*ARM'
@@ -85,10 +85,17 @@ python3 "$(dirname "$0")/verify-production-runtime.py" "$mountdir"
 python3 "$(dirname "$0")/install-boot-profile.py" --root "$mountdir" --verify
 for payload in lib/libcarlink_menu.so share/fonts/NotoSansCJKsc-Regular.otf share/source/menu/SOURCE.json share/licenses/menu/OFL.txt forward.py supervisor.py share/source/audio/SOURCE.json share/source/audio/ffmpeg.tar.gz share/licenses/audio/COPYING.LGPLv2.1 SOURCE.json SHA256SUMS share/source/relay.tar.gz share/source/stream.tar.gz \
     share/licenses/relay/LICENSE share/licenses/relay/LICENSE-GPL-3.0 share/licenses/relay/NOTICE \
-    share/compliance/index.html share/compliance/corresponding-source.tar.gz share/admin/carlink-source/index.html share/admin/carlink-source/corresponding-source.tar.gz \
     share/licenses/stream/LICENSE share/admin/index.html share/web/receiver/index.html; do
-    test -s "$receiver/$payload"
+    test -s "$receiver/$payload" || { echo "Missing or empty receiver payload: $payload" >&2; exit 1; }
 done
+# A reused pre-fix image must pass its existing runtime checks before upgrade.
+# The finished image always uses current mode and requires the new source offer.
+if [[ "$mode" == current ]]; then
+    for payload in share/compliance/index.html share/compliance/corresponding-source.tar.gz \
+        share/admin/carlink-source/index.html share/admin/carlink-source/corresponding-source.tar.gz; do
+        test -s "$receiver/$payload" || { echo "Missing or empty source offer: $payload" >&2; exit 1; }
+    done
+fi
 (cd "$receiver" && sha256sum -c SHA256SUMS)
 cmp "$receiver/run-carplay.sh" "$mountdir/usr/local/bin/carlink-carplay"
 python3 - "$receiver/SOURCE.json" "$mountdir/etc/carlink-build.json" <<'PY'
