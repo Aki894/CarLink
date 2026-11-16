@@ -33,3 +33,9 @@ iPhone (CarPlay) or Huawei phone (HiCar)
 3. In the CarLink menu, select CarPlay or HiCar and choose to connect a device. Follow the phone prompts. For a new HiCar device, use the PIN shown on screen.
 
 See the [documentation index](docs/README.md) for controls, troubleshooting and development. CarLink is an independent project. See [LICENSE](LICENSE) and the [receiver integration notes](receiver/README.md) for upstream components.
+
+## Licensing and upstream projects
+
+MIT covers only original CarLink material. OpenXPlay components and their modifications remain AGPL-3.0-only with upstream NOTICE additional terms; DiPlay/xcertplay-derived portions remain GPL-3.0-only. See the [component copyright and license table](LICENSING.md) and full license texts.
+
+Powered by OpenXPlay. [OpenXPlay](https://openxplay.org/) · [OpenXPlay-Relay](https://github.com/OpenXPlay/OpenXPlay-Relay) · [OpenXPlay-Stream](https://github.com/OpenXPlay/OpenXPlay-Stream).

@@ -77,3 +77,9 @@ the optional upstream vector test uses the ignored local reference checkout.
 The existing CarLife synthetic-media path remains independently runnable. The live
 consumer forwards H.264, converts media/alert audio and returns single-point
 touch. Phone/Siri microphone paths are a later stage.
+
+## Licensing and upstream projects
+
+MIT covers only original CarLink material. OpenXPlay components and their modifications remain AGPL-3.0-only with upstream NOTICE additional terms; DiPlay/xcertplay-derived portions remain GPL-3.0-only. See the [component copyright and license table](../LICENSING.md) and full license texts.
+
+Powered by OpenXPlay. [OpenXPlay](https://openxplay.org/) · [OpenXPlay-Relay](https://github.com/OpenXPlay/OpenXPlay-Relay) · [OpenXPlay-Stream](https://github.com/OpenXPlay/OpenXPlay-Stream).

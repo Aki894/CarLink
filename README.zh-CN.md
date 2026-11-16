@@ -25,3 +25,9 @@ CarLink 运行在外接 Linux 盒子上，适合支持有线 CarLife、无法安
 3. 在 CarLink 菜单选择协议和「连接设备」，按手机提示完成配对。添加 HiCar 设备时，输入菜单显示的 PIN。
 
 [文档目录](docs/README.md)包含日常操作、排障和开发说明。CarLink 是独立项目，许可和上游组件见 [LICENSE](LICENSE) 与[接收端集成说明](receiver/README.md)。
+
+## 许可与上游项目
+
+MIT 仅适用于 CarLink 原创内容。OpenXPlay 组件及其修改版适用 AGPL-3.0-only 和上游 NOTICE 附加条款；DiPlay/xcertplay 派生部分适用 GPL-3.0-only。组件、版权方和许可全文见[许可总览](LICENSING.md)。
+
+Powered by OpenXPlay. [OpenXPlay](https://openxplay.org/) · [OpenXPlay-Relay](https://github.com/OpenXPlay/OpenXPlay-Relay) · [OpenXPlay-Stream](https://github.com/OpenXPlay/OpenXPlay-Stream).

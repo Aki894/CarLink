@@ -75,6 +75,8 @@ def install(project, app, receiver, rootfs):
                 'share/source/stream.tar.gz', 'share/licenses/relay/LICENSE',
                 'share/licenses/relay/LICENSE-GPL-3.0', 'share/licenses/relay/NOTICE',
                 'share/licenses/stream/LICENSE']
+    required.extend(('share/compliance/index.html', 'share/compliance/corresponding-source.tar.gz',
+                     'share/admin/carlink-source/index.html', 'share/admin/carlink-source/corresponding-source.tar.gz'))
     required.extend(('voice.py', 'opus.py', 'lib/libcarlink_opus.so',
                      'share/source/opus/SOURCE.json', 'share/source/opus/opus.tar.gz',
                      'share/source/opus/configure-opus.sh', 'share/source/opus/opus-validation.txt',

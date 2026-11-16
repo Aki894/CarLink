@@ -1,7 +1,7 @@
 name: CarLink builds
 on:
   push:
-    paths: ['app/**', 'receiver/**', 'firmware/**', 'scripts/**', 'sources.lock.json', '.github/workflows/**']
+    paths: ['LICENSE', 'LICENSES/**', 'LICENSING.md', 'app/**', 'receiver/**', 'firmware/**', 'scripts/**', 'sources.lock.json', '.github/workflows/**']
   pull_request:
   workflow_dispatch:
     inputs:
@@ -104,7 +104,18 @@ jobs:
           timeout 120s python3 scripts/test-hicar-rust-backend.py app/target/debug/carlink
           python3 scripts/test-manager.py app/target/debug/carlink
           python3 scripts/test-carplay-output.py app/target/debug/carlink
-          python3 scripts/test-manager-web.py app/target/debug/carlink
+          source_test_dir=/usr/local/lib/carlink/carplay/share/compliance
+          sudo install -d -m 755 "$source_test_dir"
+          sudo chown "$(id -u):$(id -g)" "$source_test_dir"
+          cleanup_source_test_dir() {
+            sudo rm -f "$source_test_dir/corresponding-source.tar.gz" "$source_test_dir/index.html" || true
+            sudo rmdir "$source_test_dir" 2>/dev/null || true
+            sudo rmdir /usr/local/lib/carlink/carplay/share 2>/dev/null || true
+            sudo rmdir /usr/local/lib/carlink/carplay 2>/dev/null || true
+            sudo rmdir /usr/local/lib/carlink 2>/dev/null || true
+          }
+          trap cleanup_source_test_dir EXIT
+          CARLINK_TEST_SOURCE_FIXTURE=1 python3 scripts/test-manager-web.py app/target/debug/carlink
           python3 -c 'import json; d=json.load(open("/tmp/carlink-doctor.json")); assert d["schema_version"] == 1; assert d["aoa"]["status"] == "not_tested"'
           cargo +"$RUST_VERSION" build --release --locked --manifest-path app/Cargo.toml --target "$TARGET"
           mkdir -p dist/app
@@ -128,6 +139,12 @@ jobs:
           CARLINK_AUDIO_TEST_BINARY="$PWD/.build/carplay-output-test-audio" cargo +"$RUST_VERSION" test --locked --manifest-path app/Cargo.toml carplay_output:: -- --nocapture
           CARLINK_AUDIO_TEST_BINARY="$PWD/.build/carplay-output-test-audio" cargo +"$RUST_VERSION" test --locked --manifest-path app/Cargo.toml hicar::uplink:: -- --nocapture
           python3 scripts/test-runtime-install.py dist/app dist/carplay
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carlink-corresponding-source
+          path: dist/carplay/share/compliance/
+          if-no-files-found: error
+          retention-days: 90
       - uses: actions/upload-artifact@v4
         with:
           name: carplay-armv7

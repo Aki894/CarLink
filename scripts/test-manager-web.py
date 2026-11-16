@@ -4,6 +4,7 @@ Synthetic process commands and temporary sockets only; no board/radio access.
 The application itself is built exclusively by GitHub Actions.
 """
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,7 +30,7 @@ def parse_response(response):
     return code,headers,body
 
 
-def receive_response(stream):
+def receive_response(stream, max_bytes=131072):
     response=b''
     while True:
         try:
@@ -40,12 +41,19 @@ def receive_response(stream):
             return parse_response(response)
         if not part:break
         response+=part
-        assert len(response)<=131072, 'unbounded HTTP response'
+        assert len(response)<=max_bytes, 'unbounded HTTP response'
     return parse_response(response)
 
 
 def check(binary):
     runner = json.loads(os.environ.get('CARLINK_RUST_RUNNER', '[]'))
+    source_fixture = os.environ.get('CARLINK_TEST_SOURCE_FIXTURE') == '1'
+    source_path = Path('/usr/local/lib/carlink/carplay/share/compliance/corresponding-source.tar.gz')
+    source_index_path = source_path.parent / 'index.html'
+    source_fixture_paths_created = []
+    pattern = bytes(range(256))
+    source_payload = pattern * (5 * 1024 * 1024 // len(pattern))
+    source_digest = hashlib.sha256(source_payload).hexdigest()
     with tempfile.TemporaryDirectory(prefix='carlink-manager-web-') as directory:
         root = Path(directory)
         with socket.socket() as reservation:
@@ -79,12 +87,29 @@ def check(binary):
                 if predicate(status):return status
                 time.sleep(.025)
             raise AssertionError('accepted HTTP control did not reach the expected state')
-        def raw(request):
+        def raw(request,max_bytes=131072,timeout=5):
             with socket.create_connection(('127.0.0.1',port),timeout=3) as stream:
-                stream.settimeout(5);stream.sendall(request)
-                return receive_response(stream)
-        def get(path,host=authority):
-            return raw(f'GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n'.encode())
+                stream.settimeout(timeout);stream.sendall(request)
+                return receive_response(stream, max_bytes=max_bytes)
+        def get(path,host=authority,max_bytes=131072,timeout=5):
+            return raw(f'GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n'.encode(),max_bytes,timeout)
+        def open_source_download():
+            stream=socket.socket()
+            stream.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,4096)
+            stream.settimeout(3)
+            stream.connect(('127.0.0.1',port))
+            stream.sendall(f'GET /licenses/corresponding-source.tar.gz HTTP/1.1\r\nHost: {authority}\r\n\r\n'.encode())
+            return stream
+        def read_source_headers(stream):
+            data=b''
+            while b'\r\n\r\n' not in data:
+                chunk=stream.recv(4096)
+                assert chunk, 'source download closed before sending response headers'
+                data+=chunk
+                assert len(data)<16384, 'source response headers exceeded the bound'
+            header,body=data.split(b'\r\n\r\n',1)
+            head=header.decode('ascii').split('\r\n')
+            return int(head[0].split()[1]),dict(line.split(': ',1) for line in head[1:]),len(body)
         def post(command,origin=None,host=authority,kind='application/json'):
             body=json.dumps(command).encode()
             origin=f'http://{host}' if origin is None else origin
@@ -152,6 +177,20 @@ def check(binary):
                 stop.set();sender.join(timeout=2);stream.close()
                 assert not sender.is_alive(), 'drip sender did not stop'
         try:
+            if source_fixture:
+                if source_path.exists():
+                    raise AssertionError(f'refusing to overwrite existing source package: {source_path}')
+                if source_index_path.exists():
+                    raise AssertionError(f'refusing to overwrite existing source page: {source_index_path}')
+                if not source_path.parent.is_dir() or not os.access(source_path.parent, os.W_OK):
+                    raise AssertionError(f'CI source fixture directory is not writable: {source_path.parent}')
+                source_path.write_bytes(source_payload)
+                source_fixture_paths_created.append(source_path)
+                source_index_path.write_text(
+                    '<p>Powered by OpenXPlay. <a href="https://github.com/OpenXPlay/OpenXPlay-Relay">OpenXPlay-Relay</a></p>'
+                    '<a href="corresponding-source.tar.gz">Download exact Corresponding Source</a>',
+                    encoding='utf-8')
+                source_fixture_paths_created.append(source_index_path)
             # Failed startup must undo its private control endpoint so the same
             # configuration succeeds immediately after the occupied port clears.
             with socket.socket() as occupied:
@@ -179,6 +218,30 @@ def check(binary):
                 assert code==200 and headers['Content-Type'].startswith(kind) and body
             code,_,body=get('/api/status')
             assert code==200 and json.loads(body)['ok']
+            if source_fixture:
+                code,headers,body=get('/licenses/')
+                assert code==200 and headers['Content-Type'].startswith('text/html')
+                assert b'Powered by OpenXPlay.' in body and b'OpenXPlay-Relay' in body
+                assert b'corresponding-source.tar.gz' in body
+            for traversal in ('/licenses/../corresponding-source.tar.gz',
+                              '/licenses/%2e%2e/corresponding-source.tar.gz',
+                              '/licenses/../config.json'):
+                assert get(traversal)[0]==404, f'license route accepted traversal path: {traversal}'
+            source_url='/licenses/corresponding-source.tar.gz'
+            if source_fixture:
+                code,headers,body=get(source_url,max_bytes=6*1024*1024,timeout=15)
+                assert code==200 and headers['Content-Type']=='application/gzip'
+                assert len(body)==5*1024*1024 and hashlib.sha256(body).hexdigest()==source_digest, 'source download bytes/hash differ from the installed package'
+                hidden_source_path=source_path.with_suffix('.test-hidden')
+                source_path.rename(hidden_source_path)
+                try:
+                    assert get(source_url)[0]==404, 'missing corresponding-source package did not return 404'
+                finally:
+                    hidden_source_path.rename(source_path)
+            else:
+                assert get(source_url)[0]==404, 'missing corresponding-source package did not return 404'
+            assert get('/api/status')[0]==200, 'listener did not recover after source download/missing/traversal requests'
+            assert ctl(dict(op='status'))['ok'], 'control socket stopped responding after source download tests'
             code,_,body=get('/api/devices')
             assert code==200 and json.loads(body)==dict(ok=True,devices=[])
             assert get('/api/status',host=f'carlink.local:{port}')[0]==200
@@ -238,17 +301,60 @@ def check(binary):
                 assert len(sent)>=3 and max(b-a for a,b in zip(sent,sent[1:]))<.65 and finished-sent[-1]<.65, 'drip fixture hit the idle timeout instead of exercising the total deadline'
             assert get('/api/status')[0]==200, 'listener did not recover after a dripped body'
             assert not ctl(dict(op='status'))['status']['paused'], 'partial dripped JSON mutated state'
-            # A second in-flight body also bounds Web::drop during shutdown.
+            slow_downloads=[]
+            slow_download_prefixes=[]
+            if source_fixture:
+                # Enlarge the fixture after the exact-byte test so each idle
+                # client keeps a writer occupied well beyond its receive window.
+                with source_path.open('wb') as source_file:
+                    source_file.truncate(64*1024*1024)
+                slow_downloads=[open_source_download(),open_source_download()]
+                for stream in slow_downloads:
+                    code,headers,body_prefix=read_source_headers(stream)
+                    assert code==200 and headers['Content-Length']==str(64*1024*1024), 'slow source transfer did not start with the expected large body'
+                    slow_download_prefixes.append(body_prefix)
+                time.sleep(.1)
+                started=time.monotonic()
+                code,_,body=get(source_url)
+                assert code==503 and time.monotonic()-started<1.5, 'source download limit did not reject promptly when both workers were busy'
+                assert get('/api/status')[0]==200, 'slow source downloads blocked status requests'
+                code,_,body=post(dict(op='pause'))
+                assert code==200 and json.loads(body)['status']['paused'], 'slow source downloads blocked control requests'
+                code,_,body=post(dict(op='resume'))
+                assert code==202 and json.loads(body)==dict(ok=True,accepted=True)
+                until_status(lambda status:not status['paused'])
+            # Drop while both a source writer and an in-flight request are blocked.
             with drip():
                 time.sleep(.15)
                 started=time.monotonic()
                 ctl(dict(op='shutdown'));assert process.wait(timeout=5)==0;process=None
-                assert time.monotonic()-started<4.5, 'shutdown waited for the dripped body to finish'
+                assert time.monotonic()-started<4.5, 'shutdown waited for an active request/download to finish'
+            for stream,body_prefix in zip(slow_downloads,slow_download_prefixes):
+                stream.settimeout(1)
+                received=body_prefix
+                deadline=time.monotonic()+1
+                try:
+                    while True:
+                        remaining=deadline-time.monotonic()
+                        assert remaining>0, 'source worker kept its client connection alive after shutdown'
+                        stream.settimeout(remaining)
+                        try:
+                            chunk=stream.recv(65536)
+                        except ConnectionResetError:
+                            break
+                        if not chunk:
+                            break
+                        received+=len(chunk)
+                        assert received<64*1024*1024, 'source archive completed before shutdown interrupted its worker'
+                finally:
+                    stream.close()
+                assert received<64*1024*1024, 'source archive completed before shutdown interrupted its worker'
             assert not os.path.lexists(root/'control.sock'), 'normal shutdown left a control endpoint'
             print(json.dumps(dict(manager_web='passed',http_requests=True,same_origin_control=True,
                 duplicate_length_and_chunked_rejected=True,body_bound=True,operation_allowlist=True,
                 body_drip_total_deadline=True,startup_failure_cleanup=True,bounded_shutdown=True,
-                source_change_ack_precedes_controller=True)))
+                source_change_ack_precedes_controller=True,source_download_concurrency=True,
+                source_download_capacity_bounded=True,source_download_shutdown_reaped=True)))
         except BaseException:
             log.flush()
             print((root/'manager.log').read_text(encoding='utf-8',errors='replace')[-8000:],file=sys.stderr)
@@ -259,6 +365,8 @@ def check(binary):
                 try:process.wait(timeout=12)
                 except subprocess.TimeoutExpired:process.kill();process.wait(timeout=5)
             log.close()
+            for fixture_path in source_fixture_paths_created:
+                fixture_path.unlink(missing_ok=True)
 
 
 if __name__=='__main__':

@@ -1,0 +1,161 @@
+OpenXPlay Relay Notices
+
+OpenXPlay Relay
+Copyright (c) 2026 OpenXPlay.org and contributors.
+
+This project is licensed under the GNU Affero General Public License v3.0 only
+(AGPL-3.0-only), except for the derived files described below.
+See LICENSE for the full project license terms.
+
+==== Additional Terms under AGPLv3 Section 7 ====
+
+Pursuant to Section 7(b) of the GNU Affero General Public License version 3, the
+following reasonable legal notice and author attribution must be preserved by
+modified versions of OpenXPlay-owned material contributed to OpenXPlay Relay,
+in the Appropriate Legal Notices and in any prominent about, legal, footer,
+or attribution location presented by the user interface:
+
+"Powered by OpenXPlay."
+
+Modified versions that present a user interface must also preserve a visible
+link to the original project in a prominent about, legal, footer, or
+attribution location:
+
+https://github.com/OpenXPlay/OpenXPlay-Relay
+
+Modified versions must not misrepresent the origin of the software and must
+mark their changes in accordance with AGPLv3 Section 7(c).
+
+==== Derived files ====
+
+All files in rust/carplay-iap2/ and rust/carplay-airplay/, and these files in
+rust/direlay-linux/src/network/, are derived from DiPlay
+(https://github.com/shihabal3amri/DiPlay), based on xcertplay
+(https://github.com/shilapi/xcertplay):
+
+- air_play_port_selector.rs
+- hotspot_address_policy.rs
+- wireless_host_address.rs
+- wireless_hotspot_manager.rs
+
+These derived files remain licensed under GPL-3.0-only; see LICENSE-GPL-3.0
+for the full GNU General Public License v3.0 text. GPLv3 Section 13 permits
+combining them with this AGPLv3 work. The AGPLv3 requirement concerning
+interaction through a network applies to the combination: users who interact
+with it remotely, including through a head-unit browser, must be offered its
+Corresponding Source.
+
+==== Exemptions ====
+
+Organisations that cannot use AGPLv3 may contact support@openxplay.org to
+request an exemption. Exemptions cover OpenXPlay-owned code only; the derived
+DiPlay/xcertplay parts remain subject to GPLv3.
+
+==== Combined Components ====
+
+Distributed builds combine this project with:
+
+- OpenXPlay-DiPlay, a fork of DiPlay (https://github.com/shihabal3amri/DiPlay),
+  licensed under GPLv3 and based on xcertplay (GPLv3). Its notices must
+  accompany distributed builds.
+
+- OpenXPlay-Stream (https://github.com/OpenXPlay/OpenXPlay-Stream), licensed
+  under AGPLv3 only with additional terms under AGPLv3 Section 7; see its
+  NOTICE. As permitted by GPLv3 Section 13, the AGPLv3 requirement concerning
+  interaction through a network applies to the combined work: users who
+  interact with it remotely, including through a head-unit browser, must be
+  offered its Corresponding Source.
+
+==== Third-party Components ====
+
+- CarPlay and its icon (android/app/src/main/res/drawable/ic_carplay.png)
+  are trademarks of Apple Inc., used only to identify CarPlay. No affiliation
+  or endorsement is implied.
+
+- JmDNS 3.6.3, licensed under the Apache License 2.0
+  (https://www.apache.org/licenses/LICENSE-2.0). Source: https://github.com/jmdns/jmdns.
+- Lucide icons, Copyright (c) Lucide Icons and Contributors, licensed under
+  the ISC License; icons derived from Feather are Copyright (c) 2013-present
+  Cole Bemis, licensed under the MIT License.
+  Source: https://github.com/lucide-icons/lucide.
+
+- mdns-sd 0.13.11, Copyright (c) 2021-2022 Han Xu, licensed under the
+  Apache License 2.0 or the MIT License, at your option; vendored in
+  rust/vendor/mdns-sd with its licenses. OpenXPlay's changes (negative host
+  answers, NSEC encoding and interface address isolation) are licensed on the
+  same terms. Source: https://github.com/keepsimple1/mdns-sd.
+
+- Rust crates for trusted HTTPS with a free domain name (linked into
+  openxplay-relay): ureq 3.4.2, ureq-proto 0.6.5, http 1.5.0, httparse 1.10.1,
+  percent-encoding 2.3.2 and utf8-zero 0.8.1, each licensed under the MIT
+  License or the Apache License 2.0, at your option; bytes 1.12.1, licensed
+  under the MIT License. Sources: https://crates.io/crates/<name>.
+
+- webpki-roots 1.0.10 (https://github.com/rustls/webpki-roots): the Mozilla
+  root certificates that openxplay-relay trusts when it talks to Let's Encrypt
+  and the DNS providers. The certificate data is licensed under the Community
+  Data License Agreement - Permissive, Version 2.0, whose text follows:
+
+  # Community Data License Agreement - Permissive - Version 2.0
+
+  This is the Community Data License Agreement - Permissive, Version
+  2.0 (the "agreement"). Data Provider(s) and Data Recipient(s) agree
+  as follows:
+
+  ## 1. Provision of the Data
+
+  1.1. A Data Recipient may use, modify, and share the Data made
+  available by Data Provider(s) under this agreement if that Data
+  Recipient follows the terms of this agreement.
+
+  1.2. This agreement does not impose any restriction on a Data
+  Recipient's use, modification, or sharing of any portions of the
+  Data that are in the public domain or that may be used, modified,
+  or shared under any other legal exception or limitation.
+
+  ## 2. Conditions for Sharing Data
+
+  2.1. A Data Recipient may share Data, with or without modifications, so
+  long as the Data Recipient makes available the text of this agreement
+  with the shared Data.
+
+  ## 3. No Restrictions on Results
+
+  3.1. This agreement does not impose any restriction or obligations
+  with respect to the use, modification, or sharing of Results.
+
+  ## 4. No Warranty; Limitation of Liability
+
+  4.1. All Data Recipients receive the Data subject to the following
+  terms:
+
+  THE DATA IS PROVIDED ON AN "AS IS" BASIS, WITHOUT REPRESENTATIONS,
+  WARRANTIES OR CONDITIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED
+  INCLUDING, WITHOUT LIMITATION, ANY WARRANTIES OR CONDITIONS OF TITLE,
+  NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+
+  NO DATA PROVIDER SHALL HAVE ANY LIABILITY FOR ANY DIRECT, INDIRECT,
+  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING
+  WITHOUT LIMITATION LOST PROFITS), HOWEVER CAUSED AND ON ANY THEORY OF
+  LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+  NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE DATA OR RESULTS,
+  EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+  ## 5. Definitions
+
+  5.1. "Data" means the material received by a Data Recipient under
+  this agreement.
+
+  5.2. "Data Provider" means any person who is the source of Data
+  provided under this agreement and in reliance on a Data Recipient's
+  agreement to its terms.
+
+  5.3. "Data Recipient" means any person who receives Data directly
+  or indirectly from a Data Provider and agrees to the terms of this
+  agreement.
+
+  5.4. "Results" means any outcome obtained by computational analysis
+  of Data, including for example machine learning models and models'
+  insights.
+
+==== End of Notices ====

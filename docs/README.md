@@ -9,3 +9,5 @@
 | [开发与验证](development.md) | 运行结构、构建产物、测试入口 |
 
 组件文档：[Rust 应用](../app/README.md)、[CarPlay 接收端](../receiver/README.md)、[菜单渲染](../receiver/menu/README.md)。
+
+许可、第三方署名与源码提供方式见[许可总览](../LICENSING.md)和[安装说明](provisioning.md#开源许可与对应源码)。
