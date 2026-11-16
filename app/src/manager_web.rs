@@ -3,8 +3,31 @@ use std::{io::{Read,Write},net::{TcpListener,TcpStream,SocketAddr,IpAddr},os::un
 use serde_json::{Value,json};
 #[derive(Default)]struct Active{tcp:Mutex<Option<TcpStream>>,ipc:Mutex<Option<UnixStream>>}
 impl Active{fn close(&self){if let Some(s)=self.tcp.lock().unwrap_or_else(|e|e.into_inner()).take(){let _=s.shutdown(std::net::Shutdown::Both);}if let Some(s)=self.ipc.lock().unwrap_or_else(|e|e.into_inner()).take(){let _=s.shutdown(std::net::Shutdown::Both);}}}
-pub struct Web {stop:Arc<AtomicBool>,active:Arc<Active>,task:Option<thread::JoinHandle<()>>}
-impl Drop for Web {fn drop(&mut self){self.stop.store(true,Ordering::Relaxed);self.active.close();if let Some(t)=self.task.take(){let _=t.join();}}}
+const MAX_SOURCE_DOWNLOADS:usize=2;
+struct SourceWorker{cancel:TcpStream,task:thread::JoinHandle<()>}
+#[derive(Default)]struct SourcePoolState{stopping:bool,workers:Vec<SourceWorker>}
+#[derive(Default)]struct SourcePool{state:Mutex<SourcePoolState>}
+impl SourcePool{
+ fn start(&self,stream:TcpStream)->Result<(),TcpStream>{
+  let mut state=self.state.lock().unwrap_or_else(|e|e.into_inner());
+  let mut index=0;
+  while index<state.workers.len(){
+   if state.workers[index].task.is_finished(){let worker=state.workers.swap_remove(index);let _=worker.task.join();}else{index+=1;}
+  }
+  if state.stopping||state.workers.len()>=MAX_SOURCE_DOWNLOADS{return Err(stream);}
+  let Ok(worker_stream)=stream.try_clone()else{return Err(stream);};
+  let Ok(cancel)=stream.try_clone()else{return Err(stream);};
+  let Ok(task)=thread::Builder::new().name("manager-source-download".into()).spawn(move||{let mut worker_stream=worker_stream;license_file(&mut worker_stream,"corresponding-source.tar.gz","application/gzip")})else{return Err(stream);};
+  state.workers.push(SourceWorker{cancel,task});
+  Ok(())
+ }
+ fn stop(&self){
+  let workers={let mut state=self.state.lock().unwrap_or_else(|e|e.into_inner());state.stopping=true;for worker in &state.workers{let _=worker.cancel.shutdown(std::net::Shutdown::Both);}std::mem::take(&mut state.workers)};
+  for worker in workers{let _=worker.task.join();}
+ }
+}
+pub struct Web {stop:Arc<AtomicBool>,active:Arc<Active>,sources:Arc<SourcePool>,task:Option<thread::JoinHandle<()>>}
+impl Drop for Web {fn drop(&mut self){self.stop.store(true,Ordering::Relaxed);self.active.close();self.sources.stop();if let Some(t)=self.task.take(){let _=t.join();}}}
 fn local(ip:IpAddr)->bool{match ip{IpAddr::V4(a)=>a.is_loopback()||matches!(a.octets(),[192,168,77,_]|[192,168,49,_]|[10,77,0,_]),IpAddr::V6(a)=>a.is_loopback()}}
 fn read_before(s:&mut TcpStream,mut buffer:&mut [u8],deadline:Instant)->Result<(),String>{
  while !buffer.is_empty(){let remaining=deadline.checked_duration_since(Instant::now()).filter(|d|!d.is_zero()).ok_or("request deadline")?;
@@ -77,7 +100,7 @@ fn control(path:&Path,v:Value,active:&Active,stop:&AtomicBool)->Result<Value,Str
  active.ipc.lock().unwrap_or_else(|e|e.into_inner()).take();result
 }
 pub fn start(listen:SocketAddr,socket:PathBuf)->Result<Web,String>{
- let listener=TcpListener::bind(listen).map_err(|_|"cannot bind maintenance web UI")?;listener.set_nonblocking(true).map_err(|_|"web nonblocking")?;let port=listener.local_addr().map_err(|_|"web bind address")?.port();let stop=Arc::new(AtomicBool::new(false));let quit=stop.clone();let active=Arc::new(Active::default());let channels=active.clone();
+ let listener=TcpListener::bind(listen).map_err(|_|"cannot bind maintenance web UI")?;listener.set_nonblocking(true).map_err(|_|"web nonblocking")?;let port=listener.local_addr().map_err(|_|"web bind address")?.port();let stop=Arc::new(AtomicBool::new(false));let quit=stop.clone();let active=Arc::new(Active::default());let channels=active.clone();let sources=Arc::new(SourcePool::default());let source_workers=sources.clone();
  let task=thread::spawn(move||{while !quit.load(Ordering::Relaxed){let (mut s,peer)=match listener.accept(){Ok(v)=>v,Err(_)=>{thread::sleep(Duration::from_millis(50));continue;}};
  *channels.tcp.lock().unwrap_or_else(|e|e.into_inner())=s.try_clone().ok();
  if quit.load(Ordering::Relaxed){channels.close();break;}
@@ -86,7 +109,7 @@ pub fn start(listen:SocketAddr,socket:PathBuf)->Result<Web,String>{
  Ok((m,p,body))=>match (m.as_str(),p.as_str()){
  ("GET","/")=>response(&mut s,200,"text/html; charset=utf-8",include_bytes!("../ui/manager.html")),
  ("GET","/licenses/")=>license_file(&mut s,"index.html","text/html; charset=utf-8"),
- ("GET","/licenses/corresponding-source.tar.gz")=>license_file(&mut s,"corresponding-source.tar.gz","application/gzip"),
+  ("GET","/licenses/corresponding-source.tar.gz")=>if let Err(mut stream)=source_workers.start(s){response(&mut stream,503,"text/plain",b"Source download capacity reached");},
  ("GET","/app.js")=>response(&mut s,200,"application/javascript; charset=utf-8",include_bytes!("../ui/manager.js")),
  ("GET","/style.css")=>response(&mut s,200,"text/css; charset=utf-8",include_bytes!("../ui/manager.css")),
  ("GET","/api/status")|("GET","/api/devices")|("POST","/api/control")=>{
@@ -108,7 +131,7 @@ pub fn start(listen:SocketAddr,socket:PathBuf)->Result<Web,String>{
  _=>response(&mut s,404,"text/plain",b"Not found")},
  Err(_)=>response(&mut s,400,"text/plain",b"Invalid local request"),}
  channels.tcp.lock().unwrap_or_else(|e|e.into_inner()).take();
- }});Ok(Web{stop,active,task:Some(task)})
+  }});Ok(Web{stop,active,sources,task:Some(task)})
 }
 #[cfg(test)]mod tests {use super::*;
  #[test]fn only_management_networks(){for a in ["127.0.0.1","192.168.77.1","192.168.49.2","10.77.0.189"]{assert!(local(a.parse().unwrap()));}for a in ["8.8.8.8","192.168.0.18","10.78.0.1"]{assert!(!local(a.parse().unwrap()));}}
