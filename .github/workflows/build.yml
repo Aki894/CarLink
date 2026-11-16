@@ -104,7 +104,18 @@ jobs:
           timeout 120s python3 scripts/test-hicar-rust-backend.py app/target/debug/carlink
           python3 scripts/test-manager.py app/target/debug/carlink
           python3 scripts/test-carplay-output.py app/target/debug/carlink
-          python3 scripts/test-manager-web.py app/target/debug/carlink
+          source_test_dir=/usr/local/lib/carlink/carplay/share/compliance
+          sudo install -d -m 755 "$source_test_dir"
+          sudo chown "$(id -u):$(id -g)" "$source_test_dir"
+          cleanup_source_test_dir() {
+            sudo rm -f "$source_test_dir/corresponding-source.tar.gz" "$source_test_dir/index.html" || true
+            sudo rmdir "$source_test_dir" 2>/dev/null || true
+            sudo rmdir /usr/local/lib/carlink/carplay/share 2>/dev/null || true
+            sudo rmdir /usr/local/lib/carlink/carplay 2>/dev/null || true
+            sudo rmdir /usr/local/lib/carlink 2>/dev/null || true
+          }
+          trap cleanup_source_test_dir EXIT
+          CARLINK_TEST_SOURCE_FIXTURE=1 python3 scripts/test-manager-web.py app/target/debug/carlink
           python3 -c 'import json; d=json.load(open("/tmp/carlink-doctor.json")); assert d["schema_version"] == 1; assert d["aoa"]["status"] == "not_tested"'
           cargo +"$RUST_VERSION" build --release --locked --manifest-path app/Cargo.toml --target "$TARGET"
           mkdir -p dist/app

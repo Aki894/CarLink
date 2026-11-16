@@ -4,6 +4,7 @@ Synthetic process commands and temporary sockets only; no board/radio access.
 The application itself is built exclusively by GitHub Actions.
 """
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,7 +30,7 @@ def parse_response(response):
     return code,headers,body
 
 
-def receive_response(stream):
+def receive_response(stream, max_bytes=131072):
     response=b''
     while True:
         try:
@@ -40,12 +41,19 @@ def receive_response(stream):
             return parse_response(response)
         if not part:break
         response+=part
-        assert len(response)<=131072, 'unbounded HTTP response'
+        assert len(response)<=max_bytes, 'unbounded HTTP response'
     return parse_response(response)
 
 
 def check(binary):
     runner = json.loads(os.environ.get('CARLINK_RUST_RUNNER', '[]'))
+    source_fixture = os.environ.get('CARLINK_TEST_SOURCE_FIXTURE') == '1'
+    source_path = Path('/usr/local/lib/carlink/carplay/share/compliance/corresponding-source.tar.gz')
+    source_index_path = source_path.parent / 'index.html'
+    source_fixture_paths_created = []
+    pattern = bytes(range(256))
+    source_payload = pattern * (5 * 1024 * 1024 // len(pattern))
+    source_digest = hashlib.sha256(source_payload).hexdigest()
     with tempfile.TemporaryDirectory(prefix='carlink-manager-web-') as directory:
         root = Path(directory)
         with socket.socket() as reservation:
@@ -79,12 +87,12 @@ def check(binary):
                 if predicate(status):return status
                 time.sleep(.025)
             raise AssertionError('accepted HTTP control did not reach the expected state')
-        def raw(request):
+        def raw(request,max_bytes=131072,timeout=5):
             with socket.create_connection(('127.0.0.1',port),timeout=3) as stream:
-                stream.settimeout(5);stream.sendall(request)
-                return receive_response(stream)
-        def get(path,host=authority):
-            return raw(f'GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n'.encode())
+                stream.settimeout(timeout);stream.sendall(request)
+                return receive_response(stream, max_bytes=max_bytes)
+        def get(path,host=authority,max_bytes=131072,timeout=5):
+            return raw(f'GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n'.encode(),max_bytes,timeout)
         def post(command,origin=None,host=authority,kind='application/json'):
             body=json.dumps(command).encode()
             origin=f'http://{host}' if origin is None else origin
@@ -152,6 +160,20 @@ def check(binary):
                 stop.set();sender.join(timeout=2);stream.close()
                 assert not sender.is_alive(), 'drip sender did not stop'
         try:
+            if source_fixture:
+                if source_path.exists():
+                    raise AssertionError(f'refusing to overwrite existing source package: {source_path}')
+                if source_index_path.exists():
+                    raise AssertionError(f'refusing to overwrite existing source page: {source_index_path}')
+                if not source_path.parent.is_dir() or not os.access(source_path.parent, os.W_OK):
+                    raise AssertionError(f'CI source fixture directory is not writable: {source_path.parent}')
+                source_path.write_bytes(source_payload)
+                source_fixture_paths_created.append(source_path)
+                source_index_path.write_text(
+                    '<p>Powered by OpenXPlay. <a href="https://github.com/OpenXPlay/OpenXPlay-Relay">OpenXPlay-Relay</a></p>'
+                    '<a href="corresponding-source.tar.gz">Download exact Corresponding Source</a>',
+                    encoding='utf-8')
+                source_fixture_paths_created.append(source_index_path)
             # Failed startup must undo its private control endpoint so the same
             # configuration succeeds immediately after the occupied port clears.
             with socket.socket() as occupied:
@@ -179,6 +201,24 @@ def check(binary):
                 assert code==200 and headers['Content-Type'].startswith(kind) and body
             code,_,body=get('/api/status')
             assert code==200 and json.loads(body)['ok']
+            if source_fixture:
+                code,headers,body=get('/licenses/')
+                assert code==200 and headers['Content-Type'].startswith('text/html')
+                assert b'Powered by OpenXPlay.' in body and b'OpenXPlay-Relay' in body
+                assert b'corresponding-source.tar.gz' in body
+            for traversal in ('/licenses/../corresponding-source.tar.gz',
+                              '/licenses/%2e%2e/corresponding-source.tar.gz',
+                              '/licenses/../config.json'):
+                assert get(traversal)[0]==404, f'license route accepted traversal path: {traversal}'
+            source_url='/licenses/corresponding-source.tar.gz'
+            if source_fixture:
+                code,headers,body=get(source_url,max_bytes=6*1024*1024,timeout=15)
+                assert code==200 and headers['Content-Type']=='application/gzip'
+                assert len(body)==5*1024*1024 and hashlib.sha256(body).hexdigest()==source_digest, 'source download bytes/hash differ from the installed package'
+                source_path.unlink()
+            assert get(source_url)[0]==404, 'missing corresponding-source package did not return 404'
+            assert get('/api/status')[0]==200, 'listener did not recover after source download/missing/traversal requests'
+            assert ctl(dict(op='status'))['ok'], 'control socket stopped responding after source download tests'
             code,_,body=get('/api/devices')
             assert code==200 and json.loads(body)==dict(ok=True,devices=[])
             assert get('/api/status',host=f'carlink.local:{port}')[0]==200
@@ -259,6 +299,8 @@ def check(binary):
                 try:process.wait(timeout=12)
                 except subprocess.TimeoutExpired:process.kill();process.wait(timeout=5)
             log.close()
+            for fixture_path in source_fixture_paths_created:
+                fixture_path.unlink(missing_ok=True)
 
 
 if __name__=='__main__':
